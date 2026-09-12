@@ -4,7 +4,7 @@
 
 ## 在线试玩
 
-部署后访问：`https://<用户名>.github.io/science-lab/`
+部署后访问：`https://totosahora.github.io/home-lab/`
 
 ## 本地运行
 
