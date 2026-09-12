@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>小小科学乐园</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
@@ -81,6 +81,29 @@
   .en-title { font-size:13px; font-weight:bold; color:#5a4ac0; margin-bottom:4px; }
   .en-concept { font-size:12px; color:#444; line-height:1.5; margin-bottom:6px; }
   .en-plain { font-size:12px; color:#7a6aa0; line-height:1.5; font-style:italic; }
+
+  /* ===== 手机/平板自适应 ===== */
+  @media (max-width: 860px) {
+    body { padding:20px 10px 50px; }
+    h1 { font-size:28px; }
+    .sub { font-size:13px; margin-bottom:14px; text-align:center; }
+    .filters { gap:7px; margin-bottom:16px; }
+    .fbtn { padding:8px 14px; font-size:13px; }
+    .fsep { display:none; }
+    .count { font-size:12px; margin-bottom:12px; }
+    .grid { grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:12px; width:100%; }
+    .card { padding:14px 10px 12px; border-radius:16px; }
+    .card .icon { font-size:36px; }
+    .card .name { font-size:15px; }
+    .card .desc { font-size:11px; }
+    .badge { font-size:10px; padding:2px 8px; }
+    .fav { font-size:18px; }
+  }
+  @media (max-width: 380px) {
+    .grid { grid-template-columns:1fr 1fr; gap:10px; }
+    .card .desc { display:none; }
+    h1 { font-size:24px; }
+  }
 </style>
 </head>
 <body>

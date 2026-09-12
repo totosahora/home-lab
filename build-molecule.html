@@ -502,5 +502,21 @@ updateScore();
 <div id="labHomeBtn" title="回到大厅">🏠</div>
 <style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
 <script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+<!-- 竖屏提示 -->
+<div id="labRotateTip" style="display:none;position:absolute;inset:0;z-index:200;background:rgba(20,25,45,0.82);align-items:center;justify-content:center;flex-direction:column;gap:14px;">
+  <div style="font-size:52px;animation:labSpin 1.6s ease-in-out infinite alternate">📱</div>
+  <div style="color:#fff;font-size:19px;font-weight:bold">把手机横过来玩更舒服！</div>
+  <button id="labRotateOk" style="border:none;border-radius:22px;padding:10px 26px;font-size:15px;font-weight:bold;background:#ffd54a;color:#5a3d00;cursor:pointer">知道了，继续竖屏玩</button>
+</div>
+<style>@keyframes labSpin{from{transform:rotate(0deg)}to{transform:rotate(-90deg)}}</style>
+<script>(function(){
+  var tip=document.getElementById('labRotateTip');
+  function chk(){
+    var portrait=window.innerHeight>window.innerWidth && window.innerWidth<640;
+    tip.style.display=(portrait && !tip.dataset.ok)?'flex':'none';
+  }
+  document.getElementById('labRotateOk').onclick=function(){tip.dataset.ok='1';tip.style.display='none';};
+  window.addEventListener('resize',chk);chk();
+})();</script>
 </body>
 </html>
