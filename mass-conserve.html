@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>质量守恒称量实验</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#2b3a4a; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(15,25,35,0.85); color:#7fd4ff; padding:10px 22px;
+    border-radius:24px; font-size:19px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(15,25,35,0.85); color:#fff; padding:10px 22px;
+    border-radius:24px; font-size:16px; z-index:10;
+    transition:opacity 0.6s; white-space:nowrap; cursor:pointer;
+  }
+  #nextBtn {
+    position:absolute; right:26px; bottom:70px; z-index:15; display:none;
+    font-size:20px; font-weight:bold; padding:14px 26px;
+    border-radius:30px; border:none; background:#7fd4ff; color:#12304a;
+    cursor:pointer; box-shadow:0 4px 12px rgba(0,0,0,0.4);
+  }
+  #nextBtn:active { transform:scale(1.06); }
+  #lawPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center;
+    background:rgba(0,0,0,0.5);
+  }
+  #lawPanel .card {
+    background:#fffdf4; border-radius:22px; padding:30px 38px;
+    max-width:640px; text-align:center; color:#3a2a12;
+    box-shadow:0 10px 40px rgba(0,0,0,0.5);
+  }
+  #lawPanel h1 { font-size:30px; color:#d14800; margin-bottom:14px; }
+  #lawPanel .law { font-size:20px; font-weight:bold; line-height:1.7; margin-bottom:14px; }
+  #lawPanel .cmp { font-size:16px; line-height:1.8; color:#5a4a30; margin-bottom:12px; }
+  #lawPanel .eq {
+    font-size:19px; font-weight:bold; color:#1a5fb4;
+    background:#e8f2ff; border-radius:12px; padding:8px 14px; margin-bottom:18px;
+  }
+  #lawPanel button {
+    font-size:22px; font-weight:bold; padding:13px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.3);
+  }
+  #lawPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">第 1 步 · 敞口烧杯实验 ⚗️</div>
+<div id="hint">把装盐酸的烧杯拖到天平左边的托盘上</div>
+<button id="nextBtn">下一步：密闭容器实验 🎈</button>
+<div id="lawPanel">
+  <div class="card">
+    <h1>🎉 质量守恒定律</h1>
+    <div class="law">在<b>密闭容器</b>中，化学反应前后，<br>参加反应的各物质质量总和 <b>=</b> 生成的各物质质量总和！</div>
+    <div class="cmp">敞口烧杯：CO₂ 跑走了 → 160.0 g 变成 155.6 g（少了 4.4 g）<br>密闭容器：CO₂ 被气球收住 → 反应前后都是 162.0 g，不变！</div>
+    <div class="eq">CaCO₃ + 2HCl → CaCl₂ + H₂O + CO₂↑</div>
+    <button id="replayBtn">再玩一次</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const nextBtn = document.getElementById("nextBtn");
+const lawPanel = document.getElementById("lawPanel");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 场景与视图 ================= */
+// 世界坐标 1200 x 760，均匀缩放居中
+const WORLD_W = 1200, WORLD_H = 760;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / WORLD_W, H / WORLD_H);
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 天平结构 ================= */
+const PIVOT = { x:480, y:300 };
+const BEAM_HALF = 215;      // 横梁半长
+const PAN_DROP = 120;       // 托盘吊绳长度
+const PAN_W = 190;
+const CONTAINER_MASS = 150; // 烧杯/锥形瓶 + 盐酸
+const MARBLE_MASS = 10;     // 大理石块 CaCO3
+const STOPPER_MASS = 2;     // 瓶塞 + 气球
+const CO2_MASS = 4.4;       // 10 g CaCO3 完全反应生成 4.4 g CO2（100:44，科学准确）
+const REACT_DUR = 7;        // 反应时长（秒）
+
+let beamAng = 0;            // 横梁倾角（正 = 左盘下沉）
+const LP = { x:0, y:0 };    // 左盘盘面中心（每帧更新）
+const RP = { x:0, y:0 };    // 右盘盘面中心
+
+/* ================= 游戏状态 ================= */
+// 阶段流程：
+// s1_place → s1_weigh → s1_marble → s1_lower → s1_react → s1_done
+// s2_place → s2_weigh → s2_seal → s2_drop → s2_react → done
+let phase = "s1_place";
+let step = 1;
+let escaped = 0;            // 已逸出（或被收集）的 CO2 质量
+let reactT = 0;             // 反应进度 0~1
+let lowerT = 0;             // 大理石下放动画 0~1
+let dropT = 0;              // 第二步大理石掉落动画 0~1
+let balanceHold = 0;        // 平衡保持计时
+let sealT = 0;              // 密封动画
+let celebrated = false;
+
+// 工具台位置
+const TRAY = { x:880, y:110, w:300, h:580 };
+// 可拖拽物品
+const items = {
+  beaker:  { kind:"beaker",  x:1030, y:280, home:{x:1030, y:280}, state:"tray" },  // tray|drag|placed
+  flask:   { kind:"flask",   x:1030, y:280, home:{x:1030, y:280}, state:"tray" },
+  w100:    { kind:"weight",  x:948,  y:480, home:{x:948,  y:480}, state:"tray", mass:100, r:36, label:"100g" },
+  w50:     { kind:"weight",  x:1034, y:480, home:{x:1034, y:480}, state:"tray", mass:50,  r:30, label:"50g" },
+  w20:     { kind:"weight",  x:1112, y:480, home:{x:1112, y:480}, state:"tray", mass:20,  r:25, label:"20g" },
+  marble:  { kind:"marble",  x:1030, y:635, home:{x:1030, y:635}, state:"tray", r:26 },
+  stopper: { kind:"stopper", x:1030, y:625, home:{x:1030, y:625}, state:"tray" },
+};
+let panWeights = [];        // 右盘上的砝码 id 列表
+let marbleIn = false;       // 大理石已放入容器
+let sealed = false;         // 第二步：瓶塞气球已密封
+let marbleDropped = false;  // 第二步：大理石已掉入酸中
+
+function rightTotal() { return panWeights.reduce((s, id) => s + items[id].mass, 0); }
+// 砝码在右盘上的堆叠位置（绘制与拾取共用，保证一致）
+function panWeightPos(id) {
+  let off = 0;
+  for (const pid of panWeights) {
+    const w = items[pid];
+    const cy = RP.y - 8 - w.r * 0.75 - off;
+    if (pid === id) return cy;
+    off += w.r * 1.6;
+  }
+  return RP.y - 30;
+}
+function leftMass() {
+  let m = 0;
+  if (items.beaker.state === "placed" || items.flask.state === "placed") m += CONTAINER_MASS;
+  if (marbleIn) m += MARBLE_MASS;
+  if (sealed) m += STOPPER_MASS;
+  if (step === 1) m -= escaped;   // 敞口：CO2 跑掉，左盘变轻
+  return m;
+}
+function containerItem() { return step === 1 ? items.beaker : items.flask; }
+
+function resetAll() {
+  phase = "s1_place"; step = 1;
+  escaped = 0; reactT = 0; lowerT = 0; dropT = 0; sealT = 0;
+  balanceHold = 0; celebrated = false;
+  panWeights = []; marbleIn = false; sealed = false; marbleDropped = false;
+  for (const k in items) { const it = items[k]; it.state = "tray"; it.x = it.home.x; it.y = it.home.y; }
+  bubbles = []; puffs = []; confetti = [];
+  lawPanel.style.display = "none";
+  nextBtn.style.display = "none";
+  scorebar.textContent = "第 1 步 · 敞口烧杯实验 ⚗️";
+  showHint("把装盐酸的烧杯拖到天平左边的托盘上", 4000);
+}
+
+function setupStep2() {
+  phase = "s2_place"; step = 2;
+  escaped = 0; reactT = 0; lowerT = 0; dropT = 0; sealT = 0;
+  balanceHold = 0;
+  panWeights = []; marbleIn = false; sealed = false; marbleDropped = false;
+  for (const k of ["w100", "w50", "w20"]) { const it = items[k]; it.state = "tray"; it.x = it.home.x; it.y = it.home.y; }
+  items.flask.state = "tray"; items.flask.x = items.flask.home.x; items.flask.y = items.flask.home.y;
+  items.stopper.state = "tray"; items.stopper.x = items.stopper.home.x; items.stopper.y = items.stopper.home.y;
+  bubbles = []; puffs = [];
+  nextBtn.style.display = "none";
+  scorebar.textContent = "第 2 步 · 密闭容器实验 🎈";
+  showHint("这次把气体收集起来！先把装盐酸的锥形瓶拖到左盘", 4200);
+}
+
+/* ================= 动画粒子 ================= */
+let bubbles = [];   // 液体中的气泡 {dx, y, r, sp}
+let puffs = [];     // 逸出的 CO2 粒子 {x, y, vx, vy, life, label}
+let confetti = [];  // 庆祝彩纸 {x, y, vx, vy, rot, vr, color}
+let bubbleSndT = 0;
+
+/* ================= 物理 / 状态推进 ================= */
+function physics(dt) {
+  // 横梁倾角趋向质量差
+  const target = Math.max(-0.11, Math.min(0.11, (leftMass() - rightTotal()) * 0.0035));
+  beamAng += (target - beamAng) * Math.min(1, dt * 5);
+  const s = Math.sin(beamAng) * BEAM_HALF;
+  LP.x = PIVOT.x - BEAM_HALF; LP.y = PIVOT.y + s + PAN_DROP;
+  RP.x = PIVOT.x + BEAM_HALF; RP.y = PIVOT.y - s + PAN_DROP;
+
+  // 平衡判定（称量阶段）
+  if (phase === "s1_weigh" || phase === "s2_weigh") {
+    if (rightTotal() === CONTAINER_MASS) {
+      balanceHold += dt;
+      if (balanceHold > 0.7) {
+        pop(880); setTimeout(() => pop(1175), 110);
+        if (phase === "s1_weigh") { phase = "s1_marble"; showHint("平衡啦！现在把大理石块拖着放进盐酸里", 4200); }
+        else { phase = "s2_seal"; showHint("平衡啦！把带气球和大理石的瓶塞拖到瓶口密封", 4200); }
+      }
+    } else balanceHold = 0;
+  }
+
+  // 大理石下放动画（第一步）
+  if (phase === "s1_lower") {
+    lowerT = Math.min(1, lowerT + dt / 1.0);
+    if (lowerT >= 1) {
+      phase = "s1_react";
+      showHint("快看！冒泡了——天平读数在变小！", 4000);
+    }
+  }
+  // 密封动画（第二步）
+  if (phase === "s2_drop" && sealT < 1) sealT = Math.min(1, sealT + dt / 0.6);
+  // 大理石掉落动画（第二步）
+  if (phase === "s2_fall") {
+    dropT = Math.min(1, dropT + dt / 0.5);
+    if (dropT >= 1) {
+      phase = "s2_react";
+      showHint("气球鼓起来了！但天平读数一点儿没变！", 4200);
+    }
+  }
+
+  // 反应推进
+  if (phase === "s1_react" || phase === "s2_react") {
+    reactT = Math.min(1, reactT + dt / REACT_DUR);
+    escaped = CO2_MASS * reactT;
+    // 气泡
+    if (Math.random() < dt * 22 * (1.2 - reactT)) {
+      const c = containerRect();
+      bubbles.push({ dx: 14 + Math.random() * (c.w - 28), y: c.bot - 6, r: 2 + Math.random() * 4, sp: 30 + Math.random() * 40 });
+      bubbleSndT -= dt;
+      if (bubbleSndT <= 0) { bubbleSndT = 0.22; tone(500 + Math.random() * 500, 0.06, 0.035, "sine"); }
+    }
+    // 第一步：CO2 逃逸粒子
+    if (phase === "s1_react" && Math.random() < dt * 7) {
+      const c = containerRect();
+      puffs.push({
+        x: c.x + 10 + Math.random() * (c.w - 20), y: c.top - 4,
+        vx: (Math.random() - 0.5) * 30, vy: -40 - Math.random() * 40,
+        life: 1, label: Math.random() < 0.28
+      });
+    }
+    if (reactT >= 1) onReactDone();
+  }
+
+  // 粒子更新
+  for (const b of bubbles) b.y -= b.sp * dt;
+  const cr = containerRect();
+  bubbles = bubbles.filter(b => b.y > cr.top + 4);
+  for (const p of puffs) { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt * 0.45; }
+  puffs = puffs.filter(p => p.life > 0);
+  for (const c of confetti) {
+    c.vy += 300 * dt; c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+  }
+  confetti = confetti.filter(c => c.y < WORLD_H + 40);
+}
+
+function onReactDone() {
+  if (phase === "s1_react") {
+    phase = "s1_done";
+    pop(660); setTimeout(() => pop(880), 120);
+    showHint("咦？读数从 160.0 g 变成 155.6 g——CO₂ 跑到空气里啦！", 6000);
+    nextBtn.style.display = "block";
+  } else if (phase === "s2_react") {
+    phase = "done";
+    if (!celebrated) {
+      celebrated = true;
+      fanfare();
+      const COLORS = ["#ff5252", "#ffd54a", "#2fbf4a", "#2f7fe9", "#9b3de0", "#ff7a1a"];
+      for (let i = 0; i < 90; i++) confetti.push({
+        x: 600 + (Math.random() - 0.5) * 300, y: -20 - Math.random() * 200,
+        vx: (Math.random() - 0.5) * 120, vy: Math.random() * 80,
+        rot: Math.random() * 6, vr: (Math.random() - 0.5) * 8,
+        color: COLORS[i % COLORS.length]
+      });
+      setTimeout(() => { lawPanel.style.display = "flex"; }, 1400);
+    }
+  }
+}
+
+// 容器液体区域（世界坐标），供气泡/大理石定位
+function containerRect() {
+  if (step === 1) return { x: LP.x - 52, top: LP.y - 96, bot: LP.y - 12, w: 104, cx: LP.x };
+  return { x: LP.x - 56, top: LP.y - 82, bot: LP.y - 10, w: 112, cx: LP.x };
+}
+
+/* ================= 交互 ================= */
+let drag = null;   // {item, dx, dy}
+
+function draggableOk(it) {
+  if (drag) return false;
+  switch (it.kind) {
+    case "beaker":  return phase === "s1_place" && it.state === "tray";
+    case "flask":   return phase === "s2_place" && it.state === "tray";
+    case "weight":  return (phase === "s1_weigh" || phase === "s2_weigh");
+    case "marble":  return phase === "s1_marble" && it.state === "tray";
+    case "stopper": return phase === "s2_seal" && it.state === "tray";
+  }
+  return false;
+}
+
+function hitItem(wx, wy) {
+  // 按可拖性检测（后画优先）
+  const order = ["stopper", "marble", "w20", "w50", "w100", "flask", "beaker"];
+  for (const id of order) {
+    const it = items[id];
+    if (!visibleItem(it)) continue;
+    if (it.kind === "weight") {
+      let px = it.x, py = it.y;
+      if (it.state === "pan") { px = RP.x; py = panWeightPos(id); }
+      if (Math.hypot(wx - px, wy - py) < it.r + 10 && draggableOk(it)) return it;
+    } else {
+      const b = itemBounds(it);
+      if (wx > b.x - 14 && wx < b.x + b.w + 14 && wy > b.y - 20 && wy < b.y + b.h + 14 && draggableOk(it)) return it;
+    }
+  }
+  return null;
+}
+
+function visibleItem(it) {
+  if (it.state === "placed" || it.state === "used") return false;
+  if (step === 1 && (it.kind === "flask" || it.kind === "stopper")) return false;
+  if (step === 2 && (it.kind === "beaker" || it.kind === "marble")) return false;
+  return true;
+}
+
+function itemBounds(it) {
+  if (it.kind === "beaker" || it.kind === "flask") return { x: it.x - 65, y: it.y - 75, w: 130, h: 150 };
+  if (it.kind === "marble") return { x: it.x - 30, y: it.y - 30, w: 60, h: 60 };
+  return { x: it.x - 40, y: it.y - 95, w: 80, h: 130 }; // stopper
+}
+
+function inZone(wx, wy, cx, cy, hw, hh) { return Math.abs(wx - cx) < hw && Math.abs(wy - cy) < hh; }
+
+canvas.addEventListener("pointerdown", e => {
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  // 第二步：点击大理石让它掉进酸里
+  if (phase === "s2_drop" && sealT >= 1) {
+    const c = containerRect();
+    const my = c.top - 55;
+    if (Math.hypot(wx - c.cx, wy - my) < 70) {
+      phase = "s2_fall"; pop(500);
+      return;
+    }
+    showHint("点一下瓶里吊着的大理石，让它掉进盐酸里", 2600);
+    return;
+  }
+  const it = hitItem(wx, wy);
+  if (!it) return;
+  if (it.kind === "weight" && it.state === "pan") {
+    panWeights.splice(panWeights.indexOf(it.id || panWeights.find(k => items[k] === it)), 1);
+    it.state = "drag";
+  } else {
+    it.state = "drag";
+  }
+  drag = { item: it, dx: wx - it.x, dy: wy - it.y };
+  canvas.setPointerCapture(e.pointerId);
+  pop(700);
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  drag.item.x = wx - drag.dx;
+  drag.item.y = wy - drag.dy;
+});
+
+canvas.addEventListener("pointerup", e => {
+  if (!drag) return;
+  const it = drag.item;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  drag = null;
+
+  if (it.kind === "beaker" || it.kind === "flask") {
+    if (inZone(wx, wy, LP.x, LP.y - 50, 150, 130)) {
+      it.state = "placed";
+      pop(880);
+      if (it.kind === "beaker") { phase = "s1_weigh"; showHint("烧杯+盐酸共 150 g。把砝码拖到右盘，让横梁水平！", 4500); }
+      else { phase = "s2_weigh"; showHint("锥形瓶+盐酸共 150 g。把砝码拖到右盘，让横梁水平！", 4500); }
+    } else { it.state = "tray"; it.x = it.home.x; it.y = it.home.y; }
+    return;
+  }
+  if (it.kind === "weight") {
+    if (inZone(wx, wy, RP.x, RP.y - 50, 150, 140)) {
+      it.state = "pan";
+      panWeights.push(weightId(it));
+      pop(880);
+      const t = rightTotal();
+      if (t === CONTAINER_MASS) showHint("平衡啦！⚖️", 1600);
+      else if (t > CONTAINER_MASS) showHint("太重啦！把多余的砝码拖回工具台", 2600);
+      else showHint(`右盘现在 ${t} g，还差一点，继续加砝码`, 2600);
+    } else { it.state = "tray"; it.x = it.home.x; it.y = it.home.y; }
+    return;
+  }
+  if (it.kind === "marble") {
+    const c = containerRect();
+    if (inZone(wx, wy, c.cx, c.top - 20, 130, 120)) {
+      it.state = "used"; marbleIn = true; lowerT = 0; phase = "s1_lower";
+      pop(600);
+    } else { it.state = "tray"; it.x = it.home.x; it.y = it.home.y; }
+    return;
+  }
+  if (it.kind === "stopper") {
+    const c = containerRect();
+    if (inZone(wx, wy, c.cx, c.top - 70, 130, 130)) {
+      it.state = "used"; sealed = true; marbleIn = true; sealT = 0; phase = "s2_drop";
+      pop(880); setTimeout(() => pop(1175), 110);
+      showHint("密封好了！点一下瓶里吊着的大理石", 3600);
+    } else { it.state = "tray"; it.x = it.home.x; it.y = it.home.y; }
+    return;
+  }
+});
+
+function weightId(it) { for (const k of ["w100", "w50", "w20"]) if (items[k] === it) return k; return "w100"; }
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  // 墙面
+  const g = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+  g.addColorStop(0, "#3d5a75"); g.addColorStop(1, "#2b3a4a");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+  // 实验台面
+  ctx.fillStyle = "#8a6a42"; ctx.fillRect(0, 690, WORLD_W, 70);
+  ctx.fillStyle = "#a07c4e"; ctx.fillRect(0, 690, WORLD_W, 10);
+}
+
+function drawBalance() {
+  // 底座
+  const bg = ctx.createLinearGradient(300, 545, 300, 695);
+  bg.addColorStop(0, "#cfd8e0"); bg.addColorStop(1, "#8fa0b0");
+  ctx.fillStyle = bg; roundRect(300, 545, 360, 150, 18, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 3; roundRect(300, 545, 360, 150, 18); ctx.stroke();
+  // 立柱
+  ctx.fillStyle = "#9fb0c0"; ctx.fillRect(464, 296, 32, 252);
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.strokeRect(464, 296, 32, 252);
+  // 电子显示屏
+  ctx.fillStyle = "#10241a"; roundRect(330, 580, 300, 86, 12, true);
+  ctx.strokeStyle = "#050f0a"; ctx.lineWidth = 4; roundRect(330, 580, 300, 86, 12); ctx.stroke();
+  const balanced = rightTotal() === CONTAINER_MASS && leftMass() >= CONTAINER_MASS;
+  ctx.fillStyle = balanced ? "#7dff9a" : "#39d97e";
+  ctx.font = "bold 46px 'Courier New',monospace";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(leftMass().toFixed(1), 462, 616);
+  ctx.font = "bold 22px sans-serif";
+  ctx.fillText("g", 600, 622);
+  ctx.font = "13px sans-serif"; ctx.fillStyle = "rgba(125,255,154,0.7)";
+  ctx.fillText("电子天平 · 读数 = 左盘总质量", 480, 652);
+  // 横梁（绕支点旋转）
+  ctx.save();
+  ctx.translate(PIVOT.x, PIVOT.y);
+  ctx.rotate(beamAng);
+  ctx.fillStyle = "#e8b23a"; roundRect(-BEAM_HALF - 12, -9, BEAM_HALF * 2 + 24, 18, 9, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2; roundRect(-BEAM_HALF - 12, -9, BEAM_HALF * 2 + 24, 18, 9); ctx.stroke();
+  ctx.fillStyle = "#c48f22";
+  ctx.beginPath(); ctx.arc(0, 0, 12, 0, 7); ctx.fill();
+  ctx.restore();
+  // 平衡指示
+  if (balanced && (phase === "s1_weigh" || phase === "s2_weigh")) {
+    ctx.fillStyle = "#7dff9a"; ctx.font = "bold 24px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("⚖️ 平衡！", PIVOT.x, PIVOT.y - 44);
+  }
+  drawPan(LP, true);
+  drawPan(RP, false);
+}
+
+function drawPan(P, isLeft) {
+  // 吊绳（从梁端到盘）
+  const endY = P.y - PAN_DROP;
+  ctx.strokeStyle = "#d8d8d8"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(P.x, endY); ctx.lineTo(P.x - PAN_W / 2 + 12, P.y);
+  ctx.moveTo(P.x, endY); ctx.lineTo(P.x + PAN_W / 2 - 12, P.y);
+  ctx.stroke();
+  // 盘面
+  const pg = ctx.createLinearGradient(P.x, P.y - 6, P.x, P.y + 14);
+  pg.addColorStop(0, "#e8eef4"); pg.addColorStop(1, "#9fb0c0");
+  ctx.fillStyle = pg; roundRect(P.x - PAN_W / 2, P.y, PAN_W, 16, 8, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2; roundRect(P.x - PAN_W / 2, P.y, PAN_W, 16, 8); ctx.stroke();
+  // 内容物
+  if (isLeft) {
+    if (items.beaker.state === "placed") drawBeakerOnPan();
+    if (items.flask.state === "placed") drawFlaskOnPan();
+  } else {
+    panWeights.forEach((id) => {
+      drawWeightShape(RP.x, panWeightPos(id), items[id]);
+    });
+  }
+}
+
+function drawBeakerShape(cx, botY, scale) {
+  const w = 120 * scale, h = 130 * scale;
+  const x = cx - w / 2, y = botY - h;
+  // 液体
+  ctx.fillStyle = "rgba(255,224,130,0.85)";
+  ctx.fillRect(x + 6, y + h * 0.32, w - 12, h * 0.62);
+  // 杯壁
+  ctx.fillStyle = "rgba(210,235,255,0.30)";
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = "rgba(220,240,255,0.9)"; ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(x, y); ctx.lineTo(x, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.fillRect(x + 8, y + 10, 10, h - 20);
+}
+
+function drawFlaskShape(cx, botY, scale) {
+  const bw = 130 * scale, bh = 112 * scale, nw = 46 * scale, nh = 42 * scale;
+  const yBot = botY, yNeck = botY - bh, yTop = yNeck - nh;
+  // 液体
+  ctx.fillStyle = "rgba(255,224,130,0.85)";
+  ctx.beginPath();
+  ctx.moveTo(cx - bw / 2 + 8, yBot - 2);
+  ctx.lineTo(cx + bw / 2 - 8, yBot - 2);
+  ctx.lineTo(cx + nw / 2 + 12, yNeck + bh * 0.35);
+  ctx.lineTo(cx - nw / 2 - 12, yNeck + bh * 0.35);
+  ctx.closePath(); ctx.fill();
+  // 瓶身
+  ctx.fillStyle = "rgba(210,235,255,0.28)";
+  ctx.beginPath();
+  ctx.moveTo(cx - bw / 2, yBot);
+  ctx.lineTo(cx - nw / 2, yNeck); ctx.lineTo(cx - nw / 2, yTop);
+  ctx.lineTo(cx + nw / 2, yTop); ctx.lineTo(cx + nw / 2, yNeck);
+  ctx.lineTo(cx + bw / 2, yBot);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "rgba(220,240,255,0.9)"; ctx.lineWidth = 4; ctx.stroke();
+}
+
+function drawBeakerOnPan() {
+  drawBeakerShape(LP.x, LP.y - 8, 1);
+  drawLiquidFx(1);
+  // 大理石吊在液体里
+  if (marbleIn && !sealed) {
+    const c = containerRect();
+    const my = c.top - 60 + lowerT * 70;   // 下放动画
+    drawMarbleOnString(c.cx, my, marbleR());
+  }
+}
+
+function drawFlaskOnPan() {
+  drawFlaskShape(LP.x, LP.y - 8, 1);
+  drawLiquidFx(2);
+  if (sealed) {
+    const c = containerRect();
+    const mouthY = LP.y - 8 - 154;
+    // 大理石：吊在瓶口下方（seal/drop 阶段）或掉入液体（反应后）
+    let my;
+    if (phase === "s2_react" || phase === "done" || phase === "s2_fall") {
+      my = c.top - 40 + dropT * 50;
+    } else {
+      my = c.top - 55;
+    }
+    drawMarbleOnString(c.cx, my, marbleR(), mouthY + 14);
+    // 瓶塞
+    ctx.fillStyle = "#c98f4e";
+    roundRect(c.cx - 26, mouthY - 6, 52, 24, 6, true);
+    ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2; roundRect(c.cx - 26, mouthY - 6, 52, 24, 6); ctx.stroke();
+    // 气球（随反应鼓起）
+    const br = 10 + 50 * easeOut(reactT);
+    const by = mouthY - 30 - br * 0.8;
+    ctx.beginPath(); ctx.ellipse(c.cx, by, br * 0.85, br, 0, 0, 7);
+    ctx.fillStyle = "rgba(255,110,110,0.9)"; ctx.fill();
+    ctx.strokeStyle = "#c23b3b"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.beginPath(); ctx.arc(c.cx - br * 0.3, by - br * 0.35, br * 0.18, 0, 7);
+    ctx.fillStyle = "rgba(255,255,255,0.5)"; ctx.fill();
+    // 气球里的 CO2 颗粒（把不可见的气体画出来）
+    if (reactT > 0.03) {
+      ctx.fillStyle = "rgba(120,120,140,0.8)";
+      for (let i = 0; i < 24; i++) {
+        const a = i * 2.39996, rr = ((i * 37) % 100) / 100;
+        const px = c.cx + Math.cos(a) * rr * br * 0.62;
+        const py = by + Math.sin(a) * rr * br * 0.72;
+        if (Math.hypot((px - c.cx) / (br * 0.85), (py - by) / br) < 0.85) {
+          ctx.beginPath(); ctx.arc(px, py, 2.5, 0, 7); ctx.fill();
+        }
+      }
+    }
+  }
+}
+
+function drawMarbleOnString(cx, my, r, stringTopY) {
+  ctx.strokeStyle = "#eee"; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(cx, stringTopY !== undefined ? stringTopY : my - 150); ctx.lineTo(cx, my - r * 0.6); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, my, r, 0, 7);
+  ctx.fillStyle = "#d8cfc0"; ctx.fill();
+  ctx.strokeStyle = "#8a8070"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.45)";
+  ctx.beginPath(); ctx.arc(cx - r * 0.3, my - r * 0.35, r * 0.3, 0, 7); ctx.fill();
+  ctx.fillStyle = "#5a5044"; ctx.font = "bold 12px sans-serif"; ctx.textAlign = "center";
+  if (r > 16) ctx.fillText("CaCO₃", cx, my + 4);
+}
+
+function marbleR() { return 26 * (1 - 0.75 * reactT); }
+function easeOut(t) { return 1 - Math.pow(1 - t, 3); }
+
+function drawLiquidFx(which) {
+  const c = containerRect();
+  // 气泡
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  for (const b of bubbles) {
+    ctx.beginPath(); ctx.arc(c.x + b.dx, b.y, b.r, 0, 7); ctx.fill();
+  }
+  // 反应中的液面翻腾线
+  if ((phase === "s1_react" || phase === "s2_react") && reactT < 1) {
+    ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let x = 0; x <= c.w - 12; x += 8) {
+      const yy = c.top + Math.sin(x * 0.3 + performance.now() * 0.012) * 2.5;
+      if (x === 0) ctx.moveTo(c.x + 6, yy); else ctx.lineTo(c.x + 6 + x, yy);
+    }
+    ctx.stroke();
+  }
+}
+
+function drawPuffs() {
+  for (const p of puffs) {
+    ctx.globalAlpha = Math.max(0, p.life) * 0.8;
+    ctx.fillStyle = "#aeb8c4";
+    ctx.beginPath(); ctx.arc(p.x, p.y, 7 + (1 - p.life) * 8, 0, 7); ctx.fill();
+    if (p.label) {
+      ctx.fillStyle = "#e8eef4"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("CO₂", p.x, p.y - 14);
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawWeightShape(cx, cy, w) {
+  // 砝码：梯形台体 + 提手
+  ctx.fillStyle = "#5a6672";
+  ctx.beginPath();
+  ctx.moveTo(cx - w.r * 0.7, cy - w.r * 0.8);
+  ctx.lineTo(cx + w.r * 0.7, cy - w.r * 0.8);
+  ctx.lineTo(cx + w.r, cy + w.r * 0.7);
+  ctx.lineTo(cx - w.r, cy + w.r * 0.7);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "#2e3841"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.strokeStyle = "#5a6672"; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.arc(cx, cy - w.r * 0.9, w.r * 0.32, Math.PI, 0); ctx.stroke();
+  ctx.fillStyle = "#ffd54a"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(w.label, cx, cy + 2);
+}
+
+function drawTray() {
+  ctx.fillStyle = "rgba(10,20,30,0.45)";
+  roundRect(TRAY.x, TRAY.y, TRAY.w, TRAY.h, 20, true);
+  ctx.strokeStyle = "rgba(127,212,255,0.35)"; ctx.lineWidth = 2;
+  roundRect(TRAY.x, TRAY.y, TRAY.w, TRAY.h, 20); ctx.stroke();
+  ctx.fillStyle = "#7fd4ff"; ctx.font = "bold 22px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("🧰 工具台", TRAY.x + TRAY.w / 2, TRAY.y + 34);
+}
+
+function drawTrayItems() {
+  for (const k in items) {
+    const it = items[k];
+    if (!visibleItem(it) || it.state === "drag") continue;
+    drawItem(it);
+  }
+  if (drag) drawItem(drag.item);
+}
+
+function drawItem(it) {
+  switch (it.kind) {
+    case "beaker": drawBeakerShape(it.x, it.y + 65, 0.9); break;
+    case "flask":  drawFlaskShape(it.x, it.y + 70, 0.9); break;
+    case "weight": if (it.state !== "pan") drawWeightShape(it.x, it.y, it); break;
+    case "marble": drawMarbleOnString(it.x, it.y, 26, it.y - 90); break;
+    case "stopper": {
+      // 气球 + 瓶塞 + 吊着的大理石（组合件）
+      ctx.beginPath(); ctx.ellipse(it.x, it.y - 68, 12, 15, 0, 0, 7);
+      ctx.fillStyle = "rgba(255,110,110,0.85)"; ctx.fill();
+      ctx.strokeStyle = "#c23b3b"; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.fillStyle = "#c98f4e"; roundRect(it.x - 24, it.y - 46, 48, 22, 6, true);
+      drawMarbleOnString(it.x, it.y + 26, 24, it.y - 24);
+      break;
+    }
+  }
+}
+
+function drawDropZoneGlow() {
+  if (!drag) return;
+  const it = drag.item;
+  ctx.save();
+  ctx.setLineDash([10, 8]);
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 4;
+  if (it.kind === "beaker" || it.kind === "flask") {
+    roundRect(LP.x - 120, LP.y - 160, 240, 180, 16); ctx.stroke();
+  } else if (it.kind === "weight") {
+    roundRect(RP.x - 120, RP.y - 160, 240, 180, 16); ctx.stroke();
+  } else if (it.kind === "marble") {
+    const c = containerRect();
+    ctx.beginPath(); ctx.ellipse(c.cx, c.top - 10, 110, 60, 0, 0, 7); ctx.stroke();
+  } else if (it.kind === "stopper") {
+    const c = containerRect();
+    ctx.beginPath(); ctx.ellipse(c.cx, c.top - 70, 110, 70, 0, 0, 7); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawBoard() {
+  // 实验记录板（左下，避开气球与天平）
+  const bx = 24, by = 496;
+  ctx.fillStyle = "rgba(255,253,244,0.94)";
+  roundRect(bx, by, 268, 150, 14, true);
+  ctx.strokeStyle = "#c9b98a"; ctx.lineWidth = 3; roundRect(bx, by, 268, 150, 14); ctx.stroke();
+  ctx.fillStyle = "#5a4a30"; ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  ctx.font = "bold 18px sans-serif";
+  ctx.fillText("📝 实验记录", bx + 18, by + 30);
+  ctx.font = "16px sans-serif";
+  ctx.fillText(`天平读数：${leftMass().toFixed(1)} g`, bx + 18, by + 60);
+  if (reactT > 0 || phase === "s1_done" || phase === "done") {
+    ctx.fillStyle = "#d14800"; ctx.font = "bold 16px sans-serif";
+    if (step === 1) ctx.fillText(`跑到空气里的 CO₂：${escaped.toFixed(1)} g`, bx + 18, by + 90);
+    else ctx.fillText(`气球收集的 CO₂：${escaped.toFixed(1)} g`, bx + 18, by + 90);
+    ctx.fillStyle = "#5a4a30"; ctx.font = "14px sans-serif";
+    if (step === 1 && reactT >= 1) ctx.fillText("160.0 g → 155.6 g，变轻了！", bx + 18, by + 118);
+    if (step === 2 && reactT >= 1) ctx.fillText("162.0 g → 162.0 g，不变！", bx + 18, by + 118);
+  } else {
+    ctx.fillStyle = "#8a7a5a"; ctx.font = "14px sans-serif";
+    ctx.fillText(step === 1 ? "目标：观察敞口反应的质量变化" : "目标：密闭后质量还变吗？", bx + 18, by + 90);
+  }
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-7, -4, 14, 8);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#2b3a4a"; ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  drawBackground();
+  drawBoard();
+  drawBalance();
+  drawPuffs();
+  drawTray();
+  drawDropZoneGlow();
+  drawTrayItems();
+  drawConfetti();
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare() { [523, 659, 784, 1047, 1319].forEach((f, i) => setTimeout(() => pop(f), i * 140)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 3000);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+nextBtn.addEventListener("click", () => { pop(880); setupStep2(); });
+document.getElementById("replayBtn").addEventListener("click", () => { resetAll(); pop(880); });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

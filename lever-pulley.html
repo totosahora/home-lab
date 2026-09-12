@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>杠杆与滑轮</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#274b73; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #tabs {
+    position:absolute; top:10px; left:50%; transform:translateX(-50%);
+    z-index:10; display:flex; gap:10px;
+  }
+  .tab {
+    font-size:20px; font-weight:bold; padding:10px 26px; border-radius:26px;
+    border:none; background:rgba(255,255,255,0.25); color:#fff; cursor:pointer;
+  }
+  .tab.active { background:#ffd54a; color:#5a3d00; }
+  #toolbar {
+    position:absolute; top:64px; left:50%; transform:translateX(-50%);
+    z-index:10; display:flex; gap:10px; flex-wrap:wrap; justify-content:center;
+    max-width:96vw;
+  }
+  #toolbar button {
+    font-size:17px; font-weight:bold; padding:8px 18px; border-radius:22px;
+    border:none; background:rgba(255,255,255,0.92); color:#333; cursor:pointer;
+    box-shadow:0 2px 6px rgba(0,0,0,0.25);
+  }
+  #toolbar button:active { transform:scale(1.06); }
+  #toolbar button.sel { background:#7fd0ff; color:#0a3a5c; }
+  #toolbar button:disabled { opacity:0.4; }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,25,45,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; white-space:nowrap;
+    transition:opacity 0.6s; cursor:pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="tabs">
+  <button class="tab active" id="tabLever">⚖️ 杠杆</button>
+  <button class="tab" id="tabPulley">🎡 滑轮</button>
+</div>
+<div id="toolbar"></div>
+<div id="hint">把砝码拖到杠杆右边的刻度上，让右边的 质量×距离 ≥ 左边！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+const toolbar = document.getElementById("toolbar");
+let W = 0, H = 0, DPR = 1;
+
+// 设计坐标 1200 x 760，整体缩放居中
+const DW = 1200, DH = 760;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / DW, H / DH);
+  view.ox = (W - DW * view.s) / 2;
+  view.oy = (H - DH * view.s) / 2;
+}
+function toDesign(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+/* ================= 场景数据 ================= */
+let mode = "lever";   // lever | pulley
+
+// ---- 杠杆 ----
+const LV = {
+  px: 600, py: 420,       // 支点（屏幕位置固定，移动的是支点在杠杆上的位置）
+  markPx: 56,             // 1 格 = 56px
+  rightMarks: 6,          // 右边 6 个刻度
+  armList: [2, 4, 6],     // 支点左移/右移后，大象到支点的距离（格）
+  slot: 1,
+  heavy: true,            // 大象 4 / 小兔 2
+  placed: [],             // {mass, mark} 挂在右边的砝码
+  angle: 0,               // 当前倾角（正 = 右边下沉、大象翘起）
+  celebrated: false,
+};
+const LV_REST_A = 0.22;   // 大象落地时杠杆下倾角
+const LV_LIFT_A = 0.16;   // 翘起角
+const TRAY = { x0:170, y0:652, x1:1030, y1:746 };
+const trayWeights = [];   // {mass, x, y}
+(function initTray() {
+  const masses = [1,1,1,1, 2,2,2,2,2, 3,3,3,3];
+  masses.forEach((m, i) => trayWeights.push({ mass:m, x: 236 + i * 56, y: 700 }));
+})();
+
+function eleMass() { return LV.heavy ? 4 : 2; }
+function eleArm()  { return LV.armList[LV.slot]; }
+function leftTorque()  { return eleMass() * eleArm(); }
+function rightTorque() { return LV.placed.reduce((s, w) => s + w.mass * w.mark, 0); }
+
+function clearWeights() {
+  LV.placed = [];
+  LV.celebrated = false;
+  pop(400);
+  showHint("砝码收回盘子啦，再试一次！");
+}
+
+// ---- 滑轮 ----
+const PU = {
+  type: "fixed",          // fixed 定滑轮 | movable 动滑轮 | group 滑轮组(1定+1动)
+  pulled: 0,              // 已拉下的绳长(px)
+  done: false,
+  lastTick: 0,
+};
+const PU_MAXLIFT = 160;   // 重物最多升高 160px = 4 格
+const PU_GRID = 40;       // 显示用：40px = 1 格
+const PU_CRATE_TOP0 = 560;
+function puN() { return PU.type === "fixed" ? 1 : 2; }
+function puLift() { return PU.pulled / puN(); }
+function puCrateTop() { return PU_CRATE_TOP0 - puLift(); }
+function puHandle() {     // 绳子把手位置
+  if (PU.type === "movable") return { x:570, y:400 - PU.pulled };
+  return { x: PU.type === "group" ? 652 : 636, y:400 + PU.pulled };
+}
+
+/* ================= 工具栏与切换 ================= */
+function buildToolbar() {
+  toolbar.innerHTML = "";
+  const mk = (label, fn) => {
+    const b = document.createElement("button");
+    b.innerHTML = label;
+    b.addEventListener("click", fn);
+    toolbar.appendChild(b);
+    return b;
+  };
+  if (mode === "lever") {
+    const bl = mk("支点左移 ◀", () => { LV.slot = Math.max(0, LV.slot - 1); pop(520); buildToolbar(); });
+    const br = mk("支点右移 ▶", () => { LV.slot = Math.min(2, LV.slot + 1); pop(680); buildToolbar(); });
+    bl.disabled = LV.slot === 0;
+    br.disabled = LV.slot === 2;
+    mk(LV.heavy ? "🐘 重物：重" : "🐑 重物：轻", () => {
+      LV.heavy = !LV.heavy; LV.celebrated = false; pop(600); buildToolbar();
+    });
+    mk("🧹 清空砝码", clearWeights);
+  } else {
+    for (const [t, name] of [["fixed","定滑轮"],["movable","动滑轮"],["group","滑轮组"]]) {
+      const b = mk(name, () => {
+        PU.type = t; PU.pulled = 0; PU.done = false; PU.lastTick = 0;
+        pop(600); buildToolbar();
+        showHint(t === "fixed" ? "抓住圆环把手往下拉！" :
+                 t === "movable" ? "这次要往上拉哦！看看力气条变了没？" :
+                 "滑轮组：还是往下拉，比比要拉多长的绳！");
+      });
+      if (PU.type === t) b.classList.add("sel");
+    }
+    mk("🔄 放下重来", () => { PU.pulled = 0; PU.done = false; PU.lastTick = 0; pop(400); });
+  }
+}
+document.getElementById("tabLever").addEventListener("click", () => {
+  if (mode === "lever") return;
+  mode = "lever"; pop(500);
+  document.getElementById("tabLever").classList.add("active");
+  document.getElementById("tabPulley").classList.remove("active");
+  buildToolbar();
+  showHint("把砝码拖到杠杆右边的刻度上，让右边的 质量×距离 ≥ 左边！");
+});
+document.getElementById("tabPulley").addEventListener("click", () => {
+  if (mode === "pulley") return;
+  mode = "pulley"; pop(700);
+  document.getElementById("tabPulley").classList.add("active");
+  document.getElementById("tabLever").classList.remove("active");
+  buildToolbar();
+  showHint("抓住圆环把手往下拉，把箱子提到 ⭐ 线！");
+});
+buildToolbar();
+
+/* ================= 交互 ================= */
+// drag: {kind:"weight", mass, fromTray} | {kind:"rope"}
+let drag = null;
+let dragPos = { x:0, y:0 };
+let ropeGrab = 0;
+
+// 指针坐标 → 杠杆坐标系（原点支点，x 沿杠杆向右，抵消倾角）
+function toBeam(dx, dy) {
+  const x = dx - LV.px, y = dy - LV.py;
+  const c = Math.cos(LV.angle), s = Math.sin(LV.angle);
+  return [x * c + y * s, -x * s + y * c];
+}
+// 杠杆坐标系中某点的世界坐标（挂钩、砝码定位用）
+function beamPoint(bx, by) {
+  const c = Math.cos(LV.angle), s = Math.sin(LV.angle);
+  return [LV.px + bx * c - by * s, LV.py + bx * s + by * c];
+}
+// 第 k 刻度第 j 层砝码的中心（世界坐标）
+function placedWeightPos(mark, j) { return beamPoint(mark * LV.markPx, 38 + j * 30); }
+
+canvas.addEventListener("pointerdown", e => {
+  const [dx, dy] = toDesign(e.clientX, e.clientY);
+  dragPos = { x:dx, y:dy };
+  hintEl.style.opacity = "0";
+  if (mode === "lever") {
+    // 先查已挂砝码（从最上层/最远刻度找起），再查砝码盘
+    const byMark = {};
+    LV.placed.forEach((w, i) => { (byMark[w.mark] = byMark[w.mark] || []).push(i); });
+    for (let mi = LV.placed.length - 1; mi >= 0; mi--) {
+      const w = LV.placed[mi];
+      const layer = byMark[w.mark].indexOf(mi);
+      const [cx, cy] = placedWeightPos(w.mark, layer);
+      if (Math.abs(dx - cx) < 30 && Math.abs(dy - cy) < 26) {
+        LV.placed.splice(mi, 1);
+        LV.celebrated = false;
+        drag = { kind:"weight", mass:w.mass, fromTray:false };
+        pop(760);
+        canvas.setPointerCapture(e.pointerId);
+        return;
+      }
+    }
+    for (const t of trayWeights) {
+      if (Math.hypot(dx - t.x, dy - t.y) < 34) {
+        drag = { kind:"weight", mass:t.mass, fromTray:true };
+        pop(760);
+        canvas.setPointerCapture(e.pointerId);
+        return;
+      }
+    }
+  } else {
+    const h = puHandle();
+    if (Math.hypot(dx - h.x, dy - h.y) < 44) {
+      drag = { kind:"rope" };
+      ropeGrab = dy - h.y;
+      pop(660);
+      canvas.setPointerCapture(e.pointerId);
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const [dx, dy] = toDesign(e.clientX, e.clientY);
+  dragPos = { x:dx, y:dy };
+  if (drag.kind === "rope") {
+    const h = puHandle();
+    const newHY = dy - ropeGrab;
+    let pulled = PU.type === "movable" ? 400 - newHY : newHY - 400;
+    pulled = Math.max(0, Math.min(puN() * PU_MAXLIFT, pulled));
+    if (Math.floor(pulled / 26) !== Math.floor(PU.pulled / 26)) clack(0.25);  // 棘轮咔哒声
+    PU.pulled = pulled;
+  }
+});
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  if (drag.kind === "weight") {
+    const [bx, by] = toBeam(dragPos.x, dragPos.y);
+    const mark = Math.round(bx / LV.markPx);
+    const inTray = dragPos.x > TRAY.x0 - 20 && dragPos.x < TRAY.x1 + 20 &&
+                   dragPos.y > TRAY.y0 - 30 && dragPos.y < TRAY.y1 + 30;
+    if (!inTray && mark >= 1 && mark <= LV.rightMarks && by > -50 && by < 240) {
+      LV.placed.push({ mass:drag.mass, mark });
+      pop(880);
+    } else {
+      pop(360);   // 放回盘子
+    }
+  } else if (drag.kind === "rope") {
+    pop(500);
+  }
+  drag = null;
+});
+
+/* ================= 逻辑步进 ================= */
+function step(dt) {
+  if (mode === "lever") {
+    const lt = leftTorque(), rt = rightTorque();
+    const ratio = lt > 0 ? Math.min(1, rt / lt) : 1;
+    const target = -LV_REST_A + ratio * (LV_REST_A + LV_LIFT_A);
+    LV.angle += (target - LV.angle) * Math.min(1, dt * 7);
+    if (rt >= lt && rt > 0 && !LV.celebrated) {
+      LV.celebrated = true;
+      const [hx] = beamPoint(-eleArm() * LV.markPx, 0);
+      burst(hx, LV.py - 120);
+      fanfare();
+      showHint("🎉 翘起来啦！右边的 质量×距离 ≥ 左边，重物被举起！");
+    }
+  } else {
+    if (!PU.done && PU.pulled >= puN() * PU_MAXLIFT - 0.5) {
+      PU.done = true;
+      const cx = PU.type === "fixed" ? 564 : 540;
+      burst(cx, puCrateTop() - 40);
+      fanfare();
+      showHint(PU.type === "fixed"
+        ? "🎉 升高 4 格，拉了 4 格绳，用了 10 份力气。换动滑轮试试！"
+        : "🎉 同样升高 4 格：只出 5 份力，却拉了 8 格绳！省力就要多拉绳～");
+    }
+  }
+  // 彩带
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const p = confetti[i];
+    p.t += dt;
+    if (p.t > p.life) { confetti.splice(i, 1); continue; }
+    p.vy += 620 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.rot += p.vr * dt;
+  }
+}
+
+/* ================= 绘制：公共 ================= */
+const confetti = [];
+const CONF_COLORS = ["#ff5252", "#ffd54a", "#69f0ae", "#40c4ff", "#e040fb", "#ff9800"];
+function burst(x, y) {
+  for (let i = 0; i < 70; i++) {
+    confetti.push({
+      x, y,
+      vx:(Math.random() - 0.5) * 520, vy:-Math.random() * 460 - 80,
+      c:CONF_COLORS[i % CONF_COLORS.length],
+      w:6 + Math.random() * 6, h:4 + Math.random() * 5,
+      rot:Math.random() * 7, vr:(Math.random() - 0.5) * 12,
+      t:0, life:1.1 + Math.random() * 0.6,
+    });
+  }
+}
+function drawConfetti() {
+  for (const p of confetti) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.globalAlpha = Math.max(0, 1 - p.t / p.life);
+    ctx.fillStyle = p.c;
+    ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+function panel(x, y, w, h, fill) {
+  ctx.fillStyle = fill || "rgba(10,25,45,0.72)";
+  roundRect(x, y, w, h, 14, true);
+}
+
+/* ================= 绘制：杠杆 ================= */
+function drawLeverBG() {
+  const g = ctx.createLinearGradient(0, 0, 0, DH);
+  g.addColorStop(0, "#8ed0f5"); g.addColorStop(0.72, "#d8f0ff"); g.addColorStop(0.72, "#7cc46a"); g.addColorStop(1, "#5da84d");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, DW, DH);
+  // 太阳和云
+  ctx.fillStyle = "#ffe27a";
+  ctx.beginPath(); ctx.arc(1090, 96, 46, 0, 7); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  for (const [cx, cy, r] of [[170,120,30],[205,128,24],[140,130,20],[960,190,24],[990,198,18]]) {
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fill();
+  }
+}
+
+function drawWeightShape(cx, cy, mass) {
+  const colors = { 1:"#aebccb", 2:"#ffb840", 3:"#ff6b6b" };
+  // 顶部挂环
+  ctx.strokeStyle = "#555"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(cx, cy - 19, 5, 0, 7); ctx.stroke();
+  // 砝码身体（圆台）
+  ctx.beginPath();
+  ctx.moveTo(cx - 10, cy - 14);
+  ctx.lineTo(cx + 10, cy - 14);
+  ctx.lineTo(cx + 20, cy + 13);
+  ctx.lineTo(cx - 20, cy + 13);
+  ctx.closePath();
+  ctx.fillStyle = colors[mass] || "#999";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(mass, cx, cy + 1);
+}
+
+function drawLever() {
+  const arm = eleArm() * LV.markPx;
+  const lt = leftTorque(), rt = rightTorque();
+  const lifted = rt >= lt && rt > 0;
+
+  // 大象脚下的草地（支点档位决定位置）
+  const restDrop = arm * Math.sin(LV_REST_A);
+  const groundY = LV.py + restDrop + 116;
+  const groundX = LV.px - arm * Math.cos(LV_REST_A);
+  ctx.fillStyle = "#4e9640";
+  ctx.beginPath(); ctx.ellipse(groundX, groundY + 8, 110, 18, 0, 0, 7); ctx.fill();
+
+  // ---- 杠杆（随倾角旋转） ----
+  ctx.save();
+  ctx.translate(LV.px, LV.py);
+  ctx.rotate(LV.angle);
+  const beamL = -arm - 26, beamR = LV.rightMarks * LV.markPx + 26;
+  // 杠杆木板
+  const bg = ctx.createLinearGradient(0, -10, 0, 10);
+  bg.addColorStop(0, "#d9a355"); bg.addColorStop(1, "#a8713a");
+  ctx.fillStyle = bg;
+  roundRect(beamL, -10, beamR - beamL, 20, 8, true);
+  ctx.strokeStyle = "rgba(90,55,15,0.6)"; ctx.lineWidth = 2;
+  roundRect(beamL, -10, beamR - beamL, 20, 8, false); ctx.stroke();
+  // 右边刻度与数字
+  ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+  for (let k = 1; k <= LV.rightMarks; k++) {
+    ctx.strokeStyle = "#5a3d00"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(k * LV.markPx, -10); ctx.lineTo(k * LV.markPx, -20); ctx.stroke();
+    ctx.fillStyle = "#4a2f00";
+    ctx.font = "bold 17px sans-serif";
+    ctx.fillText(k, k * LV.markPx, -26);
+  }
+  // 左臂距离标注
+  ctx.fillStyle = "#4a2f00";
+  ctx.font = "bold 16px sans-serif";
+  ctx.fillText(eleArm() + " 格", -arm / 2, -20);
+  // 已挂砝码
+  const byMark = {};
+  LV.placed.forEach(w => { (byMark[w.mark] = byMark[w.mark] || []).push(w); });
+  for (const mark of Object.keys(byMark)) {
+    byMark[mark].forEach((w, j) => {
+      const wy = 38 + j * 30;
+      ctx.strokeStyle = "#444"; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(mark * LV.markPx, 10); ctx.lineTo(mark * LV.markPx, wy - 24); ctx.stroke();
+      drawWeightShape(mark * LV.markPx, wy, w.mass);
+    });
+  }
+  ctx.restore();
+
+  // ---- 支点 ----
+  ctx.fillStyle = "#7a7a8c";
+  ctx.beginPath();
+  ctx.moveTo(LV.px - 42, LV.py + 86); ctx.lineTo(LV.px + 42, LV.py + 86); ctx.lineTo(LV.px, LV.py + 6);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#5c5c6e";
+  ctx.fillRect(LV.px - 56, LV.py + 84, 112, 12);
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("支点", LV.px, LV.py + 112);
+
+  // ---- 大象/小兔（竖直挂在杠杆左端） ----
+  const [hx, hy] = beamPoint(-arm, 0);
+  ctx.strokeStyle = "#555"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(hx, hy + 42); ctx.stroke();
+  ctx.font = "64px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+  ctx.fillText(LV.heavy ? "🐘" : "🐑", hx, hy + 42 + 58);
+  // 质量标签
+  ctx.fillStyle = "rgba(10,25,45,0.8)";
+  roundRect(hx - 40, hy + 96, 80, 26, 13, true);
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 16px sans-serif";
+  ctx.textBaseline = "middle";
+  ctx.fillText("质量 " + eleMass(), hx, hy + 110);
+
+  // ---- 砝码盘 ----
+  ctx.fillStyle = "rgba(90,55,15,0.85)";
+  roundRect(TRAY.x0, TRAY.y0, TRAY.x1 - TRAY.x0, TRAY.y1 - TRAY.y0, 18, true);
+  ctx.fillStyle = "#ffe9c0";
+  ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("🧺 砝码盘 —— 把砝码拖到右边刻度上", (TRAY.x0 + TRAY.x1) / 2, TRAY.y0 + 20);
+  for (const t of trayWeights) drawWeightShape(t.x, t.y + 12, t.mass);
+
+  // ---- 力矩面板（把看不见的“质量×距离”画出来） ----
+  panel(24, 108, 330, 92);
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "#ffd54a"; ctx.font = "bold 20px sans-serif";
+  ctx.fillText(LV.heavy ? "🐘 左边（重物）" : "🐑 左边（重物）", 44, 138);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 24px sans-serif";
+  ctx.fillText(`${eleMass()} × ${eleArm()}格 = ${lt}`, 44, 172);
+  ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.font = "14px sans-serif";
+  ctx.fillText("质量 × 到支点的距离", 44, 192);
+
+  panel(846, 108, 330, 92, lifted ? "rgba(20,90,40,0.82)" : "rgba(10,25,45,0.72)");
+  ctx.fillStyle = "#7fd0ff"; ctx.font = "bold 20px sans-serif";
+  ctx.fillText("🧺 右边（砝码）", 866, 138);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 24px sans-serif";
+  ctx.fillText(`合计 = ${rt}`, 866, 172);
+  ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.font = "14px sans-serif";
+  ctx.fillText("每个砝码：质量 × 刻度，再相加", 866, 192);
+
+  // 中间对比符号
+  ctx.fillStyle = lifted ? "#69f0ae" : "#ffffff";
+  ctx.font = "bold 40px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const sign = rt === 0 ? "？" : (lifted ? "≥ 🎉" : "＜");
+  ctx.fillText(sign, 600, 152);
+  ctx.font = "bold 17px sans-serif";
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.fillText(`右边 ${rt}    左边 ${lt}`, 600, 186);
+
+  // 拖拽中的砝码
+  if (drag && drag.kind === "weight") drawWeightShape(dragPos.x, dragPos.y, drag.mass);
+}
+
+/* ================= 绘制：滑轮 ================= */
+function drawPulleyBG() {
+  const g = ctx.createLinearGradient(0, 0, 0, DH);
+  g.addColorStop(0, "#3d5a80"); g.addColorStop(0.8, "#98c1d9"); g.addColorStop(0.8, "#8d6e4f"); g.addColorStop(1, "#6e533a");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, DW, DH);
+  // 天花板横梁
+  ctx.fillStyle = "#5a3d1e";
+  ctx.fillRect(0, 60, DW, 30);
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  ctx.fillRect(0, 60, DW, 5);
+}
+
+function drawPulleyWheel(cx, cy, r) {
+  ctx.beginPath(); ctx.arc(cx, cy, r + 7, 0, 7);
+  ctx.fillStyle = "#8a5a2e"; ctx.fill();
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7);
+  ctx.fillStyle = "#e0e6ee"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 7);
+  ctx.fillStyle = "#555"; ctx.fill();
+}
+function drawCrate(cx, topY) {
+  const w = 96, h = 74;
+  ctx.fillStyle = "#c98d4b";
+  roundRect(cx - w / 2, topY, w, h, 6, true);
+  ctx.strokeStyle = "rgba(90,55,15,0.8)"; ctx.lineWidth = 3;
+  roundRect(cx - w / 2, topY, w, h, 6, false); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx - w / 2, topY + h / 2); ctx.lineTo(cx + w / 2, topY + h / 2); ctx.stroke();
+  ctx.font = "34px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("🐘", cx, topY + h / 2);
+  ctx.fillStyle = "rgba(10,25,45,0.85)";
+  roundRect(cx - 34, topY - 30, 68, 24, 12, true);
+  ctx.fillStyle = "#ffd54a"; ctx.font = "bold 15px sans-serif";
+  ctx.fillText("重 10 份", cx, topY - 17);
+}
+function drawHandle(h) {
+  ctx.beginPath(); ctx.arc(h.x, h.y, 17, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  ctx.strokeStyle = "#8a6d00"; ctx.lineWidth = 4; ctx.stroke();
+  ctx.beginPath(); ctx.arc(h.x, h.y, 7, 0, 7);
+  ctx.fillStyle = "#8a6d00"; ctx.fill();
+  // 新手指引箭头
+  if (PU.pulled < 1 && !drag) {
+    const bob = Math.sin(performance.now() / 300) * 8;
+    ctx.font = "bold 20px sans-serif";
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillStyle = "#fff";
+    ctx.fillText(PU.type === "movable" ? "👆 拉住往上拉" : "👇 拉住往下拉", h.x + 30, h.y + bob);
+  }
+}
+
+function drawPulley() {
+  const n = puN();
+  const crateTop = puCrateTop();
+  const cx = PU.type === "fixed" ? 564 : 540;
+  const h = puHandle();
+  const ropeC = "#e8c877";
+
+  // 目标线 ⭐
+  ctx.setLineDash([10, 10]);
+  ctx.strokeStyle = "rgba(255,213,74,0.9)"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx - 120, PU_CRATE_TOP0 - PU_MAXLIFT); ctx.lineTo(cx + 120, PU_CRATE_TOP0 - PU_MAXLIFT); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.font = "26px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("⭐", cx + 140, PU_CRATE_TOP0 - PU_MAXLIFT);
+
+  ctx.strokeStyle = ropeC; ctx.lineWidth = 5;
+  ctx.lineCap = "round";
+
+  if (PU.type === "fixed") {
+    // 支架
+    ctx.strokeStyle = "#666"; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.moveTo(600, 90); ctx.lineTo(600, 130); ctx.stroke();
+    // 绳子：箱顶 → 滑轮上方 → 把手
+    ctx.strokeStyle = ropeC; ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(564, crateTop);
+    ctx.lineTo(564, 130);
+    ctx.arc(600, 130, 36, Math.PI, 0, false);       // 从滑轮顶部翻过
+    ctx.lineTo(636, h.y);
+    ctx.stroke();
+    drawPulleyWheel(600, 130, 36);
+    drawCrate(cx, crateTop);
+  } else if (PU.type === "movable") {
+    const mCY = crateTop - 40;
+    // 绳子：天花板固定点 → 动滑轮下方 → 把手（往上拉）
+    ctx.beginPath();
+    ctx.moveTo(510, 90);
+    ctx.lineTo(510, mCY);
+    ctx.arc(540, mCY, 30, Math.PI, 0, true);         // 从滑轮下方绕过
+    ctx.lineTo(570, h.y);
+    ctx.stroke();
+    // 固定点小旗
+    ctx.fillStyle = "#e93b3b";
+    ctx.beginPath(); ctx.moveTo(510, 90); ctx.lineTo(510, 66); ctx.lineTo(534, 78); ctx.closePath(); ctx.fill();
+    drawPulleyWheel(540, mCY, 30);
+    // 动滑轮与箱子之间的背带
+    ctx.strokeStyle = "#666"; ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(540, mCY + 30); ctx.lineTo(540, crateTop); ctx.stroke();
+    drawCrate(cx, crateTop);
+  } else {
+    const mCY = crateTop - 40;
+    // 定滑轮支架
+    ctx.strokeStyle = "#666"; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.moveTo(620, 90); ctx.lineTo(620, 130); ctx.stroke();
+    // 绳子：定滑轮架下锚点 → 动滑轮下方 → 定滑轮上方 → 把手
+    ctx.strokeStyle = "#666"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(586, 152); ctx.lineTo(586, 168); ctx.stroke();
+    ctx.strokeStyle = ropeC; ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(586, 168);
+    ctx.lineTo(570, mCY);
+    ctx.arc(540, mCY, 30, 0, Math.PI, false);        // 从动滑轮下方绕过
+    ctx.lineTo(588, 130);
+    ctx.arc(620, 130, 32, Math.PI, 0, false);        // 从定滑轮上方翻过
+    ctx.lineTo(652, h.y);
+    ctx.stroke();
+    drawPulleyWheel(620, 130, 32);
+    drawPulleyWheel(540, mCY, 30);
+    ctx.strokeStyle = "#666"; ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(540, mCY + 30); ctx.lineTo(540, crateTop); ctx.stroke();
+    drawCrate(cx, crateTop);
+  }
+  drawHandle(h);
+
+  // 地面
+  ctx.fillStyle = "rgba(0,0,0,0.18)";
+  ctx.beginPath(); ctx.ellipse(cx, 660, 120, 16, 0, 0, 7); ctx.fill();
+
+  // ---- 数据面板 ----
+  const liftG = puLift() / PU_GRID, ropeG = PU.pulled / PU_GRID;
+  panel(24, 108, 320, 108);
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "#ffd54a"; ctx.font = "bold 20px sans-serif";
+  ctx.fillText(PU.type === "fixed" ? "🎡 定滑轮" : PU.type === "movable" ? "🎡 动滑轮" : "🎡 滑轮组（1定+1动）", 44, 138);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 21px sans-serif";
+  ctx.fillText(`⬆️ 箱子升高：${liftG.toFixed(1)} / 4 格`, 44, 168);
+  ctx.fillText(`📏 拉了绳子：${ropeG.toFixed(1)} 格`, 44, 196);
+
+  // 力气条（手感轻重）
+  panel(856, 108, 320, 108);
+  ctx.fillStyle = "#7fd0ff"; ctx.font = "bold 20px sans-serif";
+  ctx.fillText("💪 需要的力气", 876, 138);
+  const cells = 10, need = 10 / n;
+  for (let i = 0; i < cells; i++) {
+    ctx.fillStyle = i < need ? (n === 1 ? "#ff7043" : "#69f0ae") : "rgba(255,255,255,0.18)";
+    roundRect(876 + i * 27, 150, 22, 22, 5, true);
+  }
+  ctx.fillStyle = "#fff"; ctx.font = "bold 17px sans-serif";
+  ctx.fillText(n === 1 ? "10 份力气 —— 很沉！" : "5 份力气 —— 省了一半！", 876, 198);
+
+  // 省力说明（放左下角，避开把手与箱子）
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText(n === 2
+    ? "💡 2 段绳子一起扛箱子 → 省力一半，但要多拉 1 倍的绳"
+    : "💡 1 段绳子扛箱子 → 不省力，拉多长绳就升多高", 30, 726);
+}
+
+/* ================= 主循环 ================= */
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#274b73";
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  if (mode === "lever") { drawLeverBG(); drawLever(); }
+  else { drawPulleyBG(); drawPulley(); }
+  drawConfetti();
+  ctx.restore();
+}
+
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  step(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const clack = v => tone(1100 + Math.random() * 400, 0.05, 0.04 + 0.12 * v, "square");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3200);
+}
+hintEl.addEventListener("pointerdown", () => { hintEl.style.opacity = "0"; });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>神秘袋子 · 统计抽球</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#20242e; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,12,20,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,12,20,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  #btnbar {
+    position:absolute; left:50%; transform:translateX(-50%); bottom:64px;
+    z-index:10; display:flex; gap:16px;
+  }
+  #btnbar button {
+    font-size:21px; font-weight:bold; padding:14px 30px;
+    border-radius:30px; border:none; cursor:pointer;
+    box-shadow:0 4px 10px rgba(0,0,0,0.45);
+  }
+  #btnbar button:active { transform:scale(1.06); }
+  #drawBtn { background:#ffd54a; color:#5a3d00; }
+  #draw10Btn { background:#4fc3f7; color:#08304a; }
+  #btnbar button:disabled { opacity:0.35; cursor:default; transform:none; }
+  #nextBtn {
+    position:absolute; z-index:11; display:none;
+    font-size:21px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#7ee081; color:#0a3a12;
+    cursor:pointer; box-shadow:0 4px 12px rgba(0,0,0,0.5);
+  }
+  #nextBtn:active { transform:scale(1.06); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.55);
+  }
+  #winPanel .msg {
+    font-size:30px; font-weight:bold; color:#ffd54a; line-height:1.7;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">第 1 / 2 轮 · 摸球：0 / 100 次</div>
+<div id="hint">神秘袋子里有红球和蓝球，点「摸一个」摸摸看！摸完会放回去哦</div>
+<div id="btnbar">
+  <button id="drawBtn">🎲 摸一个</button>
+  <button id="draw10Btn">⚡ 连摸 10 次</button>
+</div>
+<button id="nextBtn">下一轮 ▶</button>
+<div id="winPanel">
+  <div class="msg"></div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const drawBtn = document.getElementById("drawBtn");
+const draw10Btn = document.getElementById("draw10Btn");
+const nextBtn = document.getElementById("nextBtn");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 两轮：每轮袋中 10 个球，红球数分别为 7、5（孩子事先不知道）
+const ROUNDS = [
+  { red: 7, total: 10 },
+  { red: 5, total: 10 }
+];
+const MAX_DRAWS = 100;     // 摸满 100 次开袋揭晓
+const GUESS_AT = 20;       // 20 次后解锁猜测滑杆
+
+let roundIdx = 0;
+let draws = [];            // true = 红球
+let guess = 50;            // 猜测的红球百分比 0-100
+let guessMade = false;     // 孩子是否真的拖过滑杆
+let revealed = false;      // 是否已开袋
+let revealT = 0;           // 开袋动画进度 0..1
+let flyBalls = [];         // 飞行中的球动画 {red, t0, dur, from, to}
+let queueN = 0;            // 待摸次数（连摸用）
+let lastDrawT = 0;
+let hinted = {};           // 引导提示只触发一次
+let roundResults = [];     // [{trueP, guess, err}]
+
+function trueP() { return ROUNDS[roundIdx].red / ROUNDS[roundIdx].total; }
+function redCount() { return draws.filter(d => d).length; }
+function curFreq() { return draws.length ? redCount() / draws.length : 0; }
+
+function resetRound() {
+  draws = [];
+  guess = 50;
+  guessMade = false;
+  revealed = false;
+  revealT = 0;
+  flyBalls = [];
+  queueN = 0;
+  hinted = {};
+  nextBtn.style.display = "none";
+  updateUI();
+  showHint("新袋子！里面的比例可能不一样了，重新摸吧！");
+}
+function resetGame() {
+  roundIdx = 0;
+  roundResults = [];
+  winPanel.style.display = "none";
+  resetRound();
+  hintEl.textContent = "神秘袋子里有红球和蓝球，点「摸一个」摸摸看！摸完会放回去哦";
+  hintEl.style.opacity = "1";
+}
+
+function updateUI() {
+  scorebar.textContent = `第 ${roundIdx + 1} / ${ROUNDS.length} 轮 · 摸球：${draws.length} / ${MAX_DRAWS} 次`;
+  const canDraw = !revealed && draws.length < MAX_DRAWS;
+  drawBtn.disabled = !canDraw;
+  draw10Btn.disabled = !canDraw;
+}
+
+/* ================= 布局（屏幕坐标） ================= */
+const L = {};
+function layout() {
+  const leftW = W * 0.52;
+  // 袋子：左半区中央偏上
+  L.bagX = leftW / 2;
+  L.bagY = H * 0.30;
+  L.bagW = Math.min(leftW * 0.72, 340);
+  L.bagH = L.bagW * 0.85;
+  // 最近摸球展示槽（袋下方两行，每行 6 个）
+  L.trayR = Math.max(13, Math.min(20, leftW / 22));
+  L.trayX0 = L.bagX - L.trayR * 6.2;
+  L.trayY0 = L.bagY + L.bagH * 0.62;
+  L.trayGap = L.trayR * 2.45;
+  // 右侧面板
+  L.panX = leftW + 14;
+  L.panY = 64;
+  L.panW = W - L.panX - 16;
+  L.panH = H - L.panY - 120;
+  // 图表区（面板中部）
+  L.chX = L.panX + 46;
+  L.chY = L.panY + 108;
+  L.chW = L.panW - 66;
+  L.chH = Math.max(120, L.panH * 0.42);
+  // 猜测滑杆（面板底部）
+  L.slX0 = L.panX + 46;
+  L.slX1 = L.panX + L.panW - 20;
+  L.slY = L.panY + L.panH - 56;
+  // 「下一轮」按钮放在面板底部中央
+  nextBtn.style.left = (L.panX + L.panW / 2) + "px";
+  nextBtn.style.top = (L.panY + L.panH - 66) + "px";
+  nextBtn.style.transform = "translateX(-50%)";
+}
+
+function trayPos(i) {   // i: 0..11
+  return {
+    x: L.trayX0 + (i % 6) * L.trayGap,
+    y: L.trayY0 + Math.floor(i / 6) * L.trayGap
+  };
+}
+
+/* ================= 摸球流程 ================= */
+function doDraw() {
+  if (revealed || draws.length >= MAX_DRAWS) return;
+  const red = Math.random() < trueP();
+  draws.push(red);
+  const to = trayPos((draws.length - 1) % 12);
+  flyBalls.push({
+    red, t0: performance.now(), dur: 450,
+    from: { x: L.bagX, y: L.bagY - L.bagH * 0.28 }, to
+  });
+  pop(red ? 660 : 520);
+  updateUI();
+  guide();
+  if (draws.length >= MAX_DRAWS) {
+    revealed = true;
+    revealT = 0;
+    queueN = 0;
+    setTimeout(() => {
+      fanfare();
+      const tp = trueP();
+      const g = guessMade ? guess : null;
+      const err = g === null ? null : Math.abs(g - tp * 100);
+      roundResults[roundIdx] = { trueP: tp, guess: g, err };
+      let msg = `🎉 开袋啦！红球真实比例是 ${Math.round(tp * 100)}%！`;
+      if (g !== null) msg += ` 你猜 ${g}%，误差 ${Math.round(err)}%`;
+      showHint(msg);
+      nextBtn.textContent = roundIdx + 1 < ROUNDS.length ? "下一轮 ▶" : "🏁 查看总结";
+      nextBtn.style.display = "block";
+    }, 1100);
+  }
+}
+
+function guide() {
+  const n = draws.length;
+  const once = (k, t) => { if (!hinted[k]) { hinted[k] = true; showHint(t); } };
+  if (n === 1) once("d1", "很好！每摸完一个都放回袋子里，所以每次互不影响");
+  if (n === 10) once("d10", "摸 10 次够吗？看右边的折线，是不是还晃得厉害？");
+  if (n === GUESS_AT) once("d20", "🔓 解锁「我的猜测」！拖动下面的滑杆，估一估红球占百分之几");
+  if (n === 50) once("d50", "折线平稳多了！摸的次数越多，频率越接近真实比例");
+  if (n === 90) once("d90", "再摸 10 次就开袋揭晓，抓紧调整你的猜测！");
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBallShape(x, y, r, red, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha === undefined ? 1 : alpha;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+  const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.15, x, y, r);
+  if (red) { g.addColorStop(0, "#ff8a80"); g.addColorStop(1, "#d32f2f"); }
+  else     { g.addColorStop(0, "#90caf9"); g.addColorStop(1, "#1565c0"); }
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.beginPath(); ctx.arc(x - r * 0.32, y - r * 0.36, r * 0.28, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.6)"; ctx.fill();
+  ctx.restore();
+}
+
+function drawBag() {
+  const { bagX: cx, bagY: cy, bagW: bw, bagH: bh } = L;
+  // 开袋动画：袋身上移并淡出，露出里面的 10 个球
+  let lift = 0, bagAlpha = 1;
+  if (revealed) {
+    lift = revealT * bh * 1.1;
+    bagAlpha = 1 - revealT * 0.92;
+  }
+  // 袋内真实的球（开袋时显现）
+  if (revealed && revealT > 0.25) {
+    const a = Math.min(1, (revealT - 0.25) / 0.5);
+    const R = ROUNDS[roundIdx];
+    const br = Math.min(26, bw / 7);
+    for (let i = 0; i < R.total; i++) {
+      const row = Math.floor(i / 5), col = i % 5;
+      const x = cx + (col - 2) * br * 2.3;
+      const y = cy - bh * 0.05 + row * br * 2.3;
+      drawBallShape(x, y, br, i < R.red, a);
+    }
+    if (a > 0.6) {
+      ctx.save();
+      ctx.globalAlpha = a;
+      ctx.fillStyle = "#ffd54a";
+      ctx.font = `bold ${Math.round(br * 0.95)}px "PingFang SC",sans-serif`;
+      ctx.textAlign = "center";
+      ctx.fillText(`红 ${R.red} 个 · 蓝 ${R.total - R.red} 个`, cx, cy + bh * 0.42);
+      ctx.restore();
+    }
+  }
+  // 袋身（不透明的布袋子）
+  ctx.save();
+  ctx.globalAlpha = bagAlpha;
+  ctx.translate(cx, cy - lift);
+  const w2 = bw / 2, h2 = bh / 2;
+  // 袋口绳结
+  ctx.fillStyle = "#8d6e63";
+  ctx.beginPath();
+  ctx.moveTo(-w2 * 0.28, -h2 * 0.62);
+  ctx.quadraticCurveTo(0, -h2 * 0.98, w2 * 0.28, -h2 * 0.62);
+  ctx.lineTo(w2 * 0.2, -h2 * 0.45);
+  ctx.lineTo(-w2 * 0.2, -h2 * 0.45);
+  ctx.closePath(); ctx.fill();
+  // 袋身
+  const g = ctx.createLinearGradient(-w2, 0, w2, 0);
+  g.addColorStop(0, "#6d4c41"); g.addColorStop(0.5, "#a1887f"); g.addColorStop(1, "#5d4037");
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(-w2 * 0.42, -h2 * 0.5);
+  ctx.bezierCurveTo(-w2 * 1.05, -h2 * 0.2, -w2 * 0.95, h2 * 0.75, 0, h2 * 0.88);
+  ctx.bezierCurveTo(w2 * 0.95, h2 * 0.75, w2 * 1.05, -h2 * 0.2, w2 * 0.42, -h2 * 0.5);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 3; ctx.stroke();
+  // 问号
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.font = `bold ${Math.round(bh * 0.42)}px "PingFang SC",sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("?", 0, bh * 0.1);
+  ctx.restore();
+}
+
+function drawTray() {
+  const n = Math.min(draws.length, 12);
+  for (let i = 0; i < 12; i++) {
+    const p = trayPos(i);
+    ctx.beginPath(); ctx.arc(p.x, p.y, L.trayR, 0, 7);
+    ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fill();
+  }
+  // 跳过正在飞入的最后一球
+  const flying = flyBalls.length;
+  for (let i = 0; i < n - flying; i++) {
+    const p = trayPos(i);
+    drawBallShape(p.x, p.y, L.trayR, draws[draws.length - n + i]);
+  }
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.font = "14px 'PingFang SC',sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("最近摸出的球", L.bagX, L.trayY0 + L.trayGap + L.trayR + 18);
+}
+
+function drawFlyBalls(now) {
+  flyBalls = flyBalls.filter(f => now - f.t0 < f.dur);
+  for (const f of flyBalls) {
+    const t = Math.min(1, (now - f.t0) / f.dur);
+    const e = 1 - Math.pow(1 - t, 2);          // easeOut
+    const x = f.from.x + (f.to.x - f.from.x) * e;
+    const y = f.from.y + (f.to.y - f.from.y) * e - Math.sin(t * Math.PI) * 90;  // 抛物线
+    drawBallShape(x, y, L.trayR + 2, f.red);
+  }
+}
+
+function drawPanel() {
+  const { panX: x, panY: y, panW: w, panH: h } = L;
+  ctx.fillStyle = "rgba(255,255,255,0.06)";
+  roundRect(x, y, w, h, 18, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.14)"; ctx.lineWidth = 2;
+  roundRect(x, y, w, h, 18, false); ctx.stroke();
+
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  // 统计数字
+  const n = draws.length, r = redCount();
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 22px 'PingFang SC',sans-serif";
+  ctx.fillText(`摸球次数：${n}`, x + 26, y + 40);
+  ctx.fillStyle = "#ff8a80";
+  ctx.fillText(`红球：${r} 次`, x + 26, y + 74);
+  ctx.fillStyle = "#90caf9";
+  ctx.fillText(`蓝球：${n - r} 次`, x + w * 0.45, y + 74);
+  ctx.fillStyle = "#ffd54a";
+  ctx.fillText(`红球频率：${n ? (curFreq() * 100).toFixed(1) + "%" : "—"}`, x + w * 0.66, y + 40);
+}
+
+function drawChart() {
+  const { chX: x, chY: y, chW: w, chH: h } = L;
+  ctx.save();
+  // 标题
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.font = "bold 16px 'PingFang SC',sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("红球频率折线图", x, y - 12);
+  // 网格与刻度
+  ctx.font = "12px 'PingFang SC',sans-serif";
+  ctx.textAlign = "right";
+  for (let p = 0; p <= 100; p += 25) {
+    const yy = y + h - (p / 100) * h;
+    ctx.strokeStyle = p === 50 ? "rgba(255,255,255,0.3)" : "rgba(255,255,255,0.12)";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, yy); ctx.lineTo(x + w, yy); ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.fillText(p + "%", x - 6, yy + 4);
+  }
+  // 边框
+  ctx.strokeStyle = "rgba(255,255,255,0.3)";
+  ctx.strokeRect(x, y, w, h);
+  // 频率折线
+  const n = draws.length;
+  if (n > 0) {
+    const maxX = Math.max(10, n);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    let reds = 0;
+    for (let i = 0; i < n; i++) {
+      if (draws[i]) reds++;
+      const px = x + ((i + 1) / maxX) * w;
+      const py = y + h - (reds / (i + 1)) * h;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    // 最新点
+    const px = x + (n / maxX) * w;
+    const py = y + h - curFreq() * h;
+    ctx.beginPath(); ctx.arc(px, py, 5, 0, 7);
+    ctx.fillStyle = "#ffd54a"; ctx.fill();
+    // 揭晓后画真实比例虚线
+    if (revealed && revealT > 0.4) {
+      const tp = trueP();
+      const ty = y + h - tp * h;
+      ctx.setLineDash([8, 7]);
+      ctx.strokeStyle = "#7ee081"; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(x, ty); ctx.lineTo(x + w, ty); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#7ee081";
+      ctx.textAlign = "right";
+      ctx.font = "bold 14px 'PingFang SC',sans-serif";
+      ctx.fillText(`真实 ${Math.round(tp * 100)}%`, x + w - 6, ty - 7);
+    }
+    ctx.restore();
+  }
+  // 横轴标签
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  ctx.textAlign = "center";
+  ctx.font = "12px 'PingFang SC',sans-serif";
+  ctx.fillText("摸球次数 →", x + w / 2, y + h + 18);
+  ctx.restore();
+}
+
+function drawSlider() {
+  const { slX0: x0, slX1: x1, slY: y } = L;
+  const locked = draws.length < GUESS_AT;
+  ctx.save();
+  ctx.textAlign = "left";
+  ctx.font = "bold 17px 'PingFang SC',sans-serif";
+  if (locked) {
+    ctx.fillStyle = "rgba(255,255,255,0.45)";
+    ctx.fillText(`🔒 摸满 ${GUESS_AT} 次后解锁「我的猜测」（还差 ${GUESS_AT - draws.length} 次）`, x0 - 20, y - 26);
+    ctx.globalAlpha = 0.25;
+  } else {
+    ctx.fillStyle = "#ffd54a";
+    ctx.fillText(`我的猜测：红球占 ${guess}%`, x0 - 20, y - 26);
+  }
+  // 轨道：左红右蓝渐变，表示红球占比
+  const g = ctx.createLinearGradient(x0, 0, x1, 0);
+  g.addColorStop(0, "#1565c0"); g.addColorStop(1, "#d32f2f");
+  ctx.fillStyle = g;
+  roundRect(x0, y - 8, x1 - x0, 16, 8, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 2;
+  roundRect(x0, y - 8, x1 - x0, 16, 8, false); ctx.stroke();
+  // 刻度
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  ctx.font = "11px 'PingFang SC',sans-serif";
+  ctx.textAlign = "center";
+  for (let p = 0; p <= 100; p += 25) {
+    const px = x0 + (p / 100) * (x1 - x0);
+    ctx.fillRect(px - 1, y + 10, 2, 6);
+    ctx.fillText(p + "%", px, y + 32);
+  }
+  // 手柄
+  const hx = x0 + (guess / 100) * (x1 - x0);
+  ctx.beginPath(); ctx.arc(hx, y, 17, 0, 7);
+  ctx.fillStyle = locked ? "#999" : "#ffd54a"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#5a3d00";
+  ctx.font = "bold 13px 'PingFang SC',sans-serif";
+  ctx.textBaseline = "middle";
+  ctx.fillText(guess + "", hx, y + 1);
+  ctx.textBaseline = "alphabetic";
+  ctx.restore();
+}
+
+function drawRevealInfo() {
+  if (!revealed || revealT < 0.6) return;
+  const { panX: x, chY: y, chH: h, panW: w } = L;
+  const tp = Math.round(trueP() * 100);
+  const g = roundResults[roundIdx] && roundResults[roundIdx].guess;
+  const err = roundResults[roundIdx] && roundResults[roundIdx].err;
+  ctx.save();
+  ctx.globalAlpha = Math.min(1, (revealT - 0.6) / 0.3);
+  ctx.textAlign = "left";
+  ctx.font = "bold 18px 'PingFang SC',sans-serif";
+  ctx.fillStyle = "#7ee081";
+  ctx.fillText(`✅ 真实比例：红球 ${tp}%`, x + 26, y + h + 52);
+  ctx.fillStyle = "#ffd54a";
+  if (g !== null && g !== undefined) {
+    ctx.fillText(`🎯 你的猜测：${g}%　误差：${Math.round(err)}%`, x + 26, y + h + 82);
+    let stars, praise;
+    if (err <= 5) { stars = "⭐⭐⭐"; praise = "神机妙算！"; }
+    else if (err <= 10) { stars = "⭐⭐"; praise = "非常接近！"; }
+    else if (err <= 20) { stars = "⭐"; praise = "不错的估计！"; }
+    else { stars = "⭐"; praise = "多用频率想一想，下次更准！"; }
+    ctx.fillStyle = "#fff";
+    ctx.fillText(`${stars} ${praise}`, x + 26, y + h + 112);
+  } else {
+    ctx.fillText("（还没拖动过滑杆猜测哦）", x + 26, y + h + 82);
+  }
+  ctx.restore();
+}
+
+function draw(now) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 背景
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#2b3040"); bg.addColorStop(1, "#1c202a");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+  drawBag();
+  drawTray();
+  drawFlyBalls(now);
+  drawPanel();
+  drawChart();
+  if (!revealed) drawSlider();   // 揭晓后滑杆收起，位置让给「下一轮」按钮
+  drawRevealInfo();
+  // 标题
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.font = "bold 20px 'PingFang SC',sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(revealed ? "🎉 袋子打开啦！" : "🛍️ 神秘袋子：里面红球占多少？", L.bagX, Math.max(34, L.bagY - L.bagH * 0.62 - 26));
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  // 连摸队列：每 140ms 摸一个
+  if (queueN > 0 && now - lastDrawT > 140 && flyBalls.length < 4) {
+    queueN--;
+    lastDrawT = now;
+    doDraw();
+  }
+  if (revealed && revealT < 1) revealT = Math.min(1, revealT + dt / 1.0);
+  draw(now);
+  requestAnimationFrame(loop);
+}
+
+/* ================= 交互 ================= */
+// 滑杆拖拽（核心拖拽交互）
+let draggingSlider = false;
+function sliderHit(sx, sy) {
+  const { slX0: x0, slX1: x1, slY: y } = L;
+  const hx = x0 + (guess / 100) * (x1 - x0);
+  return Math.hypot(sx - hx, sy - y) < 34 ||
+         (sx >= x0 - 10 && sx <= x1 + 10 && Math.abs(sy - y) < 22);
+}
+function sliderSet(sx) {
+  const { slX0: x0, slX1: x1 } = L;
+  guess = Math.max(0, Math.min(100, Math.round((sx - x0) / (x1 - x0) * 100)));
+  guessMade = true;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (draws.length < GUESS_AT || revealed) return;
+  if (sliderHit(e.clientX, e.clientY)) {
+    draggingSlider = true;
+    sliderSet(e.clientX);
+    canvas.setPointerCapture(e.pointerId);
+    pop(880);
+    hintEl.style.opacity = "0";
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!draggingSlider) return;
+  sliderSet(e.clientX);
+});
+window.addEventListener("pointerup", () => {
+  if (draggingSlider) { draggingSlider = false; pop(1040); }
+});
+
+drawBtn.addEventListener("click", () => {
+  if (queueN === 0 && flyBalls.length < 3) doDraw();
+  else queueN = Math.min(queueN + 1, 3);
+});
+draw10Btn.addEventListener("click", () => {
+  queueN = Math.min(queueN + 10, MAX_DRAWS - draws.length);
+  hintEl.style.opacity = "0";
+});
+nextBtn.addEventListener("click", () => {
+  pop(880);
+  if (roundIdx + 1 < ROUNDS.length) {
+    roundIdx++;
+    resetRound();
+  } else {
+    // 总结
+    let html = "🎓 两轮实验完成！<br>";
+    roundResults.forEach((r, i) => {
+      const g = r.guess === null || r.guess === undefined ? "未猜" : r.guess + "%";
+      const e = r.err === null || r.err === undefined ? "—" : Math.round(r.err) + "%";
+      html += `第 ${i + 1} 轮：真实 ${Math.round(r.trueP * 100)}% · 你猜 ${g} · 误差 ${e}<br>`;
+    });
+    html += "<br>摸到 100 次，频率就很接近真实比例啦！";
+    winPanel.querySelector(".msg").innerHTML = html;
+    nextBtn.style.display = "none";
+    winPanel.style.display = "flex";
+    fanfare();
+  }
+});
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.13);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3200);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+resize();
+resetGame();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

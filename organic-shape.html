@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>有机分子构型 · 摆一摆甲烷</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#101a2a; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(8,16,30,0.85); color:#7ee0a3; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(8,16,30,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  #tabs {
+    position:absolute; top:12px; left:12px; z-index:10;
+    display:flex; flex-direction:column; gap:8px;
+  }
+  #tabs button {
+    font-size:16px; font-weight:bold; padding:9px 16px;
+    border-radius:20px; border:2px solid rgba(255,255,255,0.25);
+    background:rgba(8,16,30,0.7); color:#cfe0f5; cursor:pointer;
+    text-align:left; white-space:nowrap;
+  }
+  #tabs button.active { background:#2fbf4a; border-color:#2fbf4a; color:#08240f; }
+  #tabs button:active { transform:scale(1.05); }
+  #resetBtn {
+    position:absolute; top:12px; right:12px; z-index:10;
+    font-size:15px; font-weight:bold; padding:9px 18px;
+    border-radius:20px; border:2px solid rgba(255,255,255,0.25);
+    background:rgba(8,16,30,0.7); color:#cfe0f5; cursor:pointer;
+  }
+  #resetBtn:active { transform:scale(1.05); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">甲烷 CH₄</div>
+<div id="tabs">
+  <button data-mol="CH4" class="active">甲烷 CH₄</button>
+  <button data-mol="NH3">氨 NH₃</button>
+  <button data-mol="H2O">水 H₂O</button>
+</div>
+<button id="resetBtn">↺ 重新挑战</button>
+<div id="hint">拖动白色氢原子调整位置，拖动空白处旋转分子 —— 让 6 个 H-C-H 键角全部变成 109.5°！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 三维向量与投影 ================= */
+// 右手坐标系，单位向量表示原子的方向；正交投影 + 深度缩放实现伪 3D
+function vnorm(v) { const l = Math.hypot(v[0], v[1], v[2]); return [v[0] / l, v[1] / l, v[2] / l]; }
+function vdot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+function rotX(v, a) { const c = Math.cos(a), s = Math.sin(a); return [v[0], v[1] * c - v[2] * s, v[1] * s + v[2] * c]; }
+function rotY(v, a) { const c = Math.cos(a), s = Math.sin(a); return [v[0] * c + v[2] * s, v[1], -v[0] * s + v[2] * c]; }
+// 视图旋转 M = Ry(ry)·Rx(rx)
+function toView(v, vw) { return rotY(rotX(v, vw.rx), vw.ry); }
+function fromView(v, vw) { return rotX(rotY(v, -vw.ry), -vw.rx); }
+
+/* ================= 分子数据 ================= */
+// 正四面体四个顶点方向（任意两点间夹角 109.47°）
+const TETRA = [[1,1,1],[1,-1,-1],[-1,1,-1],[-1,-1,1]].map(vnorm);
+const SUB = ["₁","₂","₃","₄"];
+
+// NH₃：H-N-H = 107°，三个 H 在下方呈三角锥，孤对电子朝上
+function nh3Dirs() {
+  const a = 68.2 * Math.PI / 180;   // 与锥轴的极角，使两两夹角为 107°
+  const out = [];
+  for (let i = 0; i < 3; i++) {
+    const p = (90 + i * 120) * Math.PI / 180;
+    out.push(vnorm([Math.cos(p) * Math.sin(a), -Math.cos(a), Math.sin(p) * Math.sin(a)]));
+  }
+  return out;
+}
+// H₂O：H-O-H = 104.5°，两对孤对电子朝上
+function h2oDirs() {
+  const h = 52.25 * Math.PI / 180;
+  return [vnorm([Math.sin(h), -Math.cos(h), 0]), vnorm([-Math.sin(h), -Math.cos(h), 0])];
+}
+const LP_NH3 = [[0, 1, 0]];
+const LP_H2O = (() => {
+  const b = 54.75 * Math.PI / 180;   // 两孤对电子间约 109.5°
+  return [[0, Math.cos(b), Math.sin(b)], [0, Math.cos(b), -Math.sin(b)]];
+})();
+
+const MOLECULES = {
+  CH4: {
+    name: "甲烷 CH₄", shape: "正四面体", target: 109.5, free: true,
+    center: { sym: "C", color: "#565656", hi: "#9a9a9a" },
+    hColor: "#f2f2f2", hHi: "#ffffff",
+    startDirs: () => [[1,0,0],[0,1,0],[-1,0,0],[0,-1,0]].map(vnorm),  // 故意摆成平面四方形（90°/180°）
+    lp: []
+  },
+  NH3: {
+    name: "氨 NH₃", shape: "三角锥形", target: 107, free: false,
+    center: { sym: "N", color: "#3a5bd9", hi: "#7d97f0" },
+    hColor: "#f2f2f2", hHi: "#ffffff",
+    startDirs: nh3Dirs,
+    lp: LP_NH3
+  },
+  H2O: {
+    name: "水 H₂O", shape: "V 形（角形）", target: 104.5, free: false,
+    center: { sym: "O", color: "#d84040", hi: "#ff8a80" },
+    hColor: "#f2f2f2", hHi: "#ffffff",
+    startDirs: h2oDirs,
+    lp: LP_H2O
+  }
+};
+
+/* ================= 游戏状态 ================= */
+const TOL = 2.5;            // 键角容差：|角度 - 109.5°| ≤ 2.5° 变绿
+let molKey = "CH4";
+let mol = MOLECULES.CH4;
+let dirs = [];              // 各 H 原子的单位方向向量（世界系）
+let view = { rx: -0.35, ry: 0.55 };
+let solved = false;
+let snapAnim = null;        // {t, from[], to[]} 成功时吸附到完美四面体
+let confetti = [];
+let angles = [];            // [{i, j, deg, ok}]
+
+function switchMol(k) {
+  molKey = k; mol = MOLECULES[k];
+  dirs = mol.startDirs();
+  solved = false; snapAnim = null; confetti = [];
+  view = { rx: -0.35, ry: 0.55 };
+  document.querySelectorAll("#tabs button").forEach(b =>
+    b.classList.toggle("active", b.dataset.mol === k));
+  document.getElementById("resetBtn").style.display = mol.free ? "block" : "none";
+  computeAngles();
+  updateScore();
+  if (mol.free) showHint("拖动白色氢原子调整位置，让所有 H-C-H 键角都变成 109.5°！");
+  else showHint(`${mol.name}：${mol.shape}，键角约 ${mol.target}°。粉色小球是孤对电子，拖动空白处旋转观察！`);
+}
+
+function computeAngles() {
+  angles = [];
+  for (let i = 0; i < dirs.length; i++)
+    for (let j = i + 1; j < dirs.length; j++) {
+      const deg = Math.acos(Math.max(-1, Math.min(1, vdot(dirs[i], dirs[j])))) * 180 / Math.PI;
+      angles.push({ i, j, deg, ok: mol.free && Math.abs(deg - 109.47) <= TOL });
+    }
+}
+
+function updateScore() {
+  if (!mol.free) {
+    scorebar.textContent = `${mol.name} · ${mol.shape} · 键角 ${mol.target}°`;
+  } else if (solved) {
+    scorebar.textContent = `🎉 ${mol.name} · 完美四面体！6/6 键角达标`;
+  } else {
+    const ok = angles.filter(a => a.ok).length;
+    scorebar.textContent = `${mol.name} · 达标键角 ${ok} / 6（目标 109.5°）`;
+  }
+}
+
+/* ================= 任务判定 ================= */
+function checkTask() {
+  if (!mol.free || solved) return;
+  computeAngles();
+  if (angles.length === 6 && angles.every(a => a.ok)) startSolve();
+  updateScore();
+}
+
+function startSolve() {
+  solved = true;
+  // 贪心匹配：每个 H 吸附到最接近的四面体顶点，避免大角度翻转
+  const used = [false, false, false, false];
+  const to = dirs.map(d => {
+    let best = -1, bd = -2;
+    for (let t = 0; t < 4; t++) {
+      if (used[t]) continue;
+      const dd = vdot(d, TETRA[t]);
+      if (dd > bd) { bd = dd; best = t; }
+    }
+    used[best] = true;
+    return TETRA[best];
+  });
+  snapAnim = { t: 0, from: dirs.map(d => d.slice()), to };
+  fanfare();
+  burstConfetti();
+  showHint("🎉 正四面体！键角 109.5°。再看看 NH₃(107°)、H₂O(104.5°)——孤对电子会把键角压小！");
+  updateScore();
+}
+
+/* ================= 交互 ================= */
+const DRAG_K = 0.007;       // 弧度 / 像素
+let drag = null;            // {type:"atom", idx, px, py} | {type:"view", px, py}
+
+function layout() {
+  const R = Math.min(W, H) * 0.26;
+  const cx = mol.free && W > 760 ? W * 0.40 : W * 0.5;   // CH₄ 时给右侧读数面板让位
+  const cy = H * 0.52;
+  return { R, cx, cy };
+}
+function project(v) {
+  const { R, cx, cy } = layout();
+  const p = toView(v, view);
+  const s = 1 + p[2] * 0.14;                    // 近大远小
+  return { x: cx + p[0] * R * s, y: cy - p[1] * R * s, z: p[2], s };
+}
+
+function hitH(sx, sy) {
+  let best = -1, bd = 1e9;
+  for (let i = 0; i < dirs.length; i++) {
+    const p = project(dirs[i]);
+    const d = Math.hypot(p.x - sx, p.y - sy);
+    if (d < 34 * p.s && d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  canvas.setPointerCapture(e.pointerId);
+  const idx = mol.free && !solved ? hitH(e.clientX, e.clientY) : -1;
+  if (idx >= 0) {
+    drag = { type: "atom", idx, px: e.clientX, py: e.clientY };
+    pop(520);
+  } else {
+    drag = { type: "view", px: e.clientX, py: e.clientY };
+  }
+  hintEl.style.opacity = "0";
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const dx = e.clientX - drag.px, dy = e.clientY - drag.py;
+  drag.px = e.clientX; drag.py = e.clientY;
+  if (drag.type === "view") {
+    view.ry += dx * DRAG_K;
+    view.rx += dy * DRAG_K;
+  } else {
+    // 在视图平面内拖动原子：先转到视图系做小角旋转，再转回世界系
+    let dv = toView(dirs[drag.idx], view);
+    dv = rotY(dv, dx * DRAG_K);
+    dv = rotX(dv, dy * DRAG_K);
+    dirs[drag.idx] = vnorm(fromView(dv, view));
+    checkTask();
+  }
+});
+window.addEventListener("pointerup", () => {
+  if (drag && drag.type === "atom" && !solved) {
+    computeAngles(); updateScore();
+  }
+  drag = null;
+});
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawSphere(x, y, r, base, hi, dim) {
+  const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.1, x, y, r);
+  g.addColorStop(0, hi); g.addColorStop(1, base);
+  ctx.globalAlpha = dim;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function drawBond(a, b, wBase) {
+  // 键：远处细且暗，近处粗且亮
+  const t = (a.z + 1) / 2;
+  ctx.strokeStyle = `rgba(190,200,215,${0.35 + 0.5 * t})`;
+  ctx.lineWidth = wBase * (0.55 + 0.6 * t);
+  ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+}
+
+function drawAngleArcs() {
+  if (!drag || drag.type !== "atom") return;
+  const c = project([0, 0, 0]);
+  const p1 = project(dirs[drag.idx]);
+  for (const a of angles) {
+    if (a.i !== drag.idx && a.j !== drag.idx) continue;
+    const other = a.i === drag.idx ? a.j : a.i;
+    const p2 = project(dirs[other]);
+    const a1 = Math.atan2(p1.y - c.y, p1.x - c.x);
+    const a2 = Math.atan2(p2.y - c.y, p2.x - c.x);
+    let d = a2 - a1;
+    while (d > Math.PI) d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    const r = 58;
+    ctx.strokeStyle = a.ok ? "rgba(80,230,130,0.95)" : "rgba(255,210,80,0.9)";
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(c.x, c.y, r, a1, a1 + d, d < 0); ctx.stroke();
+    const mid = a1 + d / 2;
+    const tx = c.x + Math.cos(mid) * (r + 30), ty = c.y + Math.sin(mid) * (r + 30);
+    ctx.font = "bold 15px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(8,16,30,0.75)";
+    const label = a.deg.toFixed(1) + "°";
+    const tw = ctx.measureText(label).width + 12;
+    roundRect(tx - tw / 2, ty - 12, tw, 24, 12); ctx.fill();
+    ctx.fillStyle = a.ok ? "#5ce68a" : "#ffd54a";
+    ctx.fillText(label, tx, ty + 1);
+  }
+}
+
+function drawMolecule() {
+  const c = project([0, 0, 0]);
+  const items = [];
+  // 孤对电子（半透明粉色小球）
+  mol.lp.forEach((lv, i) => items.push({ kind: "lp", p: project(lv), i }));
+  dirs.forEach((d, i) => items.push({ kind: "h", p: project(d), i }));
+  items.push({ kind: "c", p: c, i: -1 });
+  // 键先画（中心→各原子）
+  for (const it of items) {
+    if (it.kind === "h") drawBond(c, it.p, 11);
+    if (it.kind === "lp") drawBond(c, it.p, 4);
+  }
+  // 按深度从远到近画球
+  items.sort((a, b) => a.p.z - b.p.z);
+  for (const it of items) {
+    const dim = 0.62 + 0.38 * (it.p.z + 1) / 2;
+    if (it.kind === "c") {
+      const r = 34 * it.p.s;
+      drawSphere(it.p.x, it.p.y, r, mol.center.color, mol.center.hi, dim);
+      ctx.fillStyle = "#fff"; ctx.font = `bold ${Math.round(r * 0.85)}px sans-serif`;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(mol.center.sym, it.p.x, it.p.y + 1);
+    } else if (it.kind === "h") {
+      const r = 21 * it.p.s;
+      const locked = solved;
+      drawSphere(it.p.x, it.p.y, r, locked ? "#9fe8b6" : mol.hColor, mol.hHi, dim);
+      ctx.fillStyle = "#333"; ctx.font = `bold ${Math.round(r * 0.7)}px sans-serif`;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("H", it.p.x, it.p.y + 1);
+      // H 编号（便于对照键角读数）
+      ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.font = "12px sans-serif";
+      ctx.fillText("H" + SUB[it.i], it.p.x, it.p.y + r + 12);
+    } else {
+      const r = 13 * it.p.s;
+      ctx.globalAlpha = dim * 0.85;
+      ctx.beginPath(); ctx.arc(it.p.x, it.p.y, r, 0, 7);
+      ctx.fillStyle = "#ff9fd0"; ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 1; ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+  drawAngleArcs();
+}
+
+function drawPanel() {
+  const pw = 236, rowH = 34;
+  const rows = angles.length;
+  const ph = 78 + rows * rowH + (mol.lp.length ? 26 : 0);
+  const px = W - pw - 14, py = 74;
+  if (W < 640) return;   // 窄屏省略面板
+  ctx.fillStyle = "rgba(8,16,30,0.72)";
+  roundRect(px, py, pw, ph, 14); ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.15)"; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#cfe0f5"; ctx.font = "bold 16px sans-serif";
+  const bondName = mol.center.sym + " 的键角";
+  ctx.fillText(mol.free ? `∠H–${mol.center.sym}–H 实时读数` : bondName + "（固定结构）", px + 14, py + 24);
+  ctx.font = "13px sans-serif"; ctx.fillStyle = "#8fa5c0";
+  ctx.fillText(mol.free ? "目标：每个都 = 109.5°" : `实测约 ${mol.target}°（孤对电子排斥）`, px + 14, py + 44);
+  angles.forEach((a, k) => {
+    const y = py + 68 + k * rowH;
+    if (a.ok) {
+      ctx.fillStyle = "rgba(47,191,74,0.3)";
+      roundRect(px + 10, y - 13, pw - 20, 26, 8); ctx.fill();
+    }
+    ctx.fillStyle = a.ok ? "#5ce68a" : "#e8eef7";
+    ctx.font = "bold 14px sans-serif";
+    ctx.fillText(`H${SUB[a.i]}–${mol.center.sym}–H${SUB[a.j]}`, px + 16, y);
+    ctx.textAlign = "right";
+    ctx.fillText(a.deg.toFixed(1) + "°" + (a.ok ? " ✓" : ""), px + pw - 16, y);
+    ctx.textAlign = "left";
+  });
+  if (mol.lp.length) {
+    ctx.fillStyle = "#ff9fd0"; ctx.font = "13px sans-serif";
+    ctx.fillText("● 粉色小球 = 孤对电子", px + 14, py + ph - 16);
+  }
+}
+
+function drawConfetti(dt) {
+  for (const c of confetti) {
+    c.vy += 620 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += c.vr * dt; c.life -= dt;
+  }
+  confetti = confetti.filter(c => c.life > 0 && c.y < H + 30);
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.s / 2, -c.s / 2, c.s, c.s * 0.6);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+function burstConfetti() {
+  const colors = ["#ffd54a", "#5ce68a", "#7fb2ff", "#ff8a80", "#ff9fd0"];
+  for (let i = 0; i < 90; i++) {
+    confetti.push({
+      x: W / 2 + (Math.random() - 0.5) * 160, y: H * 0.35,
+      vx: (Math.random() - 0.5) * 520, vy: -200 - Math.random() * 380,
+      rot: Math.random() * 7, vr: (Math.random() - 0.5) * 12,
+      s: 7 + Math.random() * 7, life: 1.6 + Math.random() * 1.2,
+      color: colors[i % colors.length]
+    });
+  }
+}
+
+function draw(dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#182640"); g.addColorStop(1, "#0c1424");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 淡淡星空点缀
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  for (let i = 0; i < 40; i++) {
+    const sx = (i * 977) % W, sy = (i * 613) % H;
+    ctx.fillRect(sx, sy, 2, 2);
+  }
+  drawMolecule();
+  drawPanel();
+  drawConfetti(dt);
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  if (snapAnim) {
+    snapAnim.t += dt / 0.6;
+    const t = Math.min(1, snapAnim.t);
+    const e = 1 - Math.pow(1 - t, 3);   // easeOutCubic
+    for (let i = 0; i < dirs.length; i++) {
+      const f = snapAnim.from[i], tt = snapAnim.to[i];
+      dirs[i] = vnorm([f[0] + (tt[0] - f[0]) * e, f[1] + (tt[1] - f[1]) * e, f[2] + (tt[2] - f[2]) * e]);
+    }
+    computeAngles();
+    if (t >= 1) snapAnim = null;
+  }
+  draw(dt);
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 4200);
+}
+document.querySelectorAll("#tabs button").forEach(b =>
+  b.addEventListener("click", () => { switchMol(b.dataset.mol); pop(700); }));
+document.getElementById("resetBtn").addEventListener("click", () => {
+  if (!mol.free) return;
+  dirs = mol.startDirs();
+  solved = false; snapAnim = null;
+  computeAngles(); updateScore();
+  showHint("已打乱成平面结构，重新摆出正四面体吧！");
+  pop(500);
+});
+
+switchMol("CH4");
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

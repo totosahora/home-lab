@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>二力平衡实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#dfeeF8; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,60,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #condbar {
+    position:absolute; top:12px; left:12px; z-index:10;
+    display:flex; flex-direction:column; gap:8px; pointer-events:none;
+  }
+  .cond {
+    background:rgba(20,40,60,0.55); color:rgba(255,255,255,0.55);
+    padding:8px 16px; border-radius:20px; font-size:16px; font-weight:bold;
+    transition:all 0.3s; border:2px solid transparent; white-space:nowrap;
+  }
+  .cond.on {
+    background:rgba(46,160,80,0.92); color:#fff; border-color:#b8ffc9;
+    box-shadow:0 0 14px rgba(60,255,140,0.55);
+  }
+  #expbar {
+    position:absolute; top:12px; right:12px; z-index:10;
+    display:flex; flex-direction:column; gap:8px;
+  }
+  #expbar button {
+    font-size:16px; font-weight:bold; padding:10px 16px;
+    border-radius:20px; border:none; background:rgba(20,40,60,0.85); color:#ffd54a;
+    cursor:pointer; white-space:nowrap;
+  }
+  #expbar button:active { transform:scale(1.06); background:#2f7fe9; color:#fff; }
+  #hint {
+    position:absolute; bottom:96px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,60,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #ctrlbar {
+    position:absolute; bottom:10px; left:0; right:0; z-index:10;
+    display:flex; justify-content:space-between; align-items:center;
+    padding:0 18px; gap:12px;
+  }
+  .sliderBox {
+    flex:1; max-width:440px; background:rgba(20,40,60,0.8);
+    border-radius:20px; padding:10px 18px 14px; color:#fff;
+  }
+  .sliderBox .lab {
+    display:flex; justify-content:space-between; font-size:17px; font-weight:bold;
+    margin-bottom:6px;
+  }
+  .sliderBox input[type=range] {
+    width:100%; height:34px; -webkit-appearance:none; background:transparent; cursor:pointer;
+  }
+  .sliderBox input[type=range]::-webkit-slider-runnable-track {
+    height:12px; border-radius:6px; background:rgba(255,255,255,0.25);
+  }
+  .sliderBox input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance:none; width:34px; height:34px; border-radius:50%;
+    margin-top:-11px; border:3px solid #fff; box-shadow:0 2px 6px rgba(0,0,0,0.4);
+  }
+  #sL::-webkit-slider-thumb { background:#e93b3b; }
+  #sR::-webkit-slider-thumb { background:#2f7fe9; }
+  .sliderBox input[type=range]::-moz-range-track {
+    height:12px; border-radius:6px; background:rgba(255,255,255,0.25);
+  }
+  .sliderBox input[type=range]::-moz-range-thumb {
+    width:30px; height:30px; border-radius:50%; border:3px solid #fff;
+  }
+  #sL::-moz-range-thumb { background:#e93b3b; }
+  #sR::-moz-range-thumb { background:#2f7fe9; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">合力 F合 = 0 N</div>
+<div id="condbar">
+  <div class="cond" id="c1">① 大小相等 F₁=F₂</div>
+  <div class="cond" id="c2">② 方向相反</div>
+  <div class="cond" id="c3">③ 作用在同一直线</div>
+</div>
+<div id="expbar">
+  <button data-exp="1">实验① 平衡</button>
+  <button data-exp="2">实验② 加速</button>
+  <button data-exp="3">实验③ 转动</button>
+</div>
+<div id="hint">拖动下面两个滑块改变拉力，还可以上下拖动小车上的挂钩改变作用点！</div>
+<div id="ctrlbar">
+  <div class="sliderBox">
+    <div class="lab"><span style="color:#ff8a80">← 左拉力 F₁</span><span id="vL">5 N</span></div>
+    <input type="range" id="sL" min="0" max="10" step="0.5" value="5">
+  </div>
+  <div class="sliderBox">
+    <div class="lab"><span id="vR">5 N</span><span style="color:#90caf9">右拉力 F₂ →</span></div>
+    <input type="range" id="sR" min="0" max="10" step="0.5" value="5">
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const condEls = [document.getElementById("c1"), document.getElementById("c2"), document.getElementById("c3")];
+const sL = document.getElementById("sL"), sR = document.getElementById("sR");
+const vL = document.getElementById("vL"), vR = document.getElementById("vR");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 场景与视图 ================= */
+// 世界坐标：实验台 1200 x 760
+const WORLD_W = 1200, WORLD_H = 760;
+const CART_Y = 470;            // 小车中心高度
+const CART_W = 170, CART_H = 64;
+const CART_MIN_X = 300, CART_MAX_X = 900;
+const WALL_L = 70, WALL_R = 1130;   // 两侧固定墙（挂测力计）
+const HOOK_X = 88;             // 挂钩到车中心的水平距离（局部）
+const HOOK_MAX_Y = 34;         // 挂钩可上下移动范围
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / (WORLD_W + 40), H / (WORLD_H + 40));
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+// 小车：位置 x、速度 vx、转角 ang、角速度 av
+const cart = { x:600, vx:0, ang:0, av:0 };
+let F1 = 5, F2 = 5;            // 左右拉力（牛）
+let yL = 0, yR = 0;            // 挂钩局部高度（上为正）
+let balanced = false;          // 是否已触发平衡庆祝
+
+function updateLabels() {
+  vL.textContent = F1 + " N";
+  vR.textContent = F2 + " N";
+}
+function condStates() {
+  return [
+    F1 > 0 && F2 > 0 && Math.abs(F1 - F2) < 0.01,   // 大小相等
+    F1 > 0 && F2 > 0,                                // 方向相反（结构决定）
+    Math.abs(yL - yR) < 4                            // 同一直线
+  ];
+}
+
+/* ================= 物理 ================= */
+const ACCEL_PER_N = 26;        // 每牛顿产生的加速度（像素/秒²）
+const ANG_PER_N = 0.028;       // 力偶产生的角加速度系数
+const RAIL_FRICT = 14;         // 轮子微小阻力（让车停得干脆）
+
+function physics(dt) {
+  // 平动：合力 = F2 - F1（右为正）
+  const net = F2 - F1;
+  cart.vx += net * ACCEL_PER_N * dt;
+  // 微小滚动阻力
+  const fr = RAIL_FRICT * dt;
+  if (Math.abs(cart.vx) <= fr) cart.vx = 0;
+  else cart.vx -= Math.sign(cart.vx) * fr;
+  cart.x += cart.vx * dt;
+  // 轨道两端缓冲
+  if (cart.x < CART_MIN_X) { cart.x = CART_MIN_X; cart.vx = Math.abs(cart.vx) * 0.3; knock(); }
+  if (cart.x > CART_MAX_X) { cart.x = CART_MAX_X; cart.vx = -Math.abs(cart.vx) * 0.3; knock(); }
+
+  // 转动：力偶矩 τ = F2·yR − F1·yL（屏幕坐标，顺时正）
+  const tau = (yR * F2 - yL * F1) * ANG_PER_N;
+  cart.av += tau * dt;
+  // 绳子约束产生的回正力矩 + 角阻尼
+  cart.av += (-cart.ang * 26 - cart.av * 6) * dt;
+  cart.ang += cart.av * dt;
+  cart.ang = Math.max(-0.9, Math.min(0.9, cart.ang));
+}
+
+/* ================= 平衡判定与庆祝 ================= */
+function checkBalance() {
+  const cs = condStates();
+  cs.forEach((on, i) => condEls[i].classList.toggle("on", on));
+  const allOn = cs[0] && cs[1] && cs[2];
+  if (allOn && !balanced && Math.abs(cart.vx) < 8) {
+    balanced = true;
+    // 三条件逐个点亮 + 庆祝
+    condEls.forEach(el => el.classList.remove("on"));
+    cs.forEach((_, i) => setTimeout(() => {
+      condEls[i].classList.add("on");
+      pop(620 + i * 180);
+    }, 350 * (i + 1)));
+    setTimeout(() => {
+      showHint("🎉 平衡！F₁=F₂，方向相反，作用在同一直线，小车静止！");
+      fanfare();
+    }, 350 * 3 + 200);
+  } else if (!allOn) {
+    balanced = false;
+  }
+}
+
+/* ================= 交互：滑块与挂钩拖拽 ================= */
+sL.addEventListener("input", () => { F1 = parseFloat(sL.value); updateLabels(); tick(); });
+sR.addEventListener("input", () => { F2 = parseFloat(sR.value); updateLabels(); tick(); });
+
+let dragHook = null;   // "L" | "R"
+function hookWorld(side) {
+  // 局部屏幕坐标：左钩 (-HOOK_X, -yL)，右钩 (+HOOK_X, -yR)
+  const lx = side === "L" ? -HOOK_X : HOOK_X;
+  const ly = side === "L" ? -yL : -yR;
+  const c = Math.cos(cart.ang), s = Math.sin(cart.ang);
+  return [cart.x + lx * c - ly * s, CART_Y + lx * s + ly * c];
+}
+canvas.addEventListener("pointerdown", e => {
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  const [lx, ly] = hookWorld("L"), [rx, ry] = hookWorld("R");
+  if (Math.hypot(wx - lx, wy - ly) < 34) dragHook = "L";
+  else if (Math.hypot(wx - rx, wy - ry) < 34) dragHook = "R";
+  if (dragHook) {
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    tick();
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragHook) return;
+  const [, wy] = toWorld(e.clientX, e.clientY);
+  const v = Math.max(-HOOK_MAX_Y, Math.min(HOOK_MAX_Y, CART_Y - wy));
+  if (dragHook === "L") yL = v; else yR = v;
+});
+window.addEventListener("pointerup", () => { dragHook = null; });
+
+/* ================= 三个小实验 ================= */
+document.querySelectorAll("#expbar button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const n = btn.dataset.exp;
+    cart.x = 600; cart.vx = 0; cart.ang = 0; cart.av = 0;
+    if (n === "1") { F1 = 5; F2 = 5; yL = 0; yR = 0; showHint("实验①：两边拉力相等、反向、共线 → 小车静止不动"); }
+    if (n === "2") { F1 = 3; F2 = 7; yL = 0; yR = 0; showHint("实验②：F₂ > F₁，合力向右 → 小车向右加速！"); }
+    if (n === "3") { F1 = 5; F2 = 5; yL = 26; yR = -26; showHint("实验③：大小相等但不在同一直线 → 力偶让小车转动！"); }
+    sL.value = F1; sR.value = F2;
+    updateLabels();
+    pop(700);
+  });
+});
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawArrow(x1, y1, x2, y2, color, width) {
+  const a = Math.atan2(y2 - y1, x2 - x1);
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width;
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  const hl = 13 + width;
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - hl * Math.cos(a - 0.45), y2 - hl * Math.sin(a - 0.45));
+  ctx.lineTo(x2 - hl * Math.cos(a + 0.45), y2 - hl * Math.sin(a + 0.45));
+  ctx.closePath(); ctx.fill();
+}
+
+function drawScene() {
+  // 背景：天空渐变 + 实验桌面
+  const g = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+  g.addColorStop(0, "#cfe8f7"); g.addColorStop(1, "#eaf6fd");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+  // 桌面
+  ctx.fillStyle = "#b98a55";
+  ctx.fillRect(0, CART_Y + 58, WORLD_W, WORLD_H - CART_Y - 58);
+  ctx.fillStyle = "#a5763f";
+  ctx.fillRect(0, CART_Y + 58, WORLD_W, 12);
+  // 轨道
+  ctx.strokeStyle = "rgba(60,40,20,0.55)"; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(WALL_L, CART_Y + 44); ctx.lineTo(WALL_R, CART_Y + 44); ctx.stroke();
+  ctx.setLineDash([4, 18]);
+  ctx.strokeStyle = "rgba(60,40,20,0.35)"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(WALL_L, CART_Y + 30); ctx.lineTo(WALL_R, CART_Y + 30); ctx.stroke();
+  ctx.setLineDash([]);
+  // 两侧墙壁
+  for (const wx of [WALL_L, WALL_R]) {
+    ctx.fillStyle = "#8a9aa8";
+    roundRect(wx - 16, CART_Y - 110, 32, 158, 8, true);
+    ctx.fillStyle = "#6d7d8b";
+    roundRect(wx - 22, CART_Y - 118, 44, 18, 6, true);
+  }
+}
+
+// 弹簧测力计：固定端在墙，表体中心与挂钩同高，绳子保持水平 = 力的作用线
+function drawDynamometer(side, force, hookPt) {
+  const wx = side === "L" ? WALL_L : WALL_R;
+  const dir = side === "L" ? 1 : -1;           // 朝小车方向
+  const dy = hookPt[1];                        // 与小车挂钩同高，绳子即作用线
+  const bodyL = 74, bodyH = 34;
+  const springLen = 26 + force * 9;            // 弹簧长度随拉力变化
+  const bx = wx + dir * 6;                     // 表体靠墙端
+  const ex = bx + dir * (bodyL + springLen);   // 挂钩所在端
+  // 表体
+  ctx.fillStyle = side === "L" ? "#ffd7d5" : "#d5e7ff";
+  ctx.strokeStyle = side === "L" ? "#c0392b" : "#2470c8"; ctx.lineWidth = 3;
+  roundRect(Math.min(bx, bx + dir * bodyL), dy - bodyH / 2, bodyL, bodyH, 8, true);
+  ctx.stroke();
+  // 刻度线
+  ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 2;
+  for (let i = 1; i < 5; i++) {
+    const tx = bx + dir * (bodyL * i / 5);
+    ctx.beginPath(); ctx.moveTo(tx, dy - bodyH / 2 + 4);
+    ctx.lineTo(tx, dy - bodyH / 2 + 12); ctx.stroke();
+  }
+  // 读数
+  ctx.fillStyle = side === "L" ? "#c0392b" : "#2470c8";
+  ctx.font = "bold 19px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(force.toFixed(1) + "N", bx + dir * bodyL / 2, dy + 6);
+  // 弹簧（锯齿线）
+  ctx.strokeStyle = "#666"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  const sx0 = bx + dir * bodyL, sx1 = ex;
+  ctx.moveTo(sx0, dy);
+  const coils = 6;
+  for (let i = 1; i <= coils * 2; i++) {
+    const t = i / (coils * 2);
+    ctx.lineTo(sx0 + (sx1 - sx0) * t, dy + (i % 2 === 1 ? -7 : i === coils * 2 ? 0 : 7));
+  }
+  ctx.stroke();
+  // 绳子（水平）连到小车挂钩 = 力的作用线
+  ctx.strokeStyle = "#5a4632"; ctx.lineWidth = 3.5;
+  ctx.beginPath(); ctx.moveTo(ex, dy); ctx.lineTo(hookPt[0], hookPt[1]); ctx.stroke();
+  // 绳尾小钩
+  ctx.beginPath(); ctx.arc(ex, dy, 5, 0, 7);
+  ctx.strokeStyle = "#444"; ctx.lineWidth = 3; ctx.stroke();
+}
+
+function drawCart() {
+  ctx.save();
+  ctx.translate(cart.x, CART_Y);
+  ctx.rotate(cart.ang);
+  // 车轮
+  for (const wx of [-52, 52]) {
+    ctx.beginPath(); ctx.arc(wx, 44, 15, 0, 7);
+    ctx.fillStyle = "#333"; ctx.fill();
+    ctx.beginPath(); ctx.arc(wx, 44, 6, 0, 7);
+    ctx.fillStyle = "#999"; ctx.fill();
+  }
+  // 车身
+  const g = ctx.createLinearGradient(0, -CART_H / 2, 0, CART_H / 2);
+  g.addColorStop(0, "#ffb54d"); g.addColorStop(1, "#e08a1e");
+  ctx.fillStyle = g;
+  roundRect(-CART_W / 2, -CART_H / 2, CART_W, CART_H, 12, true);
+  ctx.strokeStyle = "#9a5d0e"; ctx.lineWidth = 3; ctx.stroke();
+  // 车顶小旗（帮助看出转动）
+  ctx.strokeStyle = "#9a5d0e"; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(0, -CART_H / 2); ctx.lineTo(0, -CART_H / 2 - 30); ctx.stroke();
+  ctx.fillStyle = "#e93b3b";
+  ctx.beginPath(); ctx.moveTo(0, -CART_H / 2 - 30);
+  ctx.lineTo(26, -CART_H / 2 - 23); ctx.lineTo(0, -CART_H / 2 - 16);
+  ctx.closePath(); ctx.fill();
+  // 挂钩滑槽
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(-HOOK_X, -HOOK_MAX_Y - 8); ctx.lineTo(-HOOK_X, HOOK_MAX_Y + 8); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(HOOK_X, -HOOK_MAX_Y - 8); ctx.lineTo(HOOK_X, HOOK_MAX_Y + 8); ctx.stroke();
+  // 挂钩（大拖拽区域）
+  for (const [side, hy] of [["L", -yL], ["R", -yR]]) {
+    const hx = side === "L" ? -HOOK_X : HOOK_X;
+    ctx.beginPath(); ctx.arc(hx, hy, dragHook === side ? 15 : 12, 0, 7);
+    ctx.fillStyle = side === "L" ? "#e93b3b" : "#2f7fe9"; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawForces() {
+  const [lx, ly] = hookWorld("L"), [rx, ry] = hookWorld("R");
+  // 拉力箭头：长度 ∝ 力
+  if (F1 > 0) {
+    const len = 30 + F1 * 16;
+    drawArrow(lx, ly, lx - len, ly, "#e93b3b", 6);
+    ctx.fillStyle = "#c0392b"; ctx.font = "bold 20px sans-serif";
+    ctx.textAlign = "right"; ctx.textBaseline = "bottom";
+    ctx.fillText("F₁=" + F1 + "N", lx - 10, ly - 16);
+  }
+  if (F2 > 0) {
+    const len = 30 + F2 * 16;
+    drawArrow(rx, ry, rx + len, ry, "#2f7fe9", 6);
+    ctx.fillStyle = "#2470c8"; ctx.font = "bold 20px sans-serif";
+    ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+    ctx.fillText("F₂=" + F2 + "N", rx + 10, ry - 16);
+  }
+  // 合力箭头（车顶上方，金色）
+  const net = F2 - F1;
+  if (Math.abs(net) > 0.01) {
+    const len = Math.abs(net) * 22;
+    const dir = Math.sign(net);
+    drawArrow(cart.x - dir * 10, CART_Y - 128, cart.x - dir * 10 + dir * len, CART_Y - 128, "#ffb800", 8);
+    ctx.fillStyle = "#b57d00"; ctx.font = "bold 21px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.fillText("F合=" + Math.abs(net).toFixed(1) + "N", cart.x, CART_Y - 140 - 8);
+  }
+  // 转动提示：弯曲箭头
+  if (Math.abs(cart.av) > 0.25 || Math.abs(cart.ang) > 0.06) {
+    ctx.strokeStyle = "#9b3de0"; ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.arc(cart.x, CART_Y, 96, -0.7, 0.7, cart.av < 0);
+    ctx.stroke();
+    ctx.fillStyle = "#9b3de0"; ctx.font = "bold 18px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    ctx.fillText("转动！", cart.x, CART_Y + 78);
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#dfeeF8";
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  drawScene();
+  drawCart();
+  const [lx, ly] = hookWorld("L"), [rx, ry] = hookWorld("R");
+  drawDynamometer("L", F1, [lx, ly]);
+  drawDynamometer("R", F2, [rx, ry]);
+  drawForces();
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  const steps = 3;
+  for (let i = 0; i < steps; i++) physics(dt / steps);
+  checkBalance();
+  updateScorebar();
+  draw();
+  requestAnimationFrame(loop);
+}
+function updateScorebar() {
+  const net = F2 - F1;
+  let state;
+  if (Math.abs(cart.ang) > 0.05 || Math.abs(cart.av) > 0.2) state = "🔄 转动中";
+  else if (Math.abs(cart.vx) > 6) state = "💨 加速中";
+  else state = "🧘 静止";
+  const arrow = net > 0.01 ? " →" : net < -0.01 ? " ←" : "";
+  scorebar.textContent = `F合 = ${Math.abs(net).toFixed(1)} N${arrow} · ${state}`;
+}
+updateLabels();
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const tick = () => tone(500, 0.04, 0.05, "square");
+let lastKnock = 0;
+function knock() {
+  const n = performance.now();
+  if (n - lastKnock > 200) { lastKnock = n; tone(240, 0.06, 0.06, "triangle"); }
+}
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

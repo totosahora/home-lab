@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>电路实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #palette {
+    position:absolute; left:0; top:0; bottom:0; width:212px;
+    background:linear-gradient(180deg,#e8f4ff,#d6eaff);
+    border-right:3px solid #7fb2e8;
+    padding:52px 8px 12px; z-index:10; user-select:none; overflow-y:auto;
+  }
+  .pal-title { position:absolute; top:14px; left:0; right:0; text-align:center;
+    font-size:18px; font-weight:bold; color:#1a4f8a; }
+  .pal-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .pal-item {
+    padding:8px 0; border-radius:16px; background:#fff; border:2px solid #7fb2e8;
+    display:flex; flex-direction:column; align-items:center; gap:2px;
+    font-size:28px; cursor:grab; touch-action:none;
+    box-shadow:0 2px 5px rgba(0,0,0,0.12);
+  }
+  .pal-item:active { cursor:grabbing; transform:scale(1.05); }
+  .pal-item span { font-size:12px; color:#1a4f8a; font-weight:bold; }
+  #hint {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(30,50,80,0.88); color:#fff; padding:10px 20px;
+    border-radius:24px; font-size:16px; z-index:20; pointer-events:none;
+    transition:opacity 0.6s; max-width:72%; text-align:center;
+  }
+  #zoombar {
+    position:absolute; right:16px; bottom:16px; z-index:10;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  #zoombar button {
+    width:52px; height:52px; border-radius:50%;
+    border:2px solid #7fb2e8; background:#e8f4ff;
+    font-size:24px; cursor:pointer; touch-action:manipulation;
+    box-shadow:0 2px 5px rgba(0,0,0,0.25);
+  }
+  #zoombar button:active { transform:scale(1.1); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="palette">
+  <div class="pal-title">元件盒</div>
+  <div class="pal-grid" id="palGrid"></div>
+</div>
+<div id="zoombar">
+  <button id="zoomIn" title="放大">➕</button>
+  <button id="zoomOut" title="缩小">➖</button>
+  <button id="zoomReset" title="回到原位">🔄</button>
+</div>
+<div id="hint">拖元件到实验台，拖电线连接金属脚。点元件：↻旋转 ⤡缩放 ✕删除；按住 Ctrl 点元件可断开它的所有电线</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const paletteEl = document.getElementById("palette");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 相机（无限画布） ================= */
+const cam = { x:0, y:0, k:1 };   // 屏幕 = 世界 * k + (x,y)
+function toWorld(sx, sy) { return [(sx - cam.x) / cam.k, (sy - cam.y) / cam.k]; }
+function zoomAt(sx, sy, factor) {
+  const k2 = Math.min(4, Math.max(0.3, cam.k * factor));
+  const [wx, wy] = toWorld(sx, sy);
+  cam.k = k2;
+  cam.x = sx - wx * k2;
+  cam.y = sy - wy * k2;
+}
+function setWorldTransform() {
+  ctx.setTransform(DPR * cam.k, 0, 0, DPR * cam.k, DPR * cam.x, DPR * cam.y);
+}
+
+/* ================= 数据 ================= */
+// comp: {id, kind:'comp', type, x, y, angle, s, on(switch), I, fanA, short}
+// wire: {id, kind:'wire', color, a:{x,y,conn}, b:{x,y,conn}, I}
+let items = [];
+let nextId = 1;
+let selected = null;
+const T = 50;   // 端子到中心距离（局部坐标，未缩放）
+
+function terminalPos(it, term) {
+  const lx = (term === 1 ? -T : T) * it.s;
+  const c = Math.cos(it.angle), s = Math.sin(it.angle);
+  return [it.x + lx * c, it.y + lx * s];
+}
+function wireEndPos(w, end) {
+  const e = w[end];
+  if (e.conn) return terminalPos(e.conn.it, e.conn.term);
+  return [e.x, e.y];
+}
+function wireEndNode(w, end) {
+  const c = w[end].conn;
+  if (c) return c.it.id + ":" + c.term;
+  return w.id + ":" + end;
+}
+// 断开端头：先把坐标固定在原位置，再解除连接
+function detachEnd(w, end) {
+  if (!w[end].conn) return;
+  const p = wireEndPos(w, end);
+  w[end].x = p[0]; w[end].y = p[1];
+  w[end].conn = null;
+}
+
+function addInitialScene() {
+  const pw = paletteEl.offsetWidth;
+  const bat = { id:nextId++, kind:"comp", type:"battery", x:pw + 170, y:340, angle:0, s:1, I:0 };
+  const bulb = { id:nextId++, kind:"comp", type:"bulb", x:pw + 450, y:340, angle:0, s:1, I:0 };
+  const sw = { id:nextId++, kind:"comp", type:"switch", x:pw + 310, y:180, angle:0, s:1, on:true, I:0 };
+  items.push(bat, bulb, sw);
+  const mkWire = (c1, c2, color) => ({
+    id:nextId++, kind:"wire", color, I:0,
+    a:{ x:0, y:0, conn:{ it:c1[0], term:c1[1] } },
+    b:{ x:0, y:0, conn:{ it:c2[0], term:c2[1] } }
+  });
+  items.push(mkWire([bat,2],[bulb,1], "#e94f3d"));
+  items.push(mkWire([bulb,2],[sw,2], "#2f7fe9"));
+  items.push(mkWire([sw,1],[bat,1], "#2fbf4a"));
+}
+addInitialScene();
+
+/* ================= 电路求解（MNA 改进节点分析） ================= */
+function buildEdges(openLEDs) {
+  const edges = [];
+  for (const it of items) {
+    if (it.kind === "wire") {
+      edges.push({ it, a:wireEndNode(it,"a"), b:wireEndNode(it,"b"), type:"R", R:0.5 });
+    } else {
+      const a = it.id + ":1", b = it.id + ":2";
+      switch (it.type) {
+        case "battery": edges.push({ it, a, b, type:"V", E:3 }); break;
+        case "switch":  if (it.on) edges.push({ it, a, b, type:"R", R:0.5 }); break;
+        case "bulb":    edges.push({ it, a, b, type:"R", R:10 }); break;
+        case "led":     if (!openLEDs.has(it.id)) edges.push({ it, a, b, type:"R", R:12 }); break;
+        case "motor":   edges.push({ it, a, b, type:"R", R:6 }); break;
+        case "buzzer":  edges.push({ it, a, b, type:"R", R:20 }); break;
+      }
+    }
+  }
+  return edges;
+}
+
+function gauss(A, b) {
+  const n = b.length;
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(A[r][col]) > Math.abs(A[piv][col])) piv = r;
+    if (Math.abs(A[piv][col]) < 1e-9) return null;
+    [A[col], A[piv]] = [A[piv], A[col]];
+    [b[col], b[piv]] = [b[piv], b[col]];
+    for (let r = col + 1; r < n; r++) {
+      const f = A[r][col] / A[col][col];
+      for (let k = col; k < n; k++) A[r][k] -= f * A[col][k];
+      b[r] -= f * b[col];
+    }
+  }
+  const x = new Float64Array(n);
+  for (let r = n - 1; r >= 0; r--) {
+    let s = b[r];
+    for (let k = r + 1; k < n; k++) s -= A[r][k] * x[k];
+    x[r] = s / A[r][r];
+  }
+  return x;
+}
+
+function solveGroup(nodes, edges) {
+  const ground = nodes[0];
+  const idx = new Map(); let c = 0;
+  for (const n of nodes) if (n !== ground) idx.set(n, c++);
+  const bats = edges.filter(e => e.type === "V");
+  const N = c + bats.length;
+  if (N === 0) return;
+  const A = Array.from({ length:N }, () => new Float64Array(N));
+  const b = new Float64Array(N);
+  const gi = n => idx.has(n) ? idx.get(n) : -1;
+  for (const e of edges) {
+    if (e.type !== "R") continue;
+    const G = 1 / e.R, i = gi(e.a), j = gi(e.b);
+    if (i >= 0) A[i][i] += G;
+    if (j >= 0) A[j][j] += G;
+    if (i >= 0 && j >= 0) { A[i][j] -= G; A[j][i] -= G; }
+  }
+  bats.forEach((e, k) => {
+    const r = c + k, i = gi(e.a), j = gi(e.b);
+    if (i >= 0) { A[i][r] += 1; A[r][i] += 1; }
+    if (j >= 0) { A[j][r] -= 1; A[r][j] -= 1; }
+    b[r] = e.E;
+  });
+  const x = gauss(A, b);
+  if (!x) return;
+  const V = n => n === ground ? 0 : (idx.has(n) ? x[idx.get(n)] : 0);
+  for (const e of edges) if (e.type === "R") e.it.I = (V(e.a) - V(e.b)) / e.R;
+  bats.forEach((e, k) => { e.it.I = x[c + k]; });   // 放电时为负 = 电流从 + 极流出
+}
+
+function solveCircuit() {
+  for (const it of items) it.I = 0;
+  const openLEDs = new Set();
+  for (let iter = 0; iter < 4; iter++) {
+    const edges = buildEdges(openLEDs);
+    const adj = new Map();
+    const ensure = k => { if (!adj.has(k)) adj.set(k, []); return adj.get(k); };
+    for (const e of edges) { ensure(e.a).push(e); ensure(e.b).push(e); }
+    const seen = new Set();
+    for (const start of adj.keys()) {
+      if (seen.has(start)) continue;
+      const gNodes = [], gEdges = [], q = [start];
+      seen.add(start);
+      const inG = new Set();
+      while (q.length) {
+        const n = q.pop(); gNodes.push(n);
+        for (const e of adj.get(n)) {
+          if (!inG.has(e)) { inG.add(e); gEdges.push(e); }
+          const o = e.a === n ? e.b : e.a;
+          if (!seen.has(o)) { seen.add(o); q.push(o); }
+        }
+      }
+      if (gEdges.some(e => e.type === "V")) solveGroup(gNodes, gEdges);
+    }
+    // LED 反接检测：截止后重解
+    let changed = false;
+    for (const it of items) {
+      if (it.kind === "comp" && it.type === "led" && !openLEDs.has(it.id) && it.I < -1e-6) {
+        openLEDs.add(it.id); it.I = 0; changed = true;
+      }
+    }
+    if (!changed) break;
+    for (const it of items) it.I = 0;
+  }
+  // 短路检测
+  let shorted = false;
+  for (const it of items) {
+    if (it.kind === "comp" && it.type === "battery") {
+      it.short = Math.abs(it.I) > 1.2;
+      if (it.short) shorted = true;
+    }
+  }
+  if (shorted) showHint("⚠️ 短路啦！电池被电线直接连通，会很烫！快断开一根线");
+}
+
+/* ================= 绘制 ================= */
+function drawBackground() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#f4f8fc"); g.addColorStop(1, "#e2ecf5");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  setWorldTransform();
+  const [x0, y0] = toWorld(0, 0), [x1, y1] = toWorld(W, H);
+  const step = 46, r = 1.6 / cam.k;
+  ctx.fillStyle = "rgba(80,120,160,0.12)";
+  for (let x = Math.floor(x0 / step) * step; x <= x1; x += step)
+    for (let y = Math.floor(y0 / step) * step; y <= y1; y += step)
+      { ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); }
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// 端子金属脚
+function drawTerminals(highlightTerm) {
+  for (const it of items) {
+    if (it.kind !== "comp") continue;
+    for (const t of [1, 2]) {
+      const [x, y] = terminalPos(it, t);
+      const r0 = 7 * it.s;
+      ctx.beginPath(); ctx.arc(x, y, r0, 0, 7);
+      ctx.fillStyle = "#b0bec5"; ctx.fill();
+      ctx.strokeStyle = "#607d8b"; ctx.lineWidth = 2 / cam.k; ctx.stroke();
+      if (highlightTerm && highlightTerm.it === it && highlightTerm.term === t) {
+        ctx.beginPath(); ctx.arc(x, y, r0 + 7 / cam.k, 0, 7);
+        ctx.strokeStyle = "#2fbf4a"; ctx.lineWidth = 4 / cam.k; ctx.stroke();
+      }
+    }
+  }
+}
+
+function glowAt(x, y, r, color, alpha) {
+  const g = ctx.createRadialGradient(x, y, 2, x, y, r);
+  g.addColorStop(0, color.replace("A", alpha));
+  g.addColorStop(1, color.replace("A", 0));
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+}
+
+function drawComp(it, time) {
+  ctx.save();
+  ctx.translate(it.x, it.y);
+  ctx.rotate(it.angle);
+  ctx.scale(it.s, it.s);
+  const I = it.I || 0;
+  switch (it.type) {
+    case "battery": {
+      if (it.short) {   // 短路：发抖 + 红热
+        const dx = Math.sin(time / 40) * 3;
+        ctx.translate(dx, 0);
+        glowAt(0, 0, 60, "rgba(255,60,30,A)", 0.5);
+      }
+      roundRect(-42, -16, 84, 32, 6);
+      const g = ctx.createLinearGradient(0, -16, 0, 16);
+      g.addColorStop(0, "#8fd694"); g.addColorStop(1, "#4a9e54");
+      ctx.fillStyle = g; ctx.fill();
+      ctx.strokeStyle = "#2d6b33"; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.fillStyle = "#ffd54a"; ctx.fillRect(-50, -8, 10, 16);   // + 极铜帽
+      ctx.fillStyle = "#90a4ae"; ctx.fillRect(40, -8, 10, 16);
+      ctx.fillStyle = "#fff"; ctx.font = "bold 20px sans-serif";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("+", -24, 1); ctx.fillText("−", 20, 1);
+      break;
+    }
+    case "switch": {
+      roundRect(-45, -10, 90, 20, 8);
+      ctx.fillStyle = "#90a4ae"; ctx.fill();
+      ctx.strokeStyle = "#546e7a"; ctx.lineWidth = 2; ctx.stroke();
+      const ex = it.on ? 38 : 20, ey = it.on ? 0 : -42;
+      ctx.beginPath(); ctx.moveTo(-32, 0); ctx.lineTo(ex, ey);
+      ctx.strokeStyle = "#ffb74d"; ctx.lineWidth = 8; ctx.lineCap = "round"; ctx.stroke();
+      ctx.beginPath(); ctx.arc(-32, 0, 6, 0, 7); ctx.fillStyle = "#ff8f00"; ctx.fill();
+      ctx.beginPath(); ctx.arc(ex, ey, 8, 0, 7); ctx.fillStyle = "#ff8f00"; ctx.fill();
+      if (it.on) { ctx.beginPath(); ctx.arc(38, 0, 5, 0, 7); ctx.fillStyle = "#ff8f00"; ctx.fill(); }
+      break;
+    }
+    case "bulb": {
+      const glow = Math.min(1, Math.abs(I) / 0.2);
+      if (glow > 0.02) glowAt(0, 0, 70, "rgba(255,220,80,A)", glow * 0.9);
+      ctx.beginPath(); ctx.arc(0, 0, 22, 0, 7);
+      ctx.fillStyle = glow > 0.02 ? `rgba(255,236,150,${0.35 + glow * 0.6})` : "rgba(200,220,235,0.5)";
+      ctx.fill();
+      ctx.strokeStyle = "#78909c"; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-45, 0); ctx.lineTo(-12, 0);
+      ctx.moveTo(-12, 0); ctx.lineTo(-6, -7); ctx.lineTo(0, 7); ctx.lineTo(6, -7); ctx.lineTo(12, 0);
+      ctx.moveTo(12, 0); ctx.lineTo(45, 0);
+      ctx.strokeStyle = glow > 0.02 ? "#ff8f00" : "#607d8b"; ctx.lineWidth = 3; ctx.stroke();
+      break;
+    }
+    case "led": {
+      const on = I > 0.02;
+      if (on) glowAt(0, 0, 60, "rgba(255,60,60,A)", Math.min(1, I / 0.2) * 0.9);
+      ctx.beginPath(); ctx.moveTo(-50, 0); ctx.lineTo(-16, 0);
+      ctx.moveTo(16, 0); ctx.lineTo(50, 0);
+      ctx.strokeStyle = "#90a4ae"; ctx.lineWidth = 4; ctx.stroke();
+      ctx.beginPath(); ctx.arc(0, 0, 17, 0, 7);
+      ctx.fillStyle = on ? "#ff5a5a" : "rgba(255,110,110,0.55)"; ctx.fill();
+      ctx.strokeStyle = "#c62828"; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(10, -10); ctx.lineTo(10, 10);   // 阴极标记
+      ctx.strokeStyle = "#c62828"; ctx.lineWidth = 3; ctx.stroke();
+      ctx.fillStyle = "#c62828"; ctx.font = "bold 15px sans-serif";
+      ctx.textAlign = "center"; ctx.fillText("+", -28, -14);
+      break;
+    }
+    case "motor": {
+      const spin = Math.abs(I) > 0.02;
+      roundRect(-20, -6, 40, 30, 8);
+      ctx.fillStyle = "#78909c"; ctx.fill();
+      ctx.strokeStyle = "#455a64"; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.save();
+      ctx.translate(0, -14);
+      ctx.rotate(it.fanA || 0);
+      for (let k = 0; k < 4; k++) {
+        ctx.rotate(Math.PI / 2);
+        ctx.beginPath(); ctx.ellipse(0, -16, 7, 16, 0, 0, 7);
+        ctx.fillStyle = spin ? "#4fc3f7" : "#a8d8f0"; ctx.fill();
+        ctx.strokeStyle = "#0277bd"; ctx.lineWidth = 2; ctx.stroke();
+      }
+      ctx.beginPath(); ctx.arc(0, 0, 6, 0, 7);
+      ctx.fillStyle = "#ff8f00"; ctx.fill();
+      ctx.restore();
+      break;
+    }
+    case "buzzer": {
+      const on = Math.abs(I) > 0.05;
+      roundRect(-26, -18, 52, 36, 12);
+      ctx.fillStyle = "#ffd54a"; ctx.fill();
+      ctx.strokeStyle = "#a87800"; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.beginPath(); ctx.arc(0, 0, 7, 0, 7); ctx.fillStyle = "#5a3d00"; ctx.fill();
+      if (on) {   // 声波
+        for (let k = 1; k <= 3; k++) {
+          const rr = 14 + k * 9 + Math.sin(time / 120) * 2;
+          ctx.beginPath(); ctx.arc(0, 0, rr, -0.9, 0.9);
+          ctx.strokeStyle = `rgba(255,143,0,${0.9 - k * 0.25})`; ctx.lineWidth = 3; ctx.stroke();
+        }
+      }
+      break;
+    }
+  }
+  ctx.restore();
+}
+
+// 电流光点
+function drawCurrentDots(it, pts, len, time) {
+  const I = it.I || 0;
+  if (Math.abs(I) < 0.01) return;
+  const speed = 50 + 180 * Math.min(1, Math.abs(I) / 0.3);   // px/s（世界单位）
+  const spacing = 55;
+  const n = Math.max(1, Math.round(len / spacing));
+  const phase = ((time / 1000 * speed) % len) / len;
+  ctx.save();
+  ctx.fillStyle = "#ffe14a";
+  ctx.shadowColor = "#ffea80"; ctx.shadowBlur = 8 / cam.k;
+  for (let j = 0; j < n; j++) {
+    let u = (j / n + phase) % 1;
+    if (I < 0) u = 1 - u;   // 反向流动
+    const p = pts(u);
+    ctx.beginPath(); ctx.arc(p[0], p[1], 4.5 / cam.k, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function wireCurve(w) {
+  const a = wireEndPos(w, "a"), b = wireEndPos(w, "b");
+  const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  const len = Math.hypot(dx, dy) || 1;
+  const sag = Math.min(28, 6 + len * 0.07);
+  return { a, b, c:[mx - dy / len * sag, my + dx / len * sag], len: len * 1.05 };
+}
+function bezPt(cur, t) {
+  const u = 1 - t;
+  return [u*u*cur.a[0] + 2*u*t*cur.c[0] + t*t*cur.b[0],
+          u*u*cur.a[1] + 2*u*t*cur.c[1] + t*t*cur.b[1]];
+}
+
+function drawWire(w, time) {
+  const cur = wireCurve(w);
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(cur.a[0], cur.a[1]);
+  ctx.quadraticCurveTo(cur.c[0], cur.c[1], cur.b[0], cur.b[1]);
+  ctx.strokeStyle = w.color; ctx.lineWidth = 7; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cur.a[0], cur.a[1]);
+  ctx.quadraticCurveTo(cur.c[0], cur.c[1], cur.b[0], cur.b[1]);
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.restore();
+  // 自由端头（可拖拽的插头）
+  for (const end of ["a", "b"]) {
+    if (!w[end].conn) {
+      const p = wireEndPos(w, end);
+      ctx.beginPath(); ctx.arc(p[0], p[1], 10, 0, 7);
+      ctx.fillStyle = w.color; ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 2.5 / cam.k; ctx.stroke();
+      ctx.beginPath(); ctx.arc(p[0], p[1], 4, 0, 7);
+      ctx.fillStyle = "#eceff1"; ctx.fill();
+    }
+  }
+  drawCurrentDots(w, t => bezPt(cur, t), cur.len, time);
+}
+
+function drawCompCurrent(it, time) {
+  ctx.save();
+  ctx.translate(it.x, it.y);
+  ctx.rotate(it.angle);
+  ctx.scale(it.s, it.s);
+  drawCurrentDots(it, u => [-T + u * 2 * T, 0], 2 * T * it.s, time);
+  ctx.restore();
+}
+
+// 手柄（恒定屏幕大小）
+function rotateHandlePos(it) { return [it.x, it.y - 85 / cam.k]; }
+function scaleHandlePos(it)  { return [it.x + 85 / cam.k, it.y]; }
+function deleteHandlePos(it) { return [it.x - 85 / cam.k, it.y]; }
+function drawKnob(x, y, color, ring, icon) {
+  ctx.save();
+  ctx.beginPath(); ctx.arc(x, y, 15 / cam.k, 0, 7);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = ring; ctx.lineWidth = 2 / cam.k; ctx.stroke();
+  ctx.fillStyle = ring; ctx.font = `bold ${17 / cam.k}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(icon, x, y + 1 / cam.k);
+  ctx.restore();
+}
+function drawHandleLine(it, x, y, color) {
+  ctx.save();
+  ctx.strokeStyle = color; ctx.lineWidth = 2 / cam.k;
+  ctx.setLineDash([4 / cam.k, 4 / cam.k]);
+  ctx.beginPath(); ctx.moveTo(it.x, it.y); ctx.lineTo(x, y); ctx.stroke();
+  ctx.restore();
+}
+function drawHandles() {
+  if (!selected) return;
+  if (selected.kind === "comp") {
+    const [rx, ry] = rotateHandlePos(selected);
+    drawHandleLine(selected, rx, ry, "rgba(255,213,74,0.8)");
+    drawKnob(rx, ry, "#ffd54a", "#a87800", "↻");
+    const [sx, sy] = scaleHandlePos(selected);
+    drawHandleLine(selected, sx, sy, "rgba(79,195,247,0.8)");
+    drawKnob(sx, sy, "#4fc3f7", "#01579b", "⤡");
+    const [dx, dy] = deleteHandlePos(selected);
+    drawHandleLine(selected, dx, dy, "rgba(255,82,82,0.8)");
+    drawKnob(dx, dy, "#ff5252", "#7f0000", "✕");
+  } else {
+    const cur = wireCurve(selected);
+    const m = bezPt(cur, 0.5);
+    drawKnob(m[0], m[1] - 45 / cam.k, "#ff5252", "#7f0000", "✕");
+  }
+}
+
+function draw(time) {
+  drawBackground();   // 结束时已是世界变换
+  for (const it of items) if (it.kind === "wire") drawWire(it, time);
+  drawTerminals(snapTarget);
+  for (const it of items) if (it.kind === "comp") {
+    drawComp(it, time);
+    drawCompCurrent(it, time);
+  }
+  drawHandles();
+  requestAnimationFrame(draw);
+}
+let snapTarget = null;
+requestAnimationFrame(draw);
+
+// 风扇转动
+let lastT = performance.now();
+setInterval(() => {
+  const now = performance.now();
+  const dt = (now - lastT) / 1000; lastT = now;
+  for (const it of items) {
+    if (it.kind === "comp" && it.type === "motor") {
+      it.fanA = (it.fanA || 0) + dt * (2 + 40 * Math.abs(it.I || 0));
+    }
+  }
+}, 33);
+
+/* ================= 音效 ================= */
+let actx = null;
+function pop(freq) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.12, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.15);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + 0.16);
+  } catch (e) {}
+}
+
+/* ================= 交互 ================= */
+const pointers = new Map();
+let drag = null;
+let pinch = null;
+
+function canvasPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+}
+function nearestTerminal(wx, wy, maxD) {
+  let best = null, bd = maxD;
+  for (const it of items) {
+    if (it.kind !== "comp") continue;
+    for (const t of [1, 2]) {
+      const [x, y] = terminalPos(it, t);
+      const d = Math.hypot(wx - x, wy - y);
+      if (d < bd) { bd = d; best = { it, term:t }; }
+    }
+  }
+  return best;
+}
+function hitWireEnd(wx, wy) {
+  const lim = 20 / cam.k;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const w = items[i];
+    if (w.kind !== "wire") continue;
+    for (const end of ["a", "b"]) {
+      const p = wireEndPos(w, end);
+      if (Math.hypot(wx - p[0], wy - p[1]) < lim) return { w, end };
+    }
+  }
+  return null;
+}
+function hitComp(wx, wy) {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.kind === "comp" && Math.hypot(wx - it.x, wy - it.y) < 58 * it.s) return it;
+  }
+  return null;
+}
+function hitWireBody(wx, wy) {
+  const lim = 13 / cam.k;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const w = items[i];
+    if (w.kind !== "wire") continue;
+    const cur = wireCurve(w);
+    for (let t = 0; t <= 1.001; t += 0.05) {
+      const p = bezPt(cur, t);
+      if (Math.hypot(wx - p[0], wy - p[1]) < lim) return w;
+    }
+  }
+  return null;
+}
+function overPalette(x, y) {
+  const r = paletteEl.getBoundingClientRect();
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+function dismissHint() { hintEl.style.opacity = "0"; }
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+function pinchState() {
+  const ps = [...pointers.values()];
+  if (ps.length < 2) return null;
+  const [a, b] = ps;
+  return { d: Math.hypot(a.x - b.x, a.y - b.y), mid: [(a.x + b.x) / 2, (a.y + b.y) / 2] };
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const [sx, sy] = canvasPos(e);
+  pointers.set(e.pointerId, { x:sx, y:sy });
+  dismissHint();
+  if (pointers.size === 2) {          // 第二根手指：捏合模式
+    drag = null;
+    pinch = pinchState();
+    return;
+  }
+  const [wx, wy] = toWorld(sx, sy);
+  // 选中物的手柄
+  if (selected) {
+    const near = (x, y) => Math.hypot(wx - x, wy - y) < 22 / cam.k;
+    if (selected.kind === "comp") {
+      const [dx, dy] = deleteHandlePos(selected);
+      if (near(dx, dy)) {   // 删除元件
+        for (const w of items) if (w.kind === "wire")
+          for (const end of ["a", "b"])
+            if (w[end].conn && w[end].conn.it === selected) detachEnd(w, end);
+        items = items.filter(i => i !== selected);
+        selected = null;
+        pop(220); solveCircuit();
+        return;
+      }
+      const [rx, ry] = rotateHandlePos(selected);
+      if (near(rx, ry)) {
+        drag = { mode:"rotate", item:selected };
+        canvas.setPointerCapture(e.pointerId);
+        return;
+      }
+      const [kx, ky] = scaleHandlePos(selected);
+      if (near(kx, ky)) {
+        drag = { mode:"scale", item:selected,
+                 startDist: Math.max(10, Math.hypot(wx - selected.x, wy - selected.y)),
+                 startScale: selected.s };
+        canvas.setPointerCapture(e.pointerId);
+        return;
+      }
+    } else if (selected.kind === "wire") {
+      const cur = wireCurve(selected), m = bezPt(cur, 0.5);
+      if (near(m[0], m[1] - 45 / cam.k)) {
+        items = items.filter(i => i !== selected);
+        selected = null;
+        pop(220); solveCircuit();
+        return;
+      }
+    }
+  }
+  // 电线端头
+  const we = hitWireEnd(wx, wy);
+  if (we) {
+    if (we.w[we.end].conn) { detachEnd(we.w, we.end); solveCircuit(); }   // 拔下（留在原位）
+    drag = { mode:"wireEnd", w:we.w, end:we.end };
+    canvas.setPointerCapture(e.pointerId);
+    return;
+  }
+  // 元件
+  const c = hitComp(wx, wy);
+  if (c) {
+    // Ctrl + 点元件：断开它的所有电线
+    if (e.ctrlKey || e.metaKey) {
+      let n = 0;
+      for (const w of items) if (w.kind === "wire")
+        for (const end of ["a", "b"])
+          if (w[end].conn && w[end].conn.it === c) { detachEnd(w, end); n++; }
+      if (n > 0) {
+        showHint(`已断开 ${n} 根电线 ⚡`);
+        pop(440);
+        solveCircuit();
+      } else {
+        showHint("这个元件还没有连接电线");
+      }
+      return;
+    }
+    selected = c;
+    drag = { mode:"move", item:c, offX:wx - c.x, offY:wy - c.y, downX:wx, downY:wy };
+    pop(660);
+    canvas.setPointerCapture(e.pointerId);
+    return;
+  }
+  // 电线本体
+  const w = hitWireBody(wx, wy);
+  if (w) {
+    selected = w;
+    drag = { mode:"wireMove", w, offX:wx, offY:wy };
+    canvas.setPointerCapture(e.pointerId);
+    return;
+  }
+  // 空白：平移画布
+  selected = null;
+  drag = { mode:"pan", sx, sy, camX:cam.x, camY:cam.y };
+  canvas.setPointerCapture(e.pointerId);
+});
+
+window.addEventListener("pointermove", e => {
+  if (pointers.has(e.pointerId)) {
+    const [sx, sy] = canvasPos(e);
+    pointers.set(e.pointerId, { x:sx, y:sy });
+  }
+  if (pinch && pointers.size >= 2) {
+    const now = pinchState();
+    if (now && pinch.d > 0) {
+      zoomAt(now.mid[0], now.mid[1], now.d / pinch.d);
+      cam.x += now.mid[0] - pinch.mid[0];
+      cam.y += now.mid[1] - pinch.mid[1];
+      pinch = now;
+    }
+    return;
+  }
+  if (!drag) return;
+  const [sx, sy] = canvasPos(e);
+  const [wx, wy] = toWorld(sx, sy);
+  if (drag.mode === "pan") {
+    cam.x = drag.camX + (sx - drag.sx);
+    cam.y = drag.camY + (sy - drag.sy);
+  } else if (drag.mode === "move") {
+    drag.item.x = wx - drag.offX;
+    drag.item.y = wy - drag.offY;
+  } else if (drag.mode === "rotate") {
+    drag.item.angle = Math.atan2(wy - drag.item.y, wx - drag.item.x) + Math.PI / 2;
+  } else if (drag.mode === "scale") {
+    const d = Math.hypot(wx - drag.item.x, wy - drag.item.y);
+    drag.item.s = Math.min(3, Math.max(0.5, drag.startScale * d / drag.startDist));
+  } else if (drag.mode === "wireEnd") {
+    const e2 = drag.w[drag.end];
+    e2.x = wx; e2.y = wy;
+    snapTarget = nearestTerminal(wx, wy, 45 / cam.k);
+  } else if (drag.mode === "wireMove") {
+    const w = drag.w;
+    if (!w.a.conn && !w.b.conn) {
+      w.a.x += wx - drag.offX; w.a.y += wy - drag.offY;
+      w.b.x += wx - drag.offX; w.b.y += wy - drag.offY;
+      drag.offX = wx; drag.offY = wy;
+    }
+  }
+});
+
+window.addEventListener("pointerup", e => {
+  pointers.delete(e.pointerId);
+  if (pinch && pointers.size < 2) pinch = null;
+  if (!drag) return;
+  const [sx, sy] = canvasPos(e);
+  const [wx, wy] = toWorld(sx, sy);
+  if (drag.mode === "wireEnd") {
+    const t = nearestTerminal(wx, wy, 45 / cam.k);
+    if (t) {
+      drag.w[drag.end].conn = t;
+      pop(880);
+      showHint("接上了！⚡");
+    }
+    snapTarget = null;
+    solveCircuit();
+  } else if (drag.mode === "move") {
+    if (drag.isNew && overPalette(e.clientX, e.clientY)) {
+      items = items.filter(i => i !== drag.item);
+      if (selected === drag.item) selected = null;
+    } else {
+      pop(880);
+      // 轻点开关 = 开合
+      if (drag.item.type === "switch" &&
+          Math.hypot(wx - drag.downX, wy - drag.downY) < 8 / cam.k) {
+        drag.item.on = !drag.item.on;
+        pop(drag.item.on ? 990 : 440);
+        showHint(drag.item.on ? "开关闭合，电路通了！" : "开关断开，电路断了");
+      }
+      solveCircuit();
+    }
+  } else if (drag.mode === "rotate" || drag.mode === "scale") {
+    solveCircuit();
+  }
+  drag = null;
+});
+window.addEventListener("pointercancel", e => {
+  pointers.delete(e.pointerId);
+  if (pinch && pointers.size < 2) pinch = null;
+  drag = null; snapTarget = null;
+});
+
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const [sx, sy] = canvasPos(e);
+  zoomAt(sx, sy, Math.exp(-e.deltaY * 0.0012));
+}, { passive:false });
+
+document.getElementById("zoomIn").addEventListener("click", () => { zoomAt(W/2, H/2, 1.3); pop(760); });
+document.getElementById("zoomOut").addEventListener("click", () => { zoomAt(W/2, H/2, 1/1.3); pop(520); });
+document.getElementById("zoomReset").addEventListener("click", () => { cam.x = 0; cam.y = 0; cam.k = 1; pop(660); });
+
+/* ================= 元件盒 ================= */
+const WIRE_COLORS = ["#e94f3d", "#2f7fe9", "#2fbf4a", "#9b3de0", "#ff7a1a"];
+function makeWire(wx, wy) {
+  return {
+    id:nextId++, kind:"wire", color:WIRE_COLORS[Math.floor(Math.random() * WIRE_COLORS.length)], I:0,
+    a:{ x:wx - 70 / cam.k, y:wy, conn:null }, b:{ x:wx + 70 / cam.k, y:wy, conn:null }
+  };
+}
+const PALETTE_ITEMS = [
+  { icon:"〰️", label:"电线",   make:(x,y) => makeWire(x, y) },
+  { icon:"🔋", label:"电池",   make:(x,y) => ({ id:nextId++, kind:"comp", type:"battery", x, y, angle:0, s:1, I:0 }) },
+  { icon:"🔘", label:"开关",   make:(x,y) => ({ id:nextId++, kind:"comp", type:"switch", x, y, angle:0, s:1, on:false, I:0 }) },
+  { icon:"💡", label:"灯泡",   make:(x,y) => ({ id:nextId++, kind:"comp", type:"bulb", x, y, angle:0, s:1, I:0 }) },
+  { icon:"🔴", label:"LED灯",  make:(x,y) => ({ id:nextId++, kind:"comp", type:"led", x, y, angle:0, s:1, I:0 }) },
+  { icon:"🌀", label:"风车",   make:(x,y) => ({ id:nextId++, kind:"comp", type:"motor", x, y, angle:0, s:1, fanA:0, I:0 }) },
+  { icon:"🔔", label:"蜂鸣器", make:(x,y) => ({ id:nextId++, kind:"comp", type:"buzzer", x, y, angle:0, s:1, I:0 }) }
+];
+const palGrid = document.getElementById("palGrid");
+PALETTE_ITEMS.forEach(def => {
+  const el = document.createElement("div");
+  el.className = "pal-item";
+  el.innerHTML = `${def.icon}<span>${def.label}</span>`;
+  el.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    dismissHint();
+    const pw = paletteEl.offsetWidth;
+    const [wx, wy] = toWorld(Math.max(e.clientX, pw + 80), e.clientY);
+    const it = def.make(wx, wy);
+    items.push(it);
+    selected = it;
+    if (it.kind === "wire") {
+      drag = { mode:"wireEnd", w:it, end:"b" };   // 先拖一个端头去连接
+    } else {
+      drag = { mode:"move", item:it, offX:0, offY:0, downX:wx, downY:wy, isNew:true };
+    }
+    pop(660);
+  });
+  palGrid.appendChild(el);
+});
+
+// 初始电路求解（展示流动的电流）
+solveCircuit();
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

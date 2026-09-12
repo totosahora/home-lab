@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>概率转盘</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#241a3a; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,12,40,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #toolbar {
+    position:absolute; top:12px; right:12px; z-index:10;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  #toolbar button {
+    font-size:20px; font-weight:bold; padding:13px 22px;
+    border-radius:28px; border:none; cursor:pointer;
+    box-shadow:0 4px 10px rgba(0,0,0,0.35);
+    font-family:inherit; white-space:nowrap;
+  }
+  #toolbar button:active { transform:scale(1.07); }
+  #spinBtn { background:#ffd54a; color:#5a3d00; font-size:24px; padding:16px 26px; }
+  #spin100Btn { background:#7fd4ff; color:#083b5e; }
+  #addBtn { background:#c9f2c7; color:#1e5e22; font-size:17px; }
+  #delBtn { background:#ffe9e9; color:#a03030; font-size:17px; }
+  #thinkBtn { background:#e3d6ff; color:#4a2a8a; font-size:17px; }
+  #clearBtn { background:rgba(255,255,255,0.85); color:#444; font-size:15px; padding:9px 16px; }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,12,40,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  @media (max-width: 760px) {
+    #scorebar { left:12px; transform:none; font-size:14px; padding:8px 14px; }
+    #toolbar { top:58px; left:12px; right:12px; flex-direction:row; flex-wrap:wrap; justify-content:center; gap:8px; }
+    #toolbar button { font-size:15px; padding:9px 13px; }
+    #spinBtn { font-size:17px; padding:10px 15px; }
+    #hint { font-size:13px; }
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🎯 已转：0 次</div>
+<div id="toolbar">
+  <button id="spinBtn">转！</button>
+  <button id="spin100Btn">转 100 次 ⚡</button>
+  <button id="addBtn">＋ 加一个扇区</button>
+  <button id="delBtn">－ 减一个扇区</button>
+  <button id="thinkBtn">💡 想一想</button>
+  <button id="clearBtn">清空记录</button>
+</div>
+<div id="hint">拖动转盘边缘的白色小圆点，调整每个颜色的大小！点我可关掉提示</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 布局 ================= */
+const L = {};   // 布局参数，resize 时重算
+function computeLayout() {
+  const narrow = W < 760;
+  L.cx = narrow ? W * 0.5 : W * 0.27;
+  L.cy = narrow ? H * 0.40 : H * 0.54;
+  L.R = narrow ? Math.min(W * 0.32, H * 0.20) : Math.min(W * 0.20, H * 0.33);
+  L.handleR = Math.max(14, L.R * 0.075);
+  // 统计面板
+  L.px0 = narrow ? W * 0.06 : W * 0.52;
+  L.px1 = narrow ? W * 0.94 : W - 200;
+  L.py0 = narrow ? H * 0.68 : H * 0.14;
+  L.py1 = H - 26;
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  computeLayout();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 转盘数据 ================= */
+// 扇区用分界角表示：bounds[0]=0 ... bounds[n]=2π，扇区 i 占 [bounds[i], bounds[i+1])
+const PALETTE = [
+  { name: "红", color: "#ff5b5b" },
+  { name: "橙", color: "#ff9f43" },
+  { name: "黄", color: "#f9d423" },
+  { name: "绿", color: "#4fd17c" },
+  { name: "蓝", color: "#4aa8ff" },
+  { name: "紫", color: "#b06bff" }
+];
+const MIN_SECTORS = 4, MAX_SECTORS = 6;
+const MIN_ANGLE = Math.PI * 2 * 0.05;   // 每个扇区至少 5%
+const TAU = Math.PI * 2;
+
+let sectors = [];      // [{name, color}]
+let bounds = [];       // 长度 n+1
+let counts = {};       // 按颜色名记录命中次数（增删扇区不丢数据）
+let dispCounts = {};   // 显示用（缓动）
+let totalSpins = 0;
+let dispTotal = 0;
+let wheelAngle = 0;    // 转盘当前转角（弧度）
+let spinning = false;
+let omega = 0;
+let lastPointerSector = -1;
+let flashSector = -1, flashT = 0;
+let confetti = [];
+let milestones = { 100: false, 300: false, 1000: false };
+
+function norm(a) { return ((a % TAU) + TAU) % TAU; }
+function frac(i) { return (bounds[i + 1] - bounds[i]) / TAU; }
+function sectorAt(localA) {
+  for (let i = 0; i < sectors.length; i++)
+    if (localA >= bounds[i] && localA < bounds[i + 1]) return i;
+  return sectors.length - 1;
+}
+// 指针固定在正上方（屏幕角 -π/2），换算成转盘局部角
+function pointerLocal() { return norm(-Math.PI / 2 - wheelAngle); }
+
+function resetWheel() {
+  sectors = PALETTE.slice(0, 4).map(c => ({ name: c.name, color: c.color }));
+  const n = sectors.length;
+  bounds = [];
+  for (let i = 0; i <= n; i++) bounds.push(TAU * i / n);
+}
+resetWheel();
+
+function addSector() {
+  if (sectors.length >= MAX_SECTORS) { showHint("最多 6 个扇区哦"); return; }
+  // 找还没用的颜色
+  const used = new Set(sectors.map(s => s.name));
+  const nc = PALETTE.find(c => !used.has(c.name));
+  if (!nc) return;
+  // 把最大的扇区平分成两半，新颜色放后半
+  let big = 0;
+  for (let i = 1; i < sectors.length; i++) if (frac(i) > frac(big)) big = i;
+  const mid = (bounds[big] + bounds[big + 1]) / 2;
+  bounds.splice(big + 1, 0, mid);
+  sectors.splice(big + 1, 0, { name: nc.name, color: nc.color });
+  pop(700);
+  showHint(`加上了${nc.name}色！现在是 ${sectors.length} 个扇区`, 2200);
+}
+
+function removeSector() {
+  if (sectors.length <= MIN_SECTORS) { showHint("最少 4 个扇区哦"); return; }
+  // 去掉最后一个扇区，它的角度并入前一个
+  const gone = sectors.pop();
+  bounds.splice(bounds.length - 2, 1);
+  pop(300);
+  showHint(`拿走了${gone.name}色，它的地盘分给了旁边的扇区`, 2200);
+}
+
+// 百分比标注：四舍五入且保证总和 100%
+function percents() {
+  const raw = sectors.map((_, i) => frac(i) * 100);
+  const p = raw.map(v => Math.round(v));
+  let diff = 100 - p.reduce((a, b) => a + b, 0);
+  if (diff !== 0) {
+    let big = 0;
+    for (let i = 1; i < raw.length; i++) if (raw[i] > raw[big]) big = i;
+    p[big] += diff;
+  }
+  return p;
+}
+
+/* ================= 旋转物理 ================= */
+function spin() {
+  if (spinning) return;
+  spinning = true;
+  omega = 13 + Math.random() * 7;   // 初始角速度（弧度/秒）
+  lastPointerSector = sectorAt(pointerLocal());
+  whoosh();
+}
+
+function physics(dt) {
+  if (spinning) {
+    wheelAngle = norm(wheelAngle + omega * dt);
+    omega *= Math.exp(-1.05 * dt);          // 指数减速，越转越慢
+    const idx = sectorAt(pointerLocal());
+    if (idx !== lastPointerSector) {        // 指针扫过分界线：哒哒声
+      lastPointerSector = idx;
+      tick(Math.min(1, omega / 10));
+    }
+    if (omega < 0.22) { spinning = false; omega = 0; land(idx); }
+  }
+  if (flashT > 0) flashT -= dt;
+}
+
+function land(idx) {
+  const s = sectors[idx];
+  counts[s.name] = (counts[s.name] || 0) + 1;
+  totalSpins++;
+  flashSector = idx; flashT = 1.0;
+  updateScore(`${s.name}色！`);
+  winChime(idx);
+  checkMilestone();
+}
+
+// 快速模拟 100 次：直接按理论概率抽样，不播放动画
+function spin100() {
+  if (spinning) return;
+  for (let k = 0; k < 100; k++) {
+    const r = Math.random() * TAU;
+    counts[sectors[sectorAt(r)].name] = (counts[sectors[sectorAt(r)].name] || 0) + 1;
+  }
+  totalSpins += 100;
+  updateScore();
+  fanfare();
+  burstConfetti();
+  checkMilestone();
+  // 自动讨论引导：拿最大的扇区比较理论与实际
+  let big = 0;
+  for (let i = 1; i < sectors.length; i++) if (frac(i) > frac(big)) big = i;
+  const s = sectors[big];
+  const theo = Math.round(frac(big) * 100);
+  const real = Math.round(100 * (counts[s.name] || 0) / totalSpins);
+  showHint(`⚡ 100 次转完！${s.name}色理论占 ${theo}%，目前实际频率 ${real}%（共 ${totalSpins} 次）——转得越多越接近！`, 6500);
+}
+
+function checkMilestone() {
+  for (const m of [100, 300, 1000]) {
+    if (totalSpins >= m && !milestones[m]) {
+      milestones[m] = true;
+      fanfare();
+      burstConfetti();
+      return;
+    }
+  }
+}
+
+function burstConfetti() {
+  for (let i = 0; i < 70; i++) {
+    confetti.push({
+      x: L.cx + (Math.random() - 0.5) * L.R * 2,
+      y: L.cy - L.R - 10,
+      vx: (Math.random() - 0.5) * 320,
+      vy: -Math.random() * 320,
+      color: PALETTE[(Math.random() * PALETTE.length) | 0].color,
+      rot: Math.random() * 7, vr: (Math.random() - 0.5) * 10,
+      life: 1.8 + Math.random()
+    });
+  }
+}
+
+function updateScore(last) {
+  scorebar.textContent = `🎯 已转：${totalSpins} 次` + (last ? ` · 上次：${last}` : "");
+}
+
+function clearRecords() {
+  counts = {};
+  dispCounts = {};
+  totalSpins = 0;
+  dispTotal = 0;
+  milestones = { 100: false, 300: false, 1000: false };
+  updateScore();
+  pop(300);
+  showHint("记录清空啦！重新转转看～");
+}
+
+/* ================= 讨论引导 ================= */
+function discuss() {
+  let big = 0;
+  for (let i = 1; i < sectors.length; i++) if (frac(i) > frac(big)) big = i;
+  const s = sectors[big];
+  const p = Math.round(frac(big) * 100);
+  if (totalSpins < 20) {
+    showHint(`🤔 ${s.name}色占了 ${p}%，如果转 100 次，你猜它会中几次？点「转 100 次」验证一下！`, 6000);
+  } else {
+    const c = counts[s.name] || 0;
+    const f = (100 * c / totalSpins).toFixed(1);
+    showHint(`🤔 ${s.name}色理论 ${p}%，你转了 ${totalSpins} 次中了 ${c} 次（${f}%）——次数越多，频率越靠近理论概率！`, 6500);
+  }
+  pop(880);
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function textColorFor(hex) {
+  const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+  return (0.299 * r + 0.587 * g + 0.114 * b) > 150 ? "rgba(60,40,0,0.85)" : "#ffffff";
+}
+
+function drawWheel() {
+  const pcts = percents();
+  // 底盘阴影
+  ctx.beginPath(); ctx.arc(L.cx, L.cy + 8, L.R + 14, 0, 7);
+  ctx.fillStyle = "rgba(0,0,0,0.35)"; ctx.fill();
+  // 扇区
+  for (let i = 0; i < sectors.length; i++) {
+    const a0 = bounds[i] + wheelAngle, a1 = bounds[i + 1] + wheelAngle;
+    ctx.beginPath();
+    ctx.moveTo(L.cx, L.cy);
+    ctx.arc(L.cx, L.cy, L.R, a0, a1);
+    ctx.closePath();
+    ctx.fillStyle = sectors[i].color;
+    ctx.fill();
+    // 命中扇区闪光
+    if (i === flashSector && flashT > 0) {
+      ctx.fillStyle = `rgba(255,255,255,${0.45 * flashT})`;
+      ctx.fill();
+    }
+  }
+  // 分界线
+  ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 3;
+  for (let k = 1; k < bounds.length - 1; k++) {
+    const a = bounds[k] + wheelAngle;
+    ctx.beginPath();
+    ctx.moveTo(L.cx, L.cy);
+    ctx.lineTo(L.cx + Math.cos(a) * L.R, L.cy + Math.sin(a) * L.R);
+    ctx.stroke();
+  }
+  // 外圈
+  ctx.beginPath(); ctx.arc(L.cx, L.cy, L.R + 6, 0, 7);
+  ctx.strokeStyle = "#f4ecff"; ctx.lineWidth = 10; ctx.stroke();
+  ctx.beginPath(); ctx.arc(L.cx, L.cy, L.R + 12, 0, 7);
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 3; ctx.stroke();
+  // 百分比标签
+  const fs = Math.max(15, Math.round(L.R * 0.13));
+  ctx.font = `bold ${fs}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (let i = 0; i < sectors.length; i++) {
+    const mid = (bounds[i] + bounds[i + 1]) / 2 + wheelAngle;
+    const tx = L.cx + Math.cos(mid) * L.R * 0.62;
+    const ty = L.cy + Math.sin(mid) * L.R * 0.62;
+    ctx.save();
+    ctx.translate(tx, ty);
+    // 太窄的扇区文字随角度旋转，避免互相挤
+    ctx.fillStyle = textColorFor(sectors[i].color);
+    ctx.shadowColor = "rgba(0,0,0,0.3)"; ctx.shadowBlur = 3;
+    ctx.fillText(`${pcts[i]}%`, 0, -fs * 0.55);
+    ctx.font = `bold ${Math.round(fs * 0.8)}px "PingFang SC","Microsoft YaHei",sans-serif`;
+    ctx.fillText(sectors[i].name, 0, fs * 0.55);
+    ctx.restore();
+    ctx.font = `bold ${fs}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  }
+  ctx.shadowBlur = 0;
+  // 中心轴
+  ctx.beginPath(); ctx.arc(L.cx, L.cy, L.R * 0.11, 0, 7);
+  ctx.fillStyle = "#f4ecff"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.beginPath(); ctx.arc(L.cx - L.R * 0.03, L.cy - L.R * 0.04, L.R * 0.03, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.fill();
+  // 指针（正上方，红色倒三角）
+  const px = L.cx, py = L.cy - L.R - 6;
+  ctx.beginPath();
+  ctx.moveTo(px - 16, py - 34);
+  ctx.lineTo(px + 16, py - 34);
+  ctx.lineTo(px, py + 4);
+  ctx.closePath();
+  ctx.fillStyle = "#ff3355"; ctx.fill();
+  ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3; ctx.stroke();
+  // 拖拽把手（转盘停下时显示）
+  if (!spinning) {
+    for (let k = 1; k < bounds.length - 1; k++) {
+      const a = bounds[k] + wheelAngle;
+      const hx = L.cx + Math.cos(a) * (L.R + 6);
+      const hy = L.cy + Math.sin(a) * (L.R + 6);
+      const active = dragHandle === k;
+      ctx.beginPath(); ctx.arc(hx, hy, active ? L.handleR * 1.35 : L.handleR, 0, 7);
+      ctx.fillStyle = active ? "#ffe14d" : "#ffffff";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 2.5; ctx.stroke();
+      // 把手上的小弧线，暗示可转动
+      ctx.beginPath();
+      ctx.arc(hx, hy, L.handleR * 0.5, a - 0.7, a + 0.7);
+      ctx.strokeStyle = "rgba(80,60,140,0.8)"; ctx.lineWidth = 2.5; ctx.stroke();
+    }
+  }
+}
+
+function drawPanel() {
+  const px0 = L.px0, px1 = L.px1, py0 = L.py0, py1 = L.py1;
+  ctx.fillStyle = "rgba(255,255,255,0.08)";
+  roundRect(px0, py0, px1 - px0, py1 - py0, 18, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 2;
+  roundRect(px0, py0, px1 - px0, py1 - py0, 18, false); ctx.stroke();
+  // 标题 + 图例
+  const tfs = Math.max(15, Math.round(W * 0.013));
+  ctx.font = `bold ${tfs}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#ffd54a";
+  ctx.fillText("📊 频率 vs 理论概率", px0 + 16, py0 + 24);
+  const lfs = Math.max(12, Math.round(tfs * 0.72));
+  ctx.font = `${lfs}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.fillText("■ 实际频率", px0 + 16, py0 + 24 + tfs + 6);
+  const legend2X = px0 + 16 + lfs * 6.5;
+  ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2.5; ctx.setLineDash([5, 4]);
+  ctx.beginPath(); ctx.moveTo(legend2X, py0 + 24 + tfs + 6); ctx.lineTo(legend2X + 26, py0 + 24 + tfs + 6); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.fillText(" 理论概率", legend2X + 26, py0 + 24 + tfs + 6);
+
+  // 每个扇区一行：色块+名称 | 频率条 | 理论虚线
+  const n = sectors.length;
+  const rowsTop = py0 + tfs * 2 + 34;
+  const rowH = Math.min(64, (py1 - rowsTop - 8) / n);
+  const labelW = Math.max(64, tfs * 4.2);
+  const barX0 = px0 + 16 + labelW;
+  const barX1 = px1 - 16;
+  const barW = barX1 - barX0;
+  // 缓动显示值
+  for (const s of sectors) {
+    const c = counts[s.name] || 0;
+    dispCounts[s.name] = (dispCounts[s.name] || 0) + (c - (dispCounts[s.name] || 0)) * 0.12;
+  }
+  dispTotal += (totalSpins - dispTotal) * 0.12;
+  // 纵轴最大值：理论与实际的最大值，留 20% 余量
+  let m = 0.2;
+  for (let i = 0; i < n; i++) {
+    m = Math.max(m, frac(i));
+    if (dispTotal > 0.5) m = Math.max(m, (dispCounts[sectors[i].name] || 0) / dispTotal);
+  }
+  const scale = m * 1.2;
+  const pcts = percents();
+  const rfs = Math.max(13, Math.round(tfs * 0.85));
+  for (let i = 0; i < n; i++) {
+    const s = sectors[i];
+    const ry = rowsTop + i * rowH;
+    const cy = ry + rowH / 2;
+    // 标签：色块 + 名称
+    ctx.fillStyle = s.color;
+    roundRect(px0 + 16, cy - 9, 18, 18, 5, true);
+    ctx.font = `bold ${rfs}px "PingFang SC","Microsoft YaHei",sans-serif`;
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(s.name, px0 + 40, cy);
+    // 频率条
+    const f = dispTotal > 0.5 ? (dispCounts[s.name] || 0) / dispTotal : 0;
+    const bw = f / scale * barW;
+    ctx.fillStyle = "rgba(255,255,255,0.10)";
+    roundRect(barX0, cy - rowH * 0.30, barW, rowH * 0.6, 7, true);
+    if (bw > 2) {
+      ctx.fillStyle = s.color;
+      roundRect(barX0, cy - rowH * 0.30, bw, rowH * 0.6, 7, true);
+    }
+    // 理论概率虚线（竖线叠加在条上）
+    const tx = barX0 + frac(i) / scale * barW;
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3; ctx.setLineDash([6, 5]);
+    ctx.beginPath(); ctx.moveTo(tx, cy - rowH * 0.28); ctx.lineTo(tx, cy + rowH * 0.42); ctx.stroke();
+    ctx.setLineDash([]);
+    // 数字：次数 / 实际% ｜ 理论%
+    const c = counts[s.name] || 0;
+    const realPct = totalSpins > 0 ? (100 * c / totalSpins).toFixed(0) + "%" : "--";
+    ctx.font = `${Math.max(11, Math.round(rfs * 0.78))}px "PingFang SC","Microsoft YaHei",sans-serif`;
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.textAlign = "right";
+    ctx.fillText(`${c}次 ${realPct}｜理论${pcts[i]}%`, barX1 - 2, ry + 1 + 7);
+    ctx.textAlign = "left";
+  }
+}
+
+function drawConfetti(dt) {
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.life -= dt;
+    if (c.life <= 0) { confetti.splice(i, 1); continue; }
+    c.vy += 620 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+}
+
+function draw(dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#35255c"); bg.addColorStop(1, "#1c1332");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+  drawWheel();
+  drawPanel();
+  drawConfetti(dt);
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  draw(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 交互：拖动分界线 ================= */
+let dragHandle = -1;   // 正在拖的分界线下标（1..n-1）
+
+function handleAt(mx, my) {
+  if (spinning) return -1;
+  for (let k = 1; k < bounds.length - 1; k++) {
+    const a = bounds[k] + wheelAngle;
+    const hx = L.cx + Math.cos(a) * (L.R + 6);
+    const hy = L.cy + Math.sin(a) * (L.R + 6);
+    if (Math.hypot(mx - hx, my - hy) < L.handleR * 2.2) return k;
+  }
+  return -1;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  const k = handleAt(e.clientX, e.clientY);
+  if (k > 0) {
+    dragHandle = k;
+    canvas.setPointerCapture(e.pointerId);
+    pop(520);
+    hintEl.style.opacity = "0";
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (dragHandle < 0) return;
+  const k = dragHandle;
+  // 鼠标角 → 转盘局部角，取与当前分界角的最短差，防止跨 0° 跳变
+  const mouse = Math.atan2(e.clientY - L.cy, e.clientX - L.cx);
+  let local = norm(mouse - wheelAngle);
+  let delta = local - bounds[k];
+  while (delta > Math.PI) delta -= TAU;
+  while (delta < -Math.PI) delta += TAU;
+  let nb = bounds[k] + delta;
+  // 夹紧：两边扇区都不能小于 5%
+  nb = Math.max(bounds[k - 1] + MIN_ANGLE, Math.min(bounds[k + 1] - MIN_ANGLE, nb));
+  bounds[k] = nb;
+});
+window.addEventListener("pointerup", () => {
+  if (dragHandle < 0) return;
+  dragHandle = -1;
+  pop(760);
+});
+
+/* ================= 按钮 ================= */
+document.getElementById("spinBtn").addEventListener("click", spin);
+document.getElementById("spin100Btn").addEventListener("click", spin100);
+document.getElementById("addBtn").addEventListener("click", addSector);
+document.getElementById("delBtn").addEventListener("click", removeSector);
+document.getElementById("thinkBtn").addEventListener("click", discuss);
+document.getElementById("clearBtn").addEventListener("click", clearRecords);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+let lastTickT = 0;
+function tick(v) {   // 指针扫过分界线的哒哒声，全局节流
+  const now = performance.now();
+  if (now - lastTickT < 45) return;
+  lastTickT = now;
+  tone(1400 + Math.random() * 500, 0.03, 0.02 + 0.06 * v, "square");
+}
+const whoosh = () => tone(320, 0.25, 0.10, "triangle");
+function winChime(idx) { pop(440 + idx * 110); setTimeout(() => pop(660 + idx * 110), 110); }
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 提示条 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 2600);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 测试钩子 ================= */
+function __stats() {
+  return {
+    spins: totalSpins,
+    counts: Object.assign({}, counts),
+    sectors: sectors.map((s, i) => ({ name: s.name, frac: +frac(i).toFixed(4) })),
+    spinning, bounds: bounds.slice()
+  };
+}
+function __step(dt) { physics(dt); draw(dt); }   // 无头测试手动步进
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

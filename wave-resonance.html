@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>波形与共振</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#16202e; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(8,16,28,0.85); color:#7fd8ff; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:96px; left:50%; transform:translateX(-50%);
+    background:rgba(8,16,28,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #tabs {
+    position:absolute; top:12px; left:14px; z-index:10; display:flex; gap:10px;
+  }
+  #tabs button {
+    font-size:18px; font-weight:bold; padding:10px 22px;
+    border-radius:24px; border:2px solid rgba(127,216,255,0.4);
+    background:rgba(8,16,28,0.85); color:#9fb6cc; cursor:pointer;
+  }
+  #tabs button.on { background:#1f6fa8; color:#fff; border-color:#7fd8ff; }
+  #tabs button:active { transform:scale(1.05); }
+  #panel {
+    position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+    background:rgba(8,16,28,0.85); border-radius:20px; z-index:10;
+    padding:12px 22px; display:flex; align-items:center; gap:26px;
+    color:#cfe4f5; font-size:16px; font-weight:bold; white-space:nowrap;
+  }
+  #panel label { display:flex; align-items:center; gap:10px; }
+  #panel input[type=range] {
+    -webkit-appearance:none; appearance:none; width:190px; height:14px;
+    border-radius:7px; background:#33506e; outline:none; cursor:pointer;
+  }
+  #panel input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance:none; appearance:none; width:34px; height:34px;
+    border-radius:50%; background:#7fd8ff; border:3px solid #fff;
+    box-shadow:0 2px 6px rgba(0,0,0,0.5); cursor:pointer;
+  }
+  #panel input[type=range]::-moz-range-thumb {
+    width:30px; height:30px; border-radius:50%; background:#7fd8ff;
+    border:3px solid #fff; cursor:pointer;
+  }
+  #panel .chk { display:flex; align-items:center; gap:8px; cursor:pointer; }
+  #panel .chk input { width:26px; height:26px; accent-color:#1f6fa8; cursor:pointer; }
+  #panel .val { color:#ffd54a; min-width:86px; display:inline-block; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="tabs">
+  <button id="tabWave" class="on">🌊 波形</button>
+  <button id="tabRes">🎵 共振</button>
+</div>
+<div id="scorebar"></div>
+<div id="hint"></div>
+<div id="panel"></div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const panel = document.getElementById("panel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layoutWave(); layoutRes();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 模式与场景数据 ================= */
+let mode = "wave";   // wave | res
+
+/* ---- 波形模式：一根绳子，左端手柄驱动，右端固定墙 ---- */
+const N = 220;                 // 绳子离散点数
+const C = 320;                 // 波速 v (px/s)，恒定
+let ropeX0 = 90, ropeX1 = 1000, ropeY = 300, dx = 4;
+let y = new Float64Array(N);      // 当前位移
+let yp = new Float64Array(N);     // 上一时刻位移
+let yn = new Float64Array(N);     // 下一时刻缓冲
+let waveF = 1.5, waveA = 45;      // 抖动频率 Hz / 振幅 px
+let autoShake = true;
+let simT = 0;
+let draggingHandle = false, handleDragY = 0;
+
+function layoutWave() {
+  ropeX0 = Math.max(80, W * 0.08);
+  ropeX1 = W - Math.max(70, W * 0.06);
+  ropeY = H * 0.44;
+  dx = (ropeX1 - ropeX0) / (N - 1);
+}
+
+function driveValue() {
+  if (draggingHandle) return handleDragY;
+  if (autoShake) return waveA * Math.sin(2 * Math.PI * waveF * simT);
+  return 0;
+}
+
+/* ---- 共振模式：4 根不同固有频率的弹簧片 + 底部驱动台 ---- */
+const reeds = [
+  { f0: 1.0, color: "#ff8a80" },
+  { f0: 1.5, color: "#ffd54a" },
+  { f0: 2.0, color: "#7fd8ff" },
+  { f0: 2.5, color: "#b39dff" },
+].map(r => ({ ...r, z: 0, v: 0, amp: 0, held: false, resonant: false, lastDing: 0 }));
+const ZETA = 0.1;              // 阻尼比
+const BASE_D = 16;             // 驱动台振幅 px
+let driveF = 1.5, drivePhase = 0;
+let resBaseY = 500, reedXs = [], reedHs = [];
+let resT = 0;
+
+function layoutRes() {
+  resBaseY = H * 0.68;
+  reedXs = [0.16, 0.38, 0.60, 0.82].map(p => W * p);
+  const maxH = Math.min(H * 0.34, 260);
+  // 固有频率越高，簧片越短（符合物理）
+  reedHs = reeds.map(r => maxH * (1.0 / r.f0) / (1.0 / 1.0) * 0.75 + maxH * 0.25);
+}
+
+/* ================= 物理 ================= */
+// 绳波：一维波动方程，左端受迫、右端固定（反射产生驻波）
+function physicsWave(dt) {
+  simT += dt;
+  const dtSub = 0.9 * dx / C;                    // CFL 稳定条件
+  const steps = Math.max(1, Math.ceil(dt / dtSub));
+  const h = dt / steps, r2 = (C * h / dx) * (C * h / dx);
+  for (let s = 0; s < steps; s++) {
+    for (let i = 1; i < N - 1; i++) {
+      yn[i] = (2 - 0.004) * y[i] - (1 - 0.004) * yp[i] + r2 * (y[i + 1] - 2 * y[i] + y[i - 1]);
+    }
+    for (let i = 1; i < N - 1; i++) { yp[i] = y[i]; y[i] = yn[i]; }
+    // 边界：左端驱动，右端固定墙
+    yp[0] = y[0]; y[0] = driveValue();
+    yp[N - 1] = y[N - 1]; y[N - 1] = 0;
+  }
+}
+
+// 共振：每根簧片 = 受迫阻尼振子  z'' = -ω0²z - 2ζω0 z' - x''base
+function physicsRes(dt) {
+  resT += dt;
+  drivePhase += 2 * Math.PI * driveF * dt;
+  const w = 2 * Math.PI * driveF;
+  const driveAcc = BASE_D * w * w * Math.sin(drivePhase);   // -x''base 驱动项
+  const h = dt / 4;
+  for (let s = 0; s < 4; s++) {
+    for (const r of reeds) {
+      if (r.held) { r.v = 0; continue; }
+      const w0 = 2 * Math.PI * r.f0;
+      const acc = -w0 * w0 * r.z - 2 * ZETA * w0 * r.v + driveAcc;
+      r.v += acc * h;
+      r.z += r.v * h;
+      if (r.z > 110) { r.z = 110; r.v = 0; }
+      if (r.z < -110) { r.z = -110; r.v = 0; }
+    }
+  }
+  // 振幅跟踪 + 共振判定
+  for (const r of reeds) {
+    r.amp = Math.max(Math.abs(r.z), r.amp * (1 - dt * 0.6));
+    const was = r.resonant;
+    r.resonant = r.amp > 50;
+    if (r.resonant && !was) {
+      ding(r.f0);
+      showHint(`🎵 共振！驱动频率 ≈ 固有频率 ${r.f0.toFixed(1)} Hz，这根簧片振幅暴涨！`);
+    }
+  }
+}
+
+/* ================= 绘制 ================= */
+function drawWave() {
+  // 背景网格
+  ctx.strokeStyle = "rgba(127,216,255,0.06)"; ctx.lineWidth = 1;
+  for (let gx = 0; gx < W; gx += 40) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, H); ctx.stroke(); }
+  for (let gy = 0; gy < H; gy += 40) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke(); }
+
+  // 平衡位置虚线
+  ctx.setLineDash([8, 8]);
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(ropeX0, ropeY); ctx.lineTo(ropeX1, ropeY); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 右端固定墙
+  ctx.fillStyle = "#5a6b80";
+  ctx.fillRect(ropeX1, ropeY - 110, 22, 220);
+  ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 2;
+  for (let i = -100; i < 110; i += 22) {
+    ctx.beginPath(); ctx.moveTo(ropeX1, ropeY + i); ctx.lineTo(ropeX1 - 12, ropeY + i + 12); ctx.stroke();
+  }
+  ctx.fillStyle = "#cfe4f5"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("固定端（反射）", ropeX1 + 10, ropeY + 140);
+
+  // 绳子（彩色渐变 + 圆珠）
+  const grad = ctx.createLinearGradient(ropeX0, 0, ropeX1, 0);
+  grad.addColorStop(0, "#7fd8ff"); grad.addColorStop(1, "#3f9fe0");
+  ctx.strokeStyle = grad; ctx.lineWidth = 6; ctx.lineJoin = "round"; ctx.lineCap = "round";
+  ctx.beginPath();
+  for (let i = 0; i < N; i++) {
+    const px = ropeX0 + i * dx, py = ropeY - y[i];
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  for (let i = 0; i < N; i += 10) {
+    ctx.beginPath(); ctx.arc(ropeX0 + i * dx, ropeY - y[i], 4.5, 0, 7); ctx.fill();
+  }
+
+  // 左手柄
+  const hy = ropeY - y[0];
+  ctx.beginPath(); ctx.arc(ropeX0, hy, 26, 0, 7);
+  const hg = ctx.createRadialGradient(ropeX0 - 8, hy - 9, 3, ropeX0, hy, 26);
+  hg.addColorStop(0, "#ffe9a8"); hg.addColorStop(1, "#e09a1f");
+  ctx.fillStyle = hg; ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#5a3d00"; ctx.font = "bold 20px sans-serif";
+  ctx.fillText("✋", ropeX0, hy + 7);
+  ctx.fillStyle = "#cfe4f5"; ctx.font = "bold 15px sans-serif";
+  ctx.fillText("拖我上下抖！", ropeX0, hy - 40);
+
+  // 波长 λ 标注（v 恒定，λ = v / f）
+  const lambda = C / waveF;
+  if (autoShake && lambda < (ropeX1 - ropeX0) * 0.9) {
+    const bx = ropeX0 + 60, by = ropeY + 150;
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(bx, by); ctx.lineTo(bx + lambda, by);
+    ctx.moveTo(bx, by - 10); ctx.lineTo(bx, by + 10);
+    ctx.moveTo(bx + lambda, by - 10); ctx.lineTo(bx + lambda, by + 10);
+    ctx.stroke();
+    ctx.fillStyle = "#ffd54a"; ctx.font = "bold 18px sans-serif";
+    ctx.fillText(`波长 λ = v / f ≈ ${Math.round(lambda)} px`, bx + lambda / 2, by + 30);
+  }
+  // 波速方向箭头
+  ctx.fillStyle = "rgba(127,216,255,0.6)";
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("波向右传播 →", ropeX0 + 10, ropeY - 150);
+}
+
+function drawRes() {
+  const baseX = W * 0.08, baseW = W * 0.84;
+  const xb = BASE_D * Math.sin(drivePhase);   // 驱动台当前位移
+
+  // 驱动台
+  ctx.fillStyle = "#3b5878";
+  roundRect(baseX - 20 + xb, resBaseY, baseW + 40, 30, 12, true);
+  ctx.strokeStyle = "rgba(127,216,255,0.6)"; ctx.lineWidth = 2;
+  roundRect(baseX - 20 + xb, resBaseY, baseW + 40, 30, 12, false);
+  ctx.fillStyle = "#9fd0f0"; ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(`驱动台（左右振动中，f = ${driveF.toFixed(2)} Hz）`, baseX + baseW / 2 + xb, resBaseY + 52);
+
+  // 地面
+  ctx.fillStyle = "#0d141f";
+  ctx.fillRect(0, resBaseY + 70, W, H - resBaseY - 70);
+  ctx.strokeStyle = "rgba(255,255,255,0.15)";
+  ctx.beginPath(); ctx.moveTo(0, resBaseY + 70); ctx.lineTo(W, resBaseY + 70); ctx.stroke();
+
+  reeds.forEach((r, i) => {
+    const ax = reedXs[i] + xb;            // 簧片根部跟随驱动台
+    const tipX = ax + r.z, tipY = resBaseY - reedHs[i];
+    // 共振高亮光晕
+    if (r.resonant) {
+      const glow = ctx.createRadialGradient(tipX, tipY, 4, tipX, tipY, 80);
+      glow.addColorStop(0, "rgba(255,213,74,0.55)"); glow.addColorStop(1, "rgba(255,213,74,0)");
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(tipX, tipY, 80, 0, 7); ctx.fill();
+    }
+    // 簧片（弯曲钢片：二次贝塞尔）
+    ctx.strokeStyle = r.color; ctx.lineWidth = r.resonant ? 9 : 6; ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(ax, resBaseY);
+    ctx.quadraticCurveTo(ax + r.z * 0.15, resBaseY - reedHs[i] * 0.55, tipX, tipY);
+    ctx.stroke();
+    // 顶端小球
+    ctx.beginPath(); ctx.arc(tipX, tipY, 17, 0, 7);
+    ctx.fillStyle = r.color; ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 2.5; ctx.stroke();
+    // 振幅包络虚线（把振幅画出来）
+    if (r.amp > 6) {
+      ctx.setLineDash([4, 6]);
+      ctx.strokeStyle = "rgba(255,255,255,0.3)"; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(ax - r.amp, tipY - 24); ctx.lineTo(ax - r.amp, resBaseY - 8); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(ax + r.amp, tipY - 24); ctx.lineTo(ax + r.amp, resBaseY - 8); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // 固有频率标签 + 振幅条
+    ctx.fillStyle = "#cfe4f5"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(`固有频率 f₀ = ${r.f0.toFixed(1)} Hz`, ax, resBaseY + 92);
+    const barW = 110, bx = ax - barW / 2, by = resBaseY + 102;
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
+    roundRect(bx, by, barW, 12, 6, true);
+    const p = Math.min(1, r.amp / 90);
+    ctx.fillStyle = r.resonant ? "#ffd54a" : r.color;
+    if (p > 0.02) roundRect(bx + 2, by + 2, (barW - 4) * p, 8, 4, true);
+    if (r.resonant) {
+      ctx.fillStyle = "#ffd54a"; ctx.font = "bold 22px sans-serif";
+      ctx.fillText("🎵 共振！", ax, tipY - 34);
+    }
+  });
+}
+
+function roundRect(x, yy, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, yy);
+  ctx.arcTo(x + w, yy, x + w, yy + h, r);
+  ctx.arcTo(x + w, yy + h, x, yy + h, r);
+  ctx.arcTo(x, yy + h, x, yy, r);
+  ctx.arcTo(x, yy, x + w, yy, r);
+  ctx.closePath();
+  if (fill) ctx.fill(); else ctx.stroke();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#1b2940"); g.addColorStop(1, "#16202e");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  if (mode === "wave") drawWave(); else drawRes();
+}
+
+/* ================= 交互 ================= */
+canvas.addEventListener("pointerdown", e => {
+  unlockAudio();
+  if (mode === "wave") {
+    if (Math.hypot(e.clientX - ropeX0, e.clientY - (ropeY - y[0])) < 46) {
+      draggingHandle = true;
+      handleDragY = Math.max(-95, Math.min(95, ropeY - e.clientY));
+      canvas.setPointerCapture(e.pointerId);
+      hintEl.style.opacity = "0";
+      pop(660);
+    }
+  } else {
+    for (const r of reeds) {
+      const ax = reedXs[reeds.indexOf(r)] + BASE_D * Math.sin(drivePhase);
+      const tipX = ax + r.z, tipY = resBaseY - reedHs[reeds.indexOf(r)];
+      if (Math.hypot(e.clientX - tipX, e.clientY - tipY) < 42) {
+        r.held = true;
+        canvas.setPointerCapture(e.pointerId);
+        pop(520);
+        showHint("拉开再松手，簧片会按自己的固有频率振动！");
+        break;
+      }
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (mode === "wave" && draggingHandle) {
+    handleDragY = Math.max(-95, Math.min(95, ropeY - e.clientY));
+  } else if (mode === "res") {
+    for (let i = 0; i < reeds.length; i++) {
+      if (reeds[i].held) {
+        reeds[i].z = Math.max(-110, Math.min(110, e.clientX - reedXs[i]));
+      }
+    }
+  }
+});
+window.addEventListener("pointerup", () => {
+  if (draggingHandle) { draggingHandle = false; pop(440); }
+  for (const r of reeds) if (r.held) { r.held = false; r.v = 0; pop(300 + r.f0 * 150); }
+});
+
+/* ---- 模式切换与面板 ---- */
+function setMode(m) {
+  mode = m;
+  document.getElementById("tabWave").classList.toggle("on", m === "wave");
+  document.getElementById("tabRes").classList.toggle("on", m === "res");
+  buildPanel();
+  updateScorebar();
+  if (m === "wave") showHint("拖住左侧手柄上下抖动，或用滑杆自动抖动；调频率 f，看波长 λ 怎么变！");
+  else showHint("拖动滑杆改变驱动台频率：谁的固有频率被猜中，谁就会疯狂振动（共振）！");
+  pop(700);
+}
+document.getElementById("tabWave").addEventListener("click", () => setMode("wave"));
+document.getElementById("tabRes").addEventListener("click", () => setMode("res"));
+
+function buildPanel() {
+  if (mode === "wave") {
+    panel.innerHTML = `
+      <label>频率 f <input type="range" id="sF" min="0.5" max="3.5" step="0.1" value="${waveF}"><span class="val" id="vF"></span></label>
+      <label>振幅 <input type="range" id="sA" min="10" max="90" step="5" value="${waveA}"><span class="val" id="vA"></span></label>
+      <label class="chk"><input type="checkbox" id="cAuto" ${autoShake ? "checked" : ""}> 自动抖动</label>`;
+    const sF = document.getElementById("sF"), sA = document.getElementById("sA"), cAuto = document.getElementById("cAuto");
+    const upd = () => {
+      waveF = parseFloat(sF.value); waveA = parseFloat(sA.value);
+      document.getElementById("vF").textContent = waveF.toFixed(1) + " Hz";
+      document.getElementById("vA").textContent = waveA + " px";
+      updateScorebar();
+    };
+    sF.addEventListener("input", upd); sA.addEventListener("input", upd);
+    cAuto.addEventListener("change", () => { autoShake = cAuto.checked; if (!autoShake) showHint("自动抖动已关：拖住手柄自己制造波吧！"); });
+    upd();
+  } else {
+    panel.innerHTML = `
+      <label>驱动频率 <input type="range" id="sD" min="0.5" max="3.0" step="0.01" value="${driveF}"><span class="val" id="vD"></span></label>
+      <span style="font-size:14px;color:#9fb6cc">固有频率：1.0 / 1.5 / 2.0 / 2.5 Hz</span>`;
+    const sD = document.getElementById("sD");
+    const upd = () => {
+      driveF = parseFloat(sD.value);
+      const near = reeds.some(r => Math.abs(r.f0 - driveF) < 0.12);
+      const vD = document.getElementById("vD");
+      vD.textContent = driveF.toFixed(2) + " Hz";
+      vD.style.color = near ? "#ffd54a" : "";
+      updateScorebar();
+    };
+    sD.addEventListener("input", upd);
+    upd();
+  }
+}
+
+function updateScorebar() {
+  if (mode === "wave") {
+    const lambda = C / waveF;
+    scorebar.textContent = autoShake
+      ? `f = ${waveF.toFixed(1)} Hz ｜ 波速 v 恒定 = ${C} px/s ｜ λ = v/f ≈ ${Math.round(lambda)} px`
+      : `手动模式 ｜ 波速 v 恒定 = ${C} px/s ｜ 抖得越快，波长越短`;
+  } else {
+    scorebar.textContent = `驱动频率 f = ${driveF.toFixed(2)} Hz — 接近某根簧片的 f₀ 时它就会共振！`;
+  }
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function unlockAudio() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === "suspended") actx.resume();
+  } catch (e) {}
+}
+function tone(freq, dur, vol, type) {
+  try {
+    unlockAudio();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function ding(f0) {   // 共振提示音：频率越高音越高 + 小庆祝
+  tone(300 + f0 * 220, 0.5, 0.16);
+  setTimeout(() => tone((300 + f0 * 220) * 1.5, 0.4, 0.12), 140);
+}
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 4000);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 主循环 ================= */
+resize();
+buildPanel();
+updateScorebar();
+showHint("拖住左侧手柄上下抖动，或用滑杆自动抖动；调频率 f，看波长 λ 怎么变！");
+
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  if (mode === "wave") physicsWave(dt); else physicsRes(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

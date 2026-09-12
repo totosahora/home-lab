@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>日影计时</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#1c2a4a; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,30,55,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:19px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,30,55,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #modebar {
+    position:absolute; top:12px; left:12px; z-index:10;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  #modebar button {
+    font-size:19px; font-weight:bold; padding:12px 20px;
+    border-radius:22px; border:3px solid rgba(255,255,255,0.35);
+    background:rgba(20,30,55,0.8); color:#fff; cursor:pointer;
+  }
+  #modebar button.on { background:#ffd54a; color:#5a3d00; border-color:#ffd54a; }
+  #modebar button:active { transform:scale(1.05); }
+  #answers {
+    position:absolute; bottom:64px; left:50%; transform:translateX(-50%);
+    display:none; gap:14px; z-index:10;
+  }
+  #answers button {
+    font-size:24px; font-weight:bold; padding:14px 26px;
+    border-radius:20px; border:none; background:#ffffff; color:#1c2a4a;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.35);
+  }
+  #answers button:active { transform:scale(1.06); }
+  #answers button.correct { background:#5fd35f; color:#fff; }
+  #answers button.wrong { background:#b9c0cc; color:#7a8494; }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.45);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel .row { display:flex; gap:18px; }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🕐 上午 9 点整</div>
+<div id="modebar">
+  <button id="btnFree" class="on">🌞 玩太阳</button>
+  <button id="btnQuiz">🎯 猜时间</button>
+</div>
+<div id="answers"></div>
+<div id="hint">☝️ 拖动太阳从东升到西落，看晷针的影子报时！</div>
+<div id="winPanel">
+  <div class="msg">🎉 闯关成功！</div>
+  <div class="row">
+    <button id="replayBtn">再玩一次</button>
+    <button id="freeBtn">回去玩太阳</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const answersEl = document.getElementById("answers");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 布局 ================= */
+// 画面布局：上方天空弧线（太阳轨道），下方日晷圆盘
+const SQUASH = 0.45;            // 圆盘透视压扁系数
+const GNOMON_H = 0.55;          // 晷针高度（世界单位，圆盘半径 = 1）
+const ALT_MAX = 62;             // 中午太阳最大高度角（度）
+const lay = {};
+function layout() {
+  lay.cx = W / 2;
+  lay.dialR = Math.min(W * 0.27, H * 0.26);
+  lay.cy = H * 0.70;                              // 圆盘中心
+  lay.gnomonPx = lay.dialR * 0.62;                // 晷针屏幕高度
+  lay.arcBaseY = H * 0.46;                        // 太阳弧线地平线
+  lay.arcR = Math.min(W * 0.34, lay.arcBaseY - 110);
+  lay.sunR = 26;
+  lay.gAlt = { x: 110, y: H - 78 };               // 高度角仪表（左下）
+  lay.gAz  = { x: W - 110, y: H - 78 };           // 方位角仪表（右下）
+  lay.gR = 52;
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+let mode = "free";      // free | quiz
+let t = 9;              // 当前时间（小时，6 ~ 18）
+let dragging = false;
+let particles = [];     // 庆祝星星
+const quiz = { level: 1, q: 0, firstTry: 0, target: 9, options: [], locked: false, hadWrong: false };
+const Q_PER_LEVEL = 2, LEVELS = 3;
+
+/* ================= 太阳几何 ================= */
+// 太阳沿半圆弧线：θ=0 东升(6点)，θ=π 西落(18点)
+function theta(t) { return (t - 6) / 12 * Math.PI; }
+function sunPos(t) {
+  const th = theta(t);
+  return [lay.cx - lay.arcR * Math.cos(th), lay.arcBaseY - lay.arcR * Math.sin(th)];
+}
+function sunAlt(t) { return ALT_MAX * Math.sin(theta(t)); }        // 高度角（度）
+function sunAz(t) { return 90 + (t - 6) * 15; }                    // 方位角：东90 南180 西270
+// 影子：方向与太阳方位相反，长度 = 针高 / tan(高度角)
+function shadowInfo(t) {
+  const az = sunAz(t) * Math.PI / 180;
+  const alt = sunAlt(t);
+  const len = Math.min(0.98, GNOMON_H / Math.tan(Math.max(1.5, alt) * Math.PI / 180));
+  return {
+    ux: -Math.sin(az), uy: -Math.cos(az),                          // 圆盘平面单位向量（东、北）
+    len: len,
+    alpha: Math.min(1, Math.max(0.18, alt / 9))
+  };
+}
+// 时刻 h 的刻度方向（与影子方向一致）
+function hourDir(h) { const s = shadowInfo(h); return [s.ux, s.uy]; }
+// 圆盘平面坐标 → 屏幕坐标
+function dialToScreen(u, v) { return [lay.cx + u * lay.dialR, lay.cy - v * lay.dialR * SQUASH]; }
+
+function fmtTime(t) {
+  let h = Math.floor(t), m = Math.round((t - h) * 60 / 10) * 10;
+  if (m === 60) { h++; m = 0; }
+  const period = t < 8 ? "早上" : t < 12 ? "上午" : t < 13 ? "中午" : "下午";
+  return m === 0 ? `${period} ${h} 点整` : `${period} ${h} 点 ${m} 分`;
+}
+function fmtOpt(t) {
+  const h = Math.floor(t);
+  return (t - h) < 0.01 ? `${h} 点` : `${h} 点半`;
+}
+function updateScore() {
+  if (mode === "free") scorebar.textContent = `🕐 ${fmtTime(t)}`;
+  else scorebar.textContent = `🎯 第 ${Math.min(quiz.level, LEVELS)} / ${LEVELS} 关 · ⭐ 一次答对 ${quiz.firstTry} 题`;
+}
+
+/* ================= 关卡（猜时间） ================= */
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+function randInt(n) { return Math.floor(Math.random() * n); }
+function genQuestion(level) {
+  let target, options;
+  if (level === 1) {                       // 整点，干扰项离得远
+    target = 7 + randInt(11);              // 7~17
+    const pool = [];
+    for (let h = 6; h <= 18; h++) if (Math.abs(h - target) >= 3) pool.push(h);
+    options = [target, pool[randInt(pool.length)]];
+    let d2 = pool[randInt(pool.length)];
+    while (d2 === options[1]) d2 = pool[randInt(pool.length)];
+    options.push(d2);
+  } else if (level === 2) {                // 整点，干扰项相邻
+    target = 8 + randInt(9);               // 8~16
+    const far = target + 2 <= 18 ? target + 2 : target - 2;
+    options = [target - 1, target, target + 1, far];
+  } else {                                 // 半点
+    target = 7 + randInt(10) + 0.5;        // 7:30~16:30
+    options = [target - 1, target - 0.5, target, target + 0.5];
+  }
+  return { target, options: shuffle(options) };
+}
+function startQuiz() {
+  mode = "quiz";
+  quiz.level = 1; quiz.q = 0; quiz.firstTry = 0;
+  winPanel.style.display = "none";
+  document.getElementById("btnFree").classList.remove("on");
+  document.getElementById("btnQuiz").classList.add("on");
+  nextQuestion();
+  showHint("太阳躲进云里了——看影子，猜猜现在几点？");
+}
+function nextQuestion() {
+  const q = genQuestion(quiz.level);
+  quiz.target = q.target;
+  quiz.options = q.options;
+  quiz.locked = false; quiz.hadWrong = false;
+  t = q.target;                            // 影子摆到位（太阳藏起来）
+  renderOptions();
+  updateScore();
+}
+function renderOptions() {
+  answersEl.innerHTML = "";
+  answersEl.style.display = "flex";
+  for (const opt of quiz.options) {
+    const b = document.createElement("button");
+    b.textContent = fmtOpt(opt);
+    b.addEventListener("click", () => answer(opt, b));
+    answersEl.appendChild(b);
+  }
+}
+function answer(opt, btn) {
+  if (quiz.locked) return;
+  if (Math.abs(opt - quiz.target) < 0.01) {
+    quiz.locked = true;
+    btn.classList.add("correct");
+    if (!quiz.hadWrong) quiz.firstTry++;
+    starBurst();
+    fanfare();
+    updateScore();
+    quiz.q++;
+    setTimeout(() => {
+      if (quiz.q >= Q_PER_LEVEL) {
+        quiz.q = 0; quiz.level++;
+        if (quiz.level > LEVELS) {
+          answersEl.style.display = "none";
+          winPanel.querySelector(".msg").innerHTML =
+            `🎉 闯关成功！<br>一次答对 ${quiz.firstTry} / ${Q_PER_LEVEL * LEVELS} 题`;
+          winPanel.style.display = "flex";
+          fanfare(); setTimeout(fanfare, 500);
+          return;
+        }
+        showHint(`🌟 进入第 ${quiz.level} 关，更难一点咯！`);
+      }
+      nextQuestion();
+    }, 1100);
+  } else {
+    quiz.hadWrong = true;
+    btn.classList.add("wrong");
+    btn.disabled = true;
+    pop(220);
+    showHint("再看看：影子尖尖指着哪个刻度呀？");
+  }
+}
+function setFree() {
+  mode = "free";
+  t = 9;
+  answersEl.style.display = "none";
+  winPanel.style.display = "none";
+  document.getElementById("btnFree").classList.add("on");
+  document.getElementById("btnQuiz").classList.remove("on");
+  updateScore();
+  showHint("☝️ 拖动太阳从东升到西落，看晷针的影子报时！");
+}
+
+/* ================= 庆祝星星 ================= */
+function starBurst() {
+  for (let i = 0; i < 26; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 260;
+    particles.push({
+      x: lay.cx, y: lay.cy - lay.gnomonPx,
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 160,
+      life: 1, size: 14 + Math.random() * 10
+    });
+  }
+}
+
+/* ================= 交互：拖太阳 ================= */
+let lastHour = 9;
+canvas.addEventListener("pointerdown", e => {
+  if (mode !== "free" || winPanel.style.display === "flex") return;
+  const [sx, sy] = sunPos(t);
+  if (Math.hypot(e.clientX - sx, e.clientY - sy) < 60) {
+    dragging = true;
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(660);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  const dx = e.clientX - lay.cx, dy = lay.arcBaseY - e.clientY;
+  let th = Math.atan2(dy, -dx);                       // 太阳弧线参数
+  th = Math.max(0, Math.min(Math.PI, th));
+  t = 6 + 12 * th / Math.PI;
+  const h = Math.floor(t);
+  if (h !== lastHour) { lastHour = h; pop(520 + h * 20); }   // 每过一小时叮一声
+  updateScore();
+});
+window.addEventListener("pointerup", () => { dragging = false; });
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+function mix(c1, c2, f) {   // 颜色插值
+  const p = h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  const a = p(c1), b = p(c2);
+  return `rgb(${a.map((v, i) => Math.round(v + (b[i] - v) * f)).join(",")})`;
+}
+
+function drawSky() {
+  const day = Math.sin(theta(t));                     // 0=日出日落 1=正午
+  const g = ctx.createLinearGradient(0, 0, 0, lay.arcBaseY);
+  g.addColorStop(0, mix("#ff8c42", "#1e6fd9", day));
+  g.addColorStop(1, mix("#ffd9a0", "#aee3ff", day));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, lay.arcBaseY + 1);
+  // 太阳轨迹虚线
+  ctx.save();
+  ctx.setLineDash([6, 12]);
+  ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(lay.cx, lay.arcBaseY, lay.arcR, Math.PI, 2 * Math.PI);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  // 东 / 西 地标
+  ctx.font = "bold 22px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.fillText("东", lay.cx - lay.arcR - 26, lay.arcBaseY - 14);
+  ctx.fillText("西", lay.cx + lay.arcR + 26, lay.arcBaseY - 14);
+  ctx.restore();
+}
+
+function drawSun() {
+  const [sx, sy] = sunPos(t);
+  const day = Math.sin(theta(t));
+  const col = mix("#ff7a3c", "#ffd54a", day);         // 早晚偏红，中午金黄
+  ctx.save();
+  // 光芒
+  ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.lineCap = "round";
+  for (let i = 0; i < 8; i++) {
+    const a = i / 8 * Math.PI * 2 + performance.now() / 3000;
+    ctx.beginPath();
+    ctx.moveTo(sx + Math.cos(a) * (lay.sunR + 6), sy + Math.sin(a) * (lay.sunR + 6));
+    ctx.lineTo(sx + Math.cos(a) * (lay.sunR + 16), sy + Math.sin(a) * (lay.sunR + 16));
+    ctx.stroke();
+  }
+  // 圆脸
+  ctx.beginPath(); ctx.arc(sx, sy, lay.sunR, 0, 7);
+  ctx.fillStyle = col; ctx.fill();
+  ctx.strokeStyle = "rgba(180,90,0,0.5)"; ctx.lineWidth = 2.5; ctx.stroke();
+  // 表情
+  ctx.fillStyle = "#7a4a00";
+  ctx.beginPath(); ctx.arc(sx - 8, sy - 4, 3, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(sx + 8, sy - 4, 3, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#7a4a00"; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.arc(sx, sy + 3, 9, 0.25 * Math.PI, 0.75 * Math.PI); ctx.stroke();
+  ctx.restore();
+}
+
+function drawCloud() {   // 猜时间模式：太阳藏进云里
+  const cx = lay.cx, cy = lay.arcBaseY - lay.arcR * 0.72;
+  ctx.save();
+  ctx.fillStyle = "rgba(255,255,255,0.95)";
+  for (const [ox, oy, r] of [[-34, 6, 22], [0, -8, 28], [34, 6, 22], [0, 10, 26]]) {
+    ctx.beginPath(); ctx.arc(cx + ox, cy + oy, r, 0, 7); ctx.fill();
+  }
+  ctx.fillStyle = "#5a6a8a";
+  ctx.font = "bold 30px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("?", cx, cy + 4);
+  ctx.restore();
+}
+
+function drawGround() {
+  const g = ctx.createLinearGradient(0, lay.arcBaseY, 0, H);
+  g.addColorStop(0, "#8fd45f"); g.addColorStop(1, "#5aa838");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, lay.arcBaseY, W, H - lay.arcBaseY);
+}
+
+function drawDial() {
+  const { cx, cy, dialR } = lay;
+  // 底座石墩（底部椭圆阴影）
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(cx, cy + 10, dialR * 1.12, dialR * SQUASH * 1.12, 0, 0, 7);
+  ctx.fillStyle = "rgba(0,0,0,0.22)"; ctx.fill();
+  // 圆盘侧面（厚度）
+  ctx.beginPath(); ctx.ellipse(cx, cy + 12, dialR, dialR * SQUASH, 0, 0, 7);
+  ctx.fillStyle = "#8a7a5f"; ctx.fill();
+  // 圆盘面
+  const g = ctx.createRadialGradient(cx - dialR * 0.3, cy - dialR * 0.2, dialR * 0.1, cx, cy, dialR);
+  g.addColorStop(0, "#f5e8c8"); g.addColorStop(1, "#d9c496");
+  ctx.beginPath(); ctx.ellipse(cx, cy, dialR, dialR * SQUASH, 0, 0, 7);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "#a89263"; ctx.lineWidth = 4; ctx.stroke();
+
+  // 刻度线（6 ~ 18 时 + 半点）
+  for (let h = 6; h <= 18; h++) {
+    const [ux, uy] = hourDir(h);
+    const [x1, y1] = dialToScreen(ux * 0.70, uy * 0.70);
+    const [x2, y2] = dialToScreen(ux * 0.83, uy * 0.83);
+    ctx.strokeStyle = "#7a5c2e"; ctx.lineWidth = 4; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    if (h < 18) {
+      const [hx, hy] = hourDir(h + 0.5);
+      const [m1x, m1y] = dialToScreen(hx * 0.76, hy * 0.76);
+      const [m2x, m2y] = dialToScreen(hx * 0.83, hy * 0.83);
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(m1x, m1y); ctx.lineTo(m2x, m2y); ctx.stroke();
+    }
+    // 时刻数字
+    const [nx, ny] = dialToScreen(ux * 0.93, uy * 0.93);
+    ctx.fillStyle = "#5a4416";
+    ctx.font = `bold ${Math.round(dialR * 0.13)}px sans-serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(String(h), nx, ny);
+  }
+  ctx.font = `bold ${Math.round(dialR * 0.10)}px sans-serif`;
+  ctx.fillStyle = "#8a6f3a";
+  ctx.fillText("时", cx, cy + dialR * SQUASH * 0.55);
+
+  // 影子（从针底指向刻度，宽度渐细）
+  const s = shadowInfo(t);
+  const tip = dialToScreen(s.ux * s.len, s.uy * s.len);
+  const dx = tip[0] - cx, dy = tip[1] - cy;
+  const L = Math.hypot(dx, dy);
+  if (L > 2) {
+    const nx2 = dx / L, ny2 = dy / L;
+    ctx.save();
+    ctx.globalAlpha = s.alpha * 0.55;
+    ctx.fillStyle = "#3a2c14";
+    ctx.beginPath();
+    ctx.moveTo(cx - ny2 * 7, cy + nx2 * 7);
+    ctx.lineTo(cx + ny2 * 7, cy - nx2 * 7);
+    ctx.lineTo(tip[0] + ny2 * 2, tip[1] - nx2 * 2);
+    ctx.lineTo(tip[0] - ny2 * 2, tip[1] + nx2 * 2);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // 晷针（竖针）
+  const topY = cy - lay.gnomonPx;
+  ctx.strokeStyle = "#6b4a22"; ctx.lineWidth = 9; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx, topY); ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx - 2, cy - 4); ctx.lineTo(cx - 2, topY + 4); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(cx, cy, 14, 7, 0, 0, 7);
+  ctx.fillStyle = "#7a5c2e"; ctx.fill();
+  // 针尖小球
+  ctx.beginPath(); ctx.arc(cx, topY, 6, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  ctx.strokeStyle = "#a8760a"; ctx.lineWidth = 2; ctx.stroke();
+
+  // 光线（太阳 → 针尖 虚线）
+  if (mode === "free") {
+    const [sx, sy] = sunPos(t);
+    ctx.save();
+    ctx.setLineDash([8, 8]);
+    ctx.strokeStyle = "rgba(255,240,150,0.85)"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(cx, topY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+/* ================= 仪表：高度角 / 方位角 ================= */
+function drawGauge(g, title, valText, needleAng, ticks, hide) {
+  const r = lay.gR;
+  ctx.save();
+  // 表盘
+  ctx.beginPath(); ctx.arc(g.x, g.y, r, Math.PI, 2 * Math.PI);
+  ctx.lineTo(g.x + r, g.y); ctx.closePath();
+  ctx.fillStyle = "rgba(255,255,255,0.88)"; ctx.fill();
+  ctx.strokeStyle = "#4a5a7a"; ctx.lineWidth = 3; ctx.stroke();
+  // 刻度
+  ctx.font = "bold 11px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#4a5a7a";
+  for (const [ang, txt] of ticks) {
+    const x1 = g.x + Math.cos(ang) * (r - 4), y1 = g.y + Math.sin(ang) * (r - 4);
+    const x2 = g.x + Math.cos(ang) * (r - 12), y2 = g.y + Math.sin(ang) * (r - 12);
+    ctx.strokeStyle = "#4a5a7a"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    ctx.fillText(txt, g.x + Math.cos(ang) * (r - 21), g.y + Math.sin(ang) * (r - 21));
+  }
+  // 指针（猜时间模式藏起来）
+  if (!hide) {
+    ctx.strokeStyle = "#e93b3b"; ctx.lineWidth = 4; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(g.x, g.y);
+    ctx.lineTo(g.x + Math.cos(needleAng) * (r - 14), g.y + Math.sin(needleAng) * (r - 14));
+    ctx.stroke();
+    ctx.beginPath(); ctx.arc(g.x, g.y, 5, 0, 7);
+    ctx.fillStyle = "#e93b3b"; ctx.fill();
+  } else {
+    ctx.font = "bold 22px sans-serif"; ctx.fillStyle = "#9aa4b8";
+    ctx.fillText("?", g.x, g.y - r * 0.35);
+  }
+  // 标题与数值
+  ctx.font = "bold 14px sans-serif"; ctx.fillStyle = "#2a3a5a";
+  ctx.fillText(title, g.x, g.y + 16);
+  ctx.font = "bold 15px sans-serif"; ctx.fillStyle = hide ? "#9aa4b8" : "#c33";
+  ctx.fillText(hide ? "?" : valText, g.x, g.y + 34);
+  ctx.restore();
+}
+function drawGauges() {
+  const hide = mode === "quiz";
+  const alt = sunAlt(t), az = sunAz(t);
+  // 高度角：0°（左，π）→ 90°（上，3π/2）
+  drawGauge(lay.gAlt, "太阳高度角", `${Math.round(alt)}°`,
+    Math.PI + (alt / 90) * (Math.PI / 2),
+    [[Math.PI, "0°"], [Math.PI * 1.25, "45°"], [Math.PI * 1.5, "90°"]], hide);
+  // 方位角：东90°（左）→ 南180°（上）→ 西270°（右）
+  drawGauge(lay.gAz, "太阳方位角", `${Math.round(az)}°`,
+    Math.PI + ((az - 90) / 180) * Math.PI,
+    [[Math.PI, "东"], [Math.PI * 1.5, "南"], [Math.PI * 2, "西"]], hide);
+}
+
+function drawParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt * 0.9;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    p.vy += 320 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, p.life * 1.5);
+    ctx.font = `${p.size}px sans-serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("⭐", p.x, p.y);
+    ctx.restore();
+  }
+}
+
+function draw(dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawSky();
+  drawGround();
+  if (mode === "free") drawSun(); else drawCloud();
+  drawDial();
+  drawGauges();
+  drawParticles(dt);
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  draw(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+document.getElementById("btnFree").addEventListener("click", () => { setFree(); pop(880); });
+document.getElementById("btnQuiz").addEventListener("click", () => { if (mode !== "quiz") { startQuiz(); pop(880); } });
+document.getElementById("replayBtn").addEventListener("click", () => { startQuiz(); pop(880); });
+document.getElementById("freeBtn").addEventListener("click", () => { setFree(); pop(880); });
+showHint("☝️ 拖动太阳从东升到西落，看晷针的影子报时！");
+
+// 测试钩子
+window.__sundial = {
+  get t() { return t; }, get mode() { return mode; }, get quiz() { return quiz; },
+  setTime(v) { t = v; updateScore(); },
+  startQuiz, answer, setFree
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

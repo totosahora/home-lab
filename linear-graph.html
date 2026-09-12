@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>一次函数图像 · y = kx + b</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#1c2436; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,30,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #taskcard {
+    position:absolute; top:60px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,30,0.85); color:#fff; padding:10px 26px;
+    border-radius:18px; font-size:19px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; transition:background 0.3s, transform 0.3s;
+    border:2px solid rgba(255,213,74,0.35);
+  }
+  #taskcard.done { background:rgba(30,90,40,0.92); border-color:#5be07a; transform:translateX(-50%) scale(1.08); }
+  #eqPanel {
+    position:absolute; top:12px; left:14px; z-index:10; pointer-events:none;
+    background:rgba(10,16,30,0.85); color:#7fd0ff; padding:10px 20px;
+    border-radius:16px; font-size:24px; font-weight:bold;
+    font-family:"Menlo","PingFang SC",monospace; white-space:nowrap;
+    border:2px solid rgba(127,208,255,0.3);
+  }
+  #hint {
+    position:absolute; bottom:158px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,30,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #sliders {
+    position:absolute; bottom:0; left:0; right:0; z-index:10;
+    background:rgba(10,16,30,0.9); padding:10px 16px 14px;
+    display:flex; flex-direction:column; gap:8px; align-items:center;
+  }
+  .srow { display:flex; align-items:center; gap:12px; width:100%; max-width:640px; }
+  .srow .lab { color:#fff; font-size:17px; font-weight:bold; width:118px; text-align:right; white-space:nowrap; }
+  .srow .val { color:#ffd54a; font-size:17px; font-weight:bold; width:46px; font-family:"Menlo",monospace; }
+  .srow input[type=range] {
+    flex:1; -webkit-appearance:none; appearance:none; height:14px; border-radius:7px;
+    background:rgba(255,255,255,0.18); outline:none; cursor:pointer;
+  }
+  .srow input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance:none; appearance:none; width:36px; height:36px; border-radius:50%;
+    background:#ffd54a; border:3px solid #fff; box-shadow:0 2px 8px rgba(0,0,0,0.5); cursor:pointer;
+  }
+  .srow input[type=range]::-moz-range-thumb {
+    width:32px; height:32px; border-radius:50%;
+    background:#ffd54a; border:3px solid #fff; box-shadow:0 2px 8px rgba(0,0,0,0.5); cursor:pointer;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:38px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="eqPanel">y = x</div>
+<div id="scorebar">第 1 / 5 关</div>
+<div id="taskcard">🎯 任务</div>
+<div id="hint">拖动直线上的两个圆点，或拨动下方滑杆，改变 k 和 b！</div>
+<div id="sliders">
+  <div class="srow">
+    <div class="lab">斜率 k</div>
+    <input id="kSlider" type="range" min="-5" max="5" step="0.5" value="1">
+    <div class="val" id="kVal">1</div>
+  </div>
+  <div class="srow">
+    <div class="lab">截距 b</div>
+    <input id="bSlider" type="range" min="-10" max="10" step="0.5" value="0">
+    <div class="val" id="bVal">0</div>
+  </div>
+</div>
+<div id="winPanel">
+  <div class="msg">🎉 五关全部完成！<br>你已经掌握 y = kx + b 啦！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const taskcard = document.getElementById("taskcard");
+const eqPanel = document.getElementById("eqPanel");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const kSlider = document.getElementById("kSlider");
+const bSlider = document.getElementById("bSlider");
+const kVal = document.getElementById("kVal");
+const bVal = document.getElementById("bVal");
+let W = 0, H = 0, DPR = 1;
+let hintTimer = null;
+
+/* ================= 坐标系与视图 ================= */
+// 数学坐标：x、y 范围均为 -10 ~ 10；视图留出顶部任务区和底部滑杆区
+const RANGE = 10;
+const view = { unit: 30, ox: 0, oy: 0, px0: 0, py0: 0, px1: 0, py1: 0 };
+function fitView() {
+  const top = 116, bottom = 150, side = 26;
+  const availW = W - side * 2, availH = H - top - bottom;
+  view.unit = Math.min(availW, availH) / (2 * RANGE + 1.6);
+  // 绘图区收紧到坐标范围附近并居中，避免网格两侧留空
+  const half = (RANGE + 0.8) * view.unit;
+  view.ox = side + availW / 2;
+  view.oy = top + availH / 2;
+  view.px0 = view.ox - half; view.px1 = view.ox + half;
+  view.py0 = view.oy - half; view.py1 = view.oy + half;
+}
+function toScreenX(x) { return view.ox + x * view.unit; }
+function toScreenY(y) { return view.oy - y * view.unit; }
+function toMath(sx, sy) { return [(sx - view.ox) / view.unit, (view.oy - sy) / view.unit]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+let K = 1, B = 0;            // 当前 y = K·x + B
+const K_MIN = -5, K_MAX = 5, B_MIN = -10, B_MAX = 10;
+const TOL = 0.11;            // k、b 以 0.5 为步进，判定留一点余量
+
+const TASKS = [
+  { text: "让直线穿过点 (0, 3)",
+    tip: "截距 b 就是直线与 y 轴交点的纵坐标！",
+    pts: [[0, 3]], line: null,
+    ok: (k, b) => Math.abs(b - 3) < TOL },
+  { text: "让直线穿过点 (-2, 0)",
+    tip: "把 x = -2 代入 y = kx + b，要让 y = 0",
+    pts: [[-2, 0]], line: null,
+    ok: (k, b) => Math.abs(-2 * k + b) < TOL },
+  { text: "让直线与 y = 2x 平行（不能重合）",
+    tip: "平行就是斜率 k 相同！虚线是 y = 2x",
+    pts: [], line: { k: 2, b: 0 },
+    ok: (k, b) => Math.abs(k - 2) < TOL && Math.abs(b) > TOL },
+  { text: "让直线同时穿过 (2, 4) 和 (0, 1)",
+    tip: "先让 b = 1，再调 k 让线爬上 (2, 4)",
+    pts: [[2, 4], [0, 1]], line: null,
+    ok: (k, b) => Math.abs(2 * k + b - 4) < TOL && Math.abs(b - 1) < TOL },
+  { text: "让直线与 y = -x + 2 重合",
+    tip: "重合：k 和 b 都要一模一样！k = -1，b = 2",
+    pts: [], line: { k: -1, b: 2 },
+    ok: (k, b) => Math.abs(k + 1) < TOL && Math.abs(b - 2) < TOL },
+];
+let levelIdx = 0;
+let passed = false;          // 当前关是否已通过（等待跳关）
+let confetti = [];           // 庆祝彩带 {x,y,vx,vy,color,size}
+let pulseT = 0;              // 目标点呼吸动画
+
+function fmtNum(v) {
+  const r = Math.round(v * 100) / 100;
+  return Object.is(r, -0) ? 0 : r;
+}
+function fmtEq(k, b) {
+  k = fmtNum(k); b = fmtNum(b);
+  let s = "y = ";
+  if (k === 0) { s += "" + b; return s; }
+  if (k === 1) s += "x";
+  else if (k === -1) s += "-x";
+  else s += k + "x";
+  if (b > 0) s += " + " + b;
+  else if (b < 0) s += " - " + Math.abs(b);
+  return s;
+}
+function updateScore() {
+  scorebar.textContent = `第 ${Math.min(levelIdx + 1, TASKS.length)} / ${TASKS.length} 关`;
+}
+function showTask() {
+  const t = TASKS[levelIdx];
+  taskcard.textContent = "🎯 " + t.text;
+  taskcard.classList.remove("done");
+  passed = false;
+  updateScore();
+  showHint(t.tip, 3200);
+}
+function syncUI() {
+  kSlider.value = K; bSlider.value = B;
+  kVal.textContent = fmtNum(K); bVal.textContent = fmtNum(B);
+  eqPanel.textContent = fmtEq(K, B);
+}
+function setKB(k, b) {
+  K = Math.max(K_MIN, Math.min(K_MAX, Math.round(k * 2) / 2));
+  B = Math.max(B_MIN, Math.min(B_MAX, Math.round(b * 2) / 2));
+  syncUI();
+  checkTask();
+}
+function checkTask() {
+  if (passed || winPanel.style.display === "flex") return;
+  if (TASKS[levelIdx].ok(K, B)) {
+    passed = true;
+    taskcard.textContent = "✅ 完成！太棒了！";
+    taskcard.classList.add("done");
+    fanfare();
+    spawnConfetti();
+    setTimeout(() => {
+      levelIdx++;
+      if (levelIdx >= TASKS.length) {
+        winPanel.style.display = "flex";
+        fanfare();
+        spawnConfetti();
+      } else {
+        showTask();
+      }
+    }, 1500);
+  }
+}
+function resetGame() {
+  levelIdx = 0; passed = false; confetti = [];
+  K = 1; B = 0;
+  winPanel.style.display = "none";
+  syncUI();
+  showTask();
+}
+resetGame();
+
+/* ================= 拖点交互 ================= */
+// 橙色点：直线与 y 轴交点 (0, b)，拖动改变截距 b
+// 绿色点：直线上远处一点，绕 (0,b) 旋转，拖动改变斜率 k
+const PT_R = 15, HIT_R = 36;
+function kPointMath() {
+  // 绿点放在 x = 4 处；若超出可视范围则贴边收回
+  let xq = 4, yq = K * xq + B;
+  if (Math.abs(yq) > RANGE - 1 && Math.abs(K) > 0.01) {
+    yq = Math.sign(yq) * (RANGE - 1);
+    xq = (yq - B) / K;
+    if (Math.abs(xq) < 1.5) xq = Math.sign(xq || 1) * 1.5;
+  }
+  return [xq, yq];
+}
+let dragging = null;   // "b" | "k"
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const sx = e.clientX, sy = e.clientY;
+  const bx = toScreenX(0), by = toScreenY(B);
+  const [kx2, ky2] = kPointMath();
+  const px = toScreenX(kx2), py = toScreenY(ky2);
+  if (Math.hypot(sx - bx, sy - by) < HIT_R) dragging = "b";
+  else if (Math.hypot(sx - px, sy - py) < HIT_R) dragging = "k";
+  if (dragging) {
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(660);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  const [mx, my] = toMath(e.clientX, e.clientY);
+  if (dragging === "b") {
+    setKB(K, my);
+  } else {
+    // 绿点绕 (0, b) 旋转：k = (y - b) / x，x 太小时保持原斜率
+    if (Math.abs(mx) > 0.4) setKB((my - B) / mx, B);
+  }
+});
+window.addEventListener("pointerup", () => {
+  if (dragging) { dragging = null; pop(880); }
+});
+kSlider.addEventListener("input", () => { setKB(parseFloat(kSlider.value), B); });
+bSlider.addEventListener("input", () => { setKB(K, parseFloat(bSlider.value)); });
+
+/* ================= 绘制 ================= */
+function drawGrid() {
+  // 绘图区裁剪
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(view.px0, view.py0, view.px1 - view.px0, view.py1 - view.py0);
+  ctx.clip();
+  // 底色
+  ctx.fillStyle = "#232f47";
+  ctx.fillRect(view.px0, view.py0, view.px1 - view.px0, view.py1 - view.py0);
+  // 网格线
+  ctx.lineWidth = 1;
+  for (let i = -RANGE; i <= RANGE; i++) {
+    ctx.strokeStyle = i === 0 ? "rgba(255,255,255,0.55)" : "rgba(255,255,255,0.12)";
+    ctx.beginPath();
+    ctx.moveTo(toScreenX(i), view.py0); ctx.lineTo(toScreenX(i), view.py1);
+    ctx.moveTo(view.px0, toScreenY(i)); ctx.lineTo(view.px1, toScreenY(i));
+    ctx.stroke();
+  }
+  // 坐标轴箭头
+  ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(view.px0 + 4, toScreenY(0)); ctx.lineTo(view.px1 - 4, toScreenY(0));
+  ctx.moveTo(toScreenX(0), view.py1 - 4); ctx.lineTo(toScreenX(0), view.py0 + 4);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  arrowHead(view.px1 - 4, toScreenY(0), 0);
+  arrowHead(toScreenX(0), view.py0 + 4, -Math.PI / 2);
+  // 刻度数字（每 2 格标一个，0 单独标）
+  ctx.font = "12px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let i = -RANGE; i <= RANGE; i += 2) {
+    if (i === 0) continue;
+    ctx.fillText(i, toScreenX(i), toScreenY(0) + 6);
+  }
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let i = -RANGE; i <= RANGE; i += 2) {
+    if (i === 0) continue;
+    ctx.fillText(i, toScreenX(0) - 7, toScreenY(i));
+  }
+  ctx.fillText("O", toScreenX(0) - 7, toScreenY(0) + 10);
+  // 轴名
+  ctx.fillStyle = "rgba(255,255,255,0.8)";
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  ctx.fillText("x", view.px1 - 12, toScreenY(0) - 12);
+  ctx.textAlign = "left";
+  ctx.fillText("y", toScreenX(0) + 10, view.py0 + 12);
+  ctx.restore();
+  // 外框
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 2;
+  ctx.strokeRect(view.px0, view.py0, view.px1 - view.px0, view.py1 - view.py0);
+}
+function arrowHead(x, y, ang) {
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(ang);
+  ctx.beginPath();
+  ctx.moveTo(0, 0); ctx.lineTo(-10, -5); ctx.lineTo(-10, 5);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawRefLine(k, b) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(view.px0, view.py0, view.px1 - view.px0, view.py1 - view.py0);
+  ctx.clip();
+  ctx.setLineDash([10, 8]);
+  ctx.strokeStyle = "rgba(160,170,190,0.9)"; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(toScreenX(-RANGE - 1), toScreenY(k * (-RANGE - 1) + b));
+  ctx.lineTo(toScreenX(RANGE + 1), toScreenY(k * (RANGE + 1) + b));
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawTargetPoints(pts) {
+  const pulse = 1 + 0.12 * Math.sin(pulseT / 280);
+  for (const [px, py] of pts) {
+    const sx = toScreenX(px), sy = toScreenY(py);
+    const hit = Math.abs(K * px + B - py) < TOL;
+    // 外圈光环
+    ctx.beginPath(); ctx.arc(sx, sy, 14 * pulse, 0, 7);
+    ctx.strokeStyle = hit ? "rgba(91,224,122,0.95)" : "rgba(255,213,74,0.9)";
+    ctx.lineWidth = 3; ctx.stroke();
+    // 实心点
+    ctx.beginPath(); ctx.arc(sx, sy, 6, 0, 7);
+    ctx.fillStyle = hit ? "#5be07a" : "#ffd54a";
+    ctx.fill();
+    // 坐标标签
+    ctx.font = "bold 13px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.fillStyle = hit ? "#5be07a" : "#ffd54a";
+    ctx.fillText(`(${px}, ${py})`, sx, sy - 18);
+  }
+}
+
+function drawMainLine() {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(view.px0, view.py0, view.px1 - view.px0, view.py1 - view.py0);
+  ctx.clip();
+  const x1 = -RANGE - 1, x2 = RANGE + 1;
+  // 白色描底 + 蓝色主线
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(toScreenX(x1), toScreenY(K * x1 + B));
+  ctx.lineTo(toScreenX(x2), toScreenY(K * x2 + B));
+  ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 9; ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(toScreenX(x1), toScreenY(K * x1 + B));
+  ctx.lineTo(toScreenX(x2), toScreenY(K * x2 + B));
+  ctx.strokeStyle = "#2f9bff"; ctx.lineWidth = 5; ctx.stroke();
+  ctx.restore();
+}
+
+function drawDragPoints() {
+  // 斜率小三角（拖 k 点时直观感受"上升/前进"）
+  if (dragging === "k" && Math.abs(K) > 0.01) {
+    const x0 = 0, y0 = B, x1 = x0 + 2, y1 = K * x1 + B;
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 2;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(toScreenX(x0), toScreenY(y0));
+    ctx.lineTo(toScreenX(x1), toScreenY(y0));
+    ctx.lineTo(toScreenX(x1), toScreenY(y1));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+  // 绿色 k 点
+  const [kx2, ky2] = kPointMath();
+  const px = toScreenX(kx2), py = toScreenY(ky2);
+  ctx.beginPath(); ctx.arc(px, py, PT_R, 0, 7);
+  ctx.fillStyle = dragging === "k" ? "#7cf29a" : "#2fbf4a";
+  ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+  labelPoint(px, py - PT_R - 10, "k（斜率）", "#7cf29a");
+  // 橙色 b 点
+  const bx = toScreenX(0), by = toScreenY(B);
+  ctx.beginPath(); ctx.arc(bx, by, PT_R, 0, 7);
+  ctx.fillStyle = dragging === "b" ? "#ffc46b" : "#ff9a2a";
+  ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+  labelPoint(bx + 34, by + 4, "b（截距）", "#ffc46b");
+}
+function labelPoint(x, y, text, color) {
+  ctx.font = "bold 14px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const w = ctx.measureText(text).width + 14;
+  ctx.fillStyle = "rgba(10,16,30,0.8)";
+  roundRect(x - w / 2, y - 12, w, 24, 12, true);
+  ctx.fillStyle = color;
+  ctx.fillText(text, x, y + 1);
+}
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.rot);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.size / 2, -c.size / 4, c.size, c.size / 2);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#1c2436";
+  ctx.fillRect(0, 0, W, H);
+  drawGrid();
+  const t = TASKS[Math.min(levelIdx, TASKS.length - 1)];
+  if (t.line && winPanel.style.display !== "flex") drawRefLine(t.line.k, t.line.b);
+  drawMainLine();
+  if (winPanel.style.display !== "flex") {
+    drawTargetPoints(t.pts);
+    drawDragPoints();
+  }
+  drawConfetti();
+}
+
+/* ================= 主循环（彩带与目标点呼吸动画） ================= */
+function spawnConfetti() {
+  const colors = ["#ffd54a", "#5be07a", "#2f9bff", "#ff6b81", "#c58bff"];
+  for (let i = 0; i < 60; i++) {
+    confetti.push({
+      x: W / 2 + (Math.random() - 0.5) * W * 0.6,
+      y: -20 - Math.random() * 120,
+      vx: (Math.random() - 0.5) * 120,
+      vy: 120 + Math.random() * 180,
+      rot: Math.random() * 6.28,
+      vr: (Math.random() - 0.5) * 8,
+      size: 8 + Math.random() * 8,
+      color: colors[i % colors.length],
+    });
+  }
+}
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  pulseT = now;
+  for (const c of confetti) {
+    c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+  }
+  confetti = confetti.filter(c => c.y < H + 40);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 2200);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+// 测试钩子（供自动化验证使用）
+window.__lg = {
+  set: (k, b) => setKB(k, b),
+  state: () => ({ k: K, b: B, level: levelIdx, passed, eq: fmtEq(K, B) }),
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

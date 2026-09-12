@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>密度侦探 · 找出假金条</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#2e2118; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(30,20,10,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(30,20,10,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92%;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">第 1 / 3 轮 · 🕵️ 已破案：0</div>
+<div id="hint">把金属条拖到电子秤上称质量，再拖进量筒测体积，算出密度 ρ=m÷V，找出真金放进宝箱！</div>
+<div id="winPanel">
+  <div class="msg">🎉 三轮全部破案！<br>你是密度大侦探！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layoutScene();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 4 根外观完全一样的金属条：真金、铜、铁、镀金钨（体积都是 10 cm³）
+const BAR_VOL = 10;   // cm³
+const MATS = {
+  gold:   { name:"真金",   rho:19.3, streak:"#ffd24a", streakName:"金黄色", mag:false },
+  tung:   { name:"镀金钨", rho:19.3, streak:"#cfd4dc", streakName:"银白色", mag:false },
+  copper: { name:"铜",     rho:8.9,  streak:"#e07b4a", streakName:"红色",   mag:false },
+  iron:   { name:"铁",     rho:7.9,  streak:"#9aa0a8", streakName:"灰黑色", mag:true  },
+};
+const REF_TABLE = [["金",19.3],["钨",19.3],["铜",8.9],["铁",7.9]];
+
+let bars = [];        // {id, mat, x, y, rot, lock, drag, m, v, mag, streak}
+let roundIdx = 0, found = 0;
+const ROUNDS = 3;
+let celebrating = false;
+
+// 布局（每次 resize 重算）
+const L = {};
+function layoutScene() {
+  L.benchW = W * 0.64;
+  L.panel = { x: W * 0.66, y: 12, w: W * 0.33, h: H - 24 };
+  L.barW = Math.min(150, L.benchW * 0.19);
+  L.barH = 46;
+  L.slotY = H * 0.24;
+  L.slots = [0, 1, 2, 3].map(i => ({ x: L.benchW * (0.13 + i * 0.245), y: L.slotY }));
+  L.scale = { x: L.benchW * 0.16, y: H * 0.55, w: 220, h: 180 };
+  L.cyl = { cx: L.benchW * 0.52, top: H * 0.50, w: 96, h: Math.min(250, H * 0.34) };
+  L.magnet = { x: L.benchW * 0.74, y: H * 0.66, r: 34 };
+  L.stone = { x: L.benchW * 0.88, y: H * 0.66, r: 30 };
+  L.chest = { x: L.benchW * 0.76, y: H * 0.36, w: 170, h: 120 };
+  // 未拖动的条跟随新槽位
+  for (const b of bars) {
+    if (!b.drag && !b.lock) { b.x = L.slots[b.id - 1].x; b.y = L.slots[b.id - 1].y; }
+  }
+  if (magnetTool.home) { magnetTool.hx = L.magnet.x; magnetTool.hy = L.magnet.y; if (!magnetTool.drag) { magnetTool.x = L.magnet.x; magnetTool.y = L.magnet.y; } }
+  if (stoneTool.home) { stoneTool.hx = L.stone.x; stoneTool.hy = L.stone.y; if (!stoneTool.drag) { stoneTool.x = L.stone.x; stoneTool.y = L.stone.y; } }
+}
+
+const magnetTool = { home:true, x:0, y:0, hx:0, hy:0, drag:false };
+const stoneTool = { home:true, x:0, y:0, hx:0, hy:0, drag:false };
+const scaleDisplay = { active:false, val:0 };
+const cyl = { water: 50 };       // mL
+let bubbles = [];                // 量筒气泡
+let confetti = [];               // 庆祝彩纸
+let scratchFx = null;            // 刮痕动画 {bar, t}
+
+function barMass(b) { return MATS[b.mat].rho * BAR_VOL; }   // g
+
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function setupRound() {
+  const mats = shuffle(["gold", "tung", "copper", "iron"]);
+  bars = mats.map((m, i) => ({
+    id: i + 1, mat: m,
+    x: L.slots[i].x, y: L.slots[i].y, rot: 0,
+    lock: false, drag: false,
+    m: null, v: null, mag: null, streak: null
+  }));
+  cyl.water = 50;
+  bubbles = [];
+  scratchFx = null;
+  celebrating = false;
+  updateScore();
+}
+
+function updateScore() {
+  scorebar.textContent = `第 ${Math.min(roundIdx + 1, ROUNDS)} / ${ROUNDS} 轮 · 🕵️ 已破案：${found}`;
+}
+
+function resetGame() {
+  roundIdx = 0; found = 0;
+  confetti = [];
+  winPanel.style.display = "none";
+  setupRound();
+  showHint("4 根金属条外观一模一样，只有一根是真金！先测质量，再测体积。");
+}
+
+/* ================= 补间动画 ================= */
+const tweens = [];
+function addTween(dur, update, done) { tweens.push({ t:0, dur, update, done }); }
+function stepTweens(dt) {
+  for (let i = tweens.length - 1; i >= 0; i--) {
+    const tw = tweens[i];
+    tw.t += dt;
+    const k = Math.min(1, tw.t / tw.dur);
+    const e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;   // easeInOut
+    tw.update(e, k);
+    if (k >= 1) { tweens.splice(i, 1); if (tw.done) tw.done(); }
+  }
+}
+function animateBarTo(bar, x, y, dur, done, rot) {
+  const sx = bar.x, sy = bar.y, sr = bar.rot, tr = rot === undefined ? 0 : rot;
+  addTween(dur, e => {
+    bar.x = sx + (x - sx) * e;
+    bar.y = sy + (y - sy) * e;
+    bar.rot = sr + (tr - sr) * e;
+  }, done);
+}
+function animateHome(bar, done) {
+  animateBarTo(bar, L.slots[bar.id - 1].x, L.slots[bar.id - 1].y, 0.3, () => {
+    bar.lock = false;
+    if (done) done();
+  });
+}
+
+/* ================= 测量逻辑 ================= */
+// 1) 电子秤称质量
+function startWeigh(bar) {
+  bar.lock = true;
+  const panX = L.scale.x + L.scale.w / 2, panY = L.scale.y + 26;
+  animateBarTo(bar, panX, panY - L.barH / 2, 0.28, () => {
+    const target = barMass(bar);
+    scaleDisplay.active = true;
+    addTween(0.9, e => { scaleDisplay.val = target * e; }, () => {
+      scaleDisplay.val = target;
+      scaleDisplay.active = false;
+      bar.m = target;
+      ding();
+      showHint(`${bar.id} 号质量 m = ${bar.m} g`);
+      animateHome(bar);
+    });
+  });
+}
+
+// 2) 量筒排水测体积（水位 50 → 60 mL 动画）
+function startDunk(bar) {
+  bar.lock = true;
+  const cx = L.cyl.cx, mouthY = L.cyl.top + 8;
+  animateBarTo(bar, cx, mouthY - 10, 0.28, () => {
+    // 竖起来沉入水中
+    animateBarTo(bar, cx, mouthY + L.cyl.h * 0.55, 0.5, null, -Math.PI / 2);
+    addTween(1.0, e => {
+      cyl.water = 50 + BAR_VOL * e;
+      if (Math.random() < 0.4) bubbles.push({ x: cx + (Math.random() - 0.5) * 40, y: cylWaterY() + Math.random() * 20, r: 2 + Math.random() * 3, vy: -30 - Math.random() * 40 });
+    }, () => {
+      bar.v = BAR_VOL;
+      glug();
+      showHint(`${bar.id} 号排开的水 = 体积 V = ${bar.v} cm³`);
+      // 捞出来送回
+      animateBarTo(bar, cx, mouthY - 10, 0.35, () => {
+        animateHome(bar);
+      }, -Math.PI / 2);
+      setTimeout(() => { cyl.water = 50; }, 1200);
+    });
+  });
+}
+function cylWaterY() {
+  return L.cyl.top + L.cyl.h - (cyl.water / 100) * L.cyl.h;
+}
+
+// 3) 磁铁小测试（铁会被吸住）
+function applyMagnet(bar) {
+  if (bar.lock) return;
+  bar.mag = MATS[bar.mat].mag;
+  if (bar.mag) {
+    bar.lock = true;
+    cling();
+    showHint(`🧲 吸住了！${bar.id} 号是铁！`);
+    animateBarTo(bar, magnetTool.x, magnetTool.y + 44, 0.18, () => {
+      setTimeout(() => animateHome(bar), 450);
+    });
+  } else {
+    thud();
+    showHint(`${bar.id} 号吸不住 → 不是铁`);
+  }
+}
+
+// 4) 试金石刮一刮（镀金钨会露出银白色）
+function applyScratch(bar) {
+  if (bar.lock) return;
+  bar.streak = MATS[bar.mat].streak;
+  scratchFx = { bar, t: 0 };
+  scratchSound();
+  showHint(`${bar.id} 号刮痕是${MATS[bar.mat].streakName}（真金刮痕是金黄色）`);
+}
+
+// 5) 放进宝箱 = 认定是真金
+function tryChest(bar) {
+  if (celebrating) { animateHome(bar); return; }
+  if (bar.mat === "gold") {
+    found++;
+    celebrating = true;
+    updateScore();
+    fanfare();
+    spawnConfetti();
+    if (found >= ROUNDS) {
+      setTimeout(() => { winPanel.style.display = "flex"; fanfare(); }, 1200);
+    } else {
+      showHint(`🎉 它就是真金！密度 ${MATS.gold.rho} g/cm³，刮痕金黄、磁铁不吸！`);
+      setTimeout(() => { roundIdx++; setupRound(); showHint("新的一轮：假货换位置了，再来一次！"); }, 1800);
+    }
+  } else {
+    // 不扣分，只给线索
+    boing();
+    if (bar.m !== null && bar.v !== null && MATS[bar.mat].rho !== MATS.gold.rho) {
+      showHint(`${bar.id} 号密度是 ${MATS[bar.mat].rho} g/cm³，对不上金（19.3），是假货！`);
+    } else if (bar.m !== null && bar.v !== null) {
+      showHint(`${bar.id} 号密度和金一样是 19.3！还需第二条线索：刮一刮看里面！`);
+    } else {
+      showHint("还没测完数据哦，先称质量、测体积再下结论！");
+    }
+    animateHome(bar);
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawDesk() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#4a3524"); g.addColorStop(1, "#2e2118");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 桌面木纹
+  ctx.strokeStyle = "rgba(0,0,0,0.12)"; ctx.lineWidth = 2;
+  for (let y = 30; y < H; y += 46) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(L.benchW, y + 8); ctx.stroke();
+  }
+  // 台面（放金属条区域）
+  ctx.fillStyle = "rgba(255,220,150,0.08)";
+  roundRect(L.benchW * 0.04, H * 0.13, L.benchW * 0.92, H * 0.22, 18, true);
+  ctx.fillStyle = "rgba(255,213,74,0.75)";
+  ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("证物台：4 根外观一样的“金条”", L.benchW * 0.5, H * 0.13 + 26);
+}
+
+function drawBar(b) {
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.rotate(b.rot);
+  const w = L.barW, h = L.barH;
+  // 所有条外观一样：金色
+  const g = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+  g.addColorStop(0, "#ffe08a"); g.addColorStop(0.5, "#e8b23a"); g.addColorStop(1, "#b9871f");
+  ctx.fillStyle = g;
+  roundRect(-w / 2, -h / 2, w, h, 8, true);
+  ctx.strokeStyle = "rgba(90,60,10,0.6)"; ctx.lineWidth = 2;
+  roundRect(-w / 2, -h / 2, w, h, 8, false); ctx.stroke();
+  // 高光
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  roundRect(-w / 2 + 6, -h / 2 + 5, w - 12, 8, 4, true);
+  // 刮痕（做过刮擦测试后显示里面颜色）
+  if (b.streak) {
+    ctx.fillStyle = b.streak;
+    ctx.fillRect(w * 0.18, -3, w * 0.22, 6);
+    ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 1;
+    ctx.strokeRect(w * 0.18, -3, w * 0.22, 6);
+  }
+  ctx.restore();
+  // 编号牌
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center";
+  const labelY = b.y - L.barH / 2 - 8;
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
+  ctx.beginPath(); ctx.arc(b.x, labelY - 5, 11, 0, 7); ctx.fill();
+  ctx.fillStyle = "#ffd54a";
+  ctx.fillText(b.id + "号", b.x, labelY);
+}
+
+function drawScale() {
+  const s = L.scale;
+  // 机身
+  ctx.fillStyle = "#3c4654";
+  roundRect(s.x, s.y + 30, s.w, s.h - 30, 16, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.2)"; ctx.lineWidth = 2;
+  roundRect(s.x, s.y + 30, s.w, s.h - 30, 16, false); ctx.stroke();
+  // 托盘
+  ctx.fillStyle = "#aeb8c4";
+  ctx.beginPath(); ctx.ellipse(s.x + s.w / 2, s.y + 26, s.w * 0.42, 14, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = "#8a95a2";
+  ctx.fillRect(s.x + s.w / 2 - 8, s.y + 26, 16, 14);
+  // 显示屏
+  ctx.fillStyle = "#0c2b16";
+  roundRect(s.x + 20, s.y + 62, s.w - 40, 52, 8, true);
+  ctx.fillStyle = "#4dff88";
+  ctx.font = "bold 30px monospace";
+  ctx.textAlign = "center";
+  const txt = scaleDisplay.active || scaleDisplay.val > 0 ? scaleDisplay.val.toFixed(1) + " g" : "0.0 g";
+  ctx.fillText(txt, s.x + s.w / 2, s.y + 99);
+  // 标签
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 17px sans-serif";
+  ctx.fillText("⚖️ 电子秤（拖到托盘上）", s.x + s.w / 2, s.y + s.h - 18);
+}
+
+// 量筒分两层：背玻璃先画（条可以"进入"），水/刻度/前玻璃后画（盖住沉入的条）
+function drawCylinderBack() {
+  const c = L.cyl;
+  const x0 = c.cx - c.w / 2, y0 = c.top;
+  ctx.fillStyle = "rgba(200,225,255,0.14)";
+  roundRect(x0, y0, c.w, c.h, 10, true);
+  // 标签
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("🧪 量筒（拖入测体积）", c.cx, y0 + c.h + 26);
+}
+
+function drawCylinderFront() {
+  const c = L.cyl;
+  const x0 = c.cx - c.w / 2, y0 = c.top;
+  // 水
+  const wy = cylWaterY();
+  const wg = ctx.createLinearGradient(0, wy, 0, y0 + c.h);
+  wg.addColorStop(0, "rgba(80,160,255,0.55)"); wg.addColorStop(1, "rgba(40,110,220,0.7)");
+  ctx.fillStyle = wg;
+  ctx.fillRect(x0 + 3, wy, c.w - 6, y0 + c.h - wy - 4);
+  // 水面
+  ctx.fillStyle = "rgba(150,200,255,0.85)";
+  ctx.beginPath(); ctx.ellipse(c.cx, wy, (c.w - 6) / 2, 5, 0, 0, 7); ctx.fill();
+  // 气泡
+  ctx.fillStyle = "rgba(220,240,255,0.8)";
+  for (const b of bubbles) { ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill(); }
+  // 刻度
+  ctx.strokeStyle = "rgba(255,255,255,0.75)"; ctx.lineWidth = 1.5;
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.font = "12px sans-serif"; ctx.textAlign = "left";
+  for (let ml = 10; ml <= 90; ml += 10) {
+    const yy = y0 + c.h - (ml / 100) * c.h;
+    ctx.beginPath(); ctx.moveTo(x0 + c.w - (ml % 50 === 0 ? 22 : 12), yy); ctx.lineTo(x0 + c.w - 3, yy); ctx.stroke();
+    if (ml % 20 === 0) ctx.fillText(ml + "", x0 + 5, yy + 4);
+  }
+  // 当前水位读数
+  ctx.fillStyle = "#7fd0ff";
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(cyl.water.toFixed(0) + " mL", c.cx, y0 - 10);
+  // 前玻璃边框
+  ctx.strokeStyle = "rgba(220,235,255,0.6)"; ctx.lineWidth = 3;
+  roundRect(x0, y0, c.w, c.h, 10, false); ctx.stroke();
+}
+
+function drawMagnetTool() {
+  const t = magnetTool;
+  ctx.save();
+  ctx.translate(t.x, t.y);
+  // U 形磁铁
+  ctx.lineWidth = 16;
+  ctx.strokeStyle = "#d23b3b";
+  ctx.beginPath(); ctx.arc(0, -4, 22, Math.PI, 0, false); ctx.stroke();
+  ctx.strokeStyle = "#d23b3b";
+  ctx.beginPath(); ctx.moveTo(-22, -4); ctx.lineTo(-22, 16); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(22, -4); ctx.lineTo(22, 16); ctx.stroke();
+  ctx.strokeStyle = "#c8ccd4";
+  ctx.beginPath(); ctx.moveTo(-22, 10); ctx.lineTo(-22, 20); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(22, 10); ctx.lineTo(22, 20); ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("🧲 磁铁", t.hx, t.hy + 52);
+}
+
+function drawStoneTool() {
+  const t = stoneTool;
+  ctx.save();
+  ctx.translate(t.x, t.y);
+  ctx.fillStyle = "#5a4632";
+  ctx.beginPath(); ctx.ellipse(0, 0, 30, 20, -0.3, 0, 7); ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.ellipse(0, 0, 30, 20, -0.3, 0, 7); ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.3)";
+  ctx.beginPath(); ctx.ellipse(-8, -6, 10, 5, -0.3, 0, 7); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("🪨 试金石", t.hx, t.hy + 52);
+}
+
+function drawChest() {
+  const c = L.chest;
+  // 箱体
+  ctx.fillStyle = "#7a4a20";
+  roundRect(c.x - c.w / 2, c.y - c.h / 2 + 22, c.w, c.h - 22, 10, true);
+  // 盖子
+  ctx.fillStyle = "#96602c";
+  roundRect(c.x - c.w / 2 - 6, c.y - c.h / 2 - 6, c.w + 12, 40, 12, true);
+  // 金锁
+  ctx.fillStyle = "#ffd54a";
+  roundRect(c.x - 13, c.y - c.h / 2 + 22, 26, 26, 6, true);
+  ctx.fillStyle = "#7a4a20";
+  ctx.beginPath(); ctx.arc(c.x, c.y - c.h / 2 + 34, 4, 0, 7); ctx.fill();
+  ctx.fillRect(c.x - 2, c.y - c.h / 2 + 34, 4, 8);
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2;
+  roundRect(c.x - c.w / 2 - 6, c.y - c.h / 2 - 6, c.w + 12, c.h + 28, 12, false); ctx.stroke();
+  ctx.fillStyle = "#ffd54a"; ctx.font = "bold 17px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("🔒 宝箱：放入真金！", c.x, c.y + c.h / 2 + 26);
+}
+
+function drawPanel() {
+  const p = L.panel;
+  // 羊皮纸
+  ctx.fillStyle = "#f3e5c0";
+  roundRect(p.x, p.y, p.w, p.h, 16, true);
+  ctx.strokeStyle = "#b89a5e"; ctx.lineWidth = 3;
+  roundRect(p.x, p.y, p.w, p.h, 16, false); ctx.stroke();
+
+  const cx = p.x + p.w / 2;
+  let y = p.y + 34;
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#5a3d00";
+  ctx.font = "bold 22px sans-serif";
+  ctx.fillText("🕵️ 侦探笔记", cx, y);
+  y += 26;
+  ctx.font = "15px sans-serif";
+  ctx.fillText("密度公式：ρ = m ÷ V", cx, y);
+  y += 18;
+
+  // 每根条一行数据
+  const rowH = Math.min(64, (p.h * 0.42) / 4);
+  ctx.textAlign = "left";
+  bars.forEach(b => {
+    const ry = y + b.id * 0 + (b.id - 1) * rowH + 8;
+    ctx.fillStyle = "rgba(120,90,30,0.14)";
+    roundRect(p.x + 10, ry - 4, p.w - 20, rowH - 6, 8, true);
+    ctx.fillStyle = "#4a3200";
+    ctx.font = "bold 16px sans-serif";
+    ctx.fillText(`${b.id} 号`, p.x + 20, ry + 18);
+    ctx.font = "14px monospace";
+    const mTxt = b.m === null ? " m = --- g" : ` m = ${b.m} g`;
+    const vTxt = b.v === null ? " V = -- cm³" : ` V = ${b.v} cm³`;
+    ctx.fillText(mTxt, p.x + 20, ry + 38);
+    ctx.fillText(vTxt, p.x + 20, ry + 56);
+    // ρ 与迷你密度条
+    if (b.m !== null && b.v !== null) {
+      const rho = b.m / b.v;
+      ctx.font = "bold 15px sans-serif";
+      ctx.fillStyle = "#8a5a00";
+      ctx.fillText(`ρ = ${rho.toFixed(1)}`, p.x + p.w * 0.52, ry + 18);
+      // 密度条（0–20 刻度，金线 19.3）
+      const bx = p.x + p.w * 0.52, bw = p.w * 0.40;
+      ctx.fillStyle = "rgba(0,0,0,0.15)";
+      roundRect(bx, ry + 26, bw, 10, 5, true);
+      ctx.fillStyle = "#3a86d8";
+      roundRect(bx, ry + 26, bw * Math.min(1, rho / 20), 10, 5, true);
+      const gx = bx + bw * (19.3 / 20);
+      ctx.strokeStyle = "#c8102e"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(gx, ry + 22); ctx.lineTo(gx, ry + 40); ctx.stroke();
+      ctx.fillStyle = "#c8102e"; ctx.font = "10px sans-serif";
+      ctx.fillText("金", gx - 6, ry + 50);
+    }
+    // 小测试结果
+    ctx.font = "13px sans-serif";
+    let tx = p.x + p.w * 0.52;
+    const ty = ry + rowH - 12;
+    if (b.mag !== null) {
+      ctx.fillStyle = b.mag ? "#c8102e" : "#2f7a3a";
+      ctx.fillText(b.mag ? "🧲吸住!" : "🧲不吸", tx, ty);
+      tx += 66;
+    }
+    if (b.streak) {
+      ctx.fillStyle = b.streak;
+      ctx.fillRect(tx + 2, ty - 11, 26, 10);
+      ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 1;
+      ctx.strokeRect(tx + 2, ty - 11, 26, 10);
+      ctx.fillStyle = "#4a3200";
+      ctx.fillText("刮痕", tx + 32, ty);
+    }
+  });
+  y += 4 * rowH + 20;
+
+  // 密度对照表
+  ctx.fillStyle = "#5a3d00";
+  ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("📖 密度表（g/cm³）", cx, y);
+  y += 8;
+  ctx.font = "15px sans-serif";
+  REF_TABLE.forEach(([name, rho]) => {
+    y += 22;
+    ctx.fillStyle = name === "金" ? "#a06a00" : "#4a3200";
+    ctx.fillText(`${name}　${rho}`, cx, y);
+  });
+  y += 26;
+  ctx.fillStyle = "#c8102e";
+  ctx.font = "bold 14px sans-serif";
+  ctx.fillText("★ 注意：钨和金密度相同！", cx, y);
+  y += 22;
+  ctx.fillStyle = "#5a3d00";
+  ctx.font = "14px sans-serif";
+  ctx.fillText("密度相同时，用磁铁 / 刮痕找第二条线索", cx, y);
+  y += 24;
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillText("把认定的真金拖进宝箱 🔒", cx, y);
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.rot);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-4, -2, 8, 5);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawDesk();
+  drawCylinderBack();      // 背玻璃：条可以"进入"量筒
+  drawScale();
+  drawChest();
+  drawMagnetTool();
+  drawStoneTool();
+  for (const b of bars) if (!b.drag) drawBar(b);
+  for (const b of bars) if (b.drag) drawBar(b);
+  drawCylinderFront();     // 水/刻度/前玻璃：盖住沉入水中的条
+  // 刮痕动画：白条扫过
+  if (scratchFx) {
+    const b = scratchFx.bar;
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,255,255,0.9)";
+    ctx.lineWidth = 4;
+    const k = scratchFx.t;
+    ctx.beginPath();
+    ctx.moveTo(b.x - L.barW * 0.2 + L.barW * 0.4 * k, b.y - 14);
+    ctx.lineTo(b.x - L.barW * 0.2 + L.barW * 0.4 * k, b.y + 14);
+    ctx.stroke();
+    ctx.restore();
+  }
+  drawConfetti();
+  drawPanel();
+}
+
+/* ================= 交互 ================= */
+let drag = null;   // {type:'bar'|'tool', ref, dx, dy}
+
+function hitBar(x, y) {
+  for (let i = bars.length - 1; i >= 0; i--) {
+    const b = bars[i];
+    if (b.lock || celebrating) continue;
+    if (Math.abs(x - b.x) < L.barW / 2 + 8 && Math.abs(y - b.y) < L.barH / 2 + 8) return b;
+  }
+  return null;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const x = e.clientX, y = e.clientY;
+  hintEl.style.opacity = "0";
+  const b = hitBar(x, y);
+  if (b) {
+    b.drag = true;
+    drag = { type: "bar", ref: b, dx: b.x - x, dy: b.y - y };
+    pop(660);
+  } else if (Math.hypot(x - magnetTool.x, y - magnetTool.y) < 46) {
+    magnetTool.drag = true;
+    drag = { type: "tool", ref: magnetTool, dx: magnetTool.x - x, dy: magnetTool.y - y };
+    pop(520);
+  } else if (Math.hypot(x - stoneTool.x, y - stoneTool.y) < 42) {
+    stoneTool.drag = true;
+    drag = { type: "tool", ref: stoneTool, dx: stoneTool.x - x, dy: stoneTool.y - y };
+    pop(520);
+  }
+  if (drag) canvas.setPointerCapture(e.pointerId);
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  drag.ref.x = e.clientX + drag.dx;
+  drag.ref.y = e.clientY + drag.dy;
+});
+
+canvas.addEventListener("pointerup", e => {
+  if (!drag) return;
+  const x = e.clientX, y = e.clientY;
+  const ref = drag.ref;
+  if (drag.type === "bar") {
+    ref.drag = false;
+    ref.lock = true;
+    // 宝箱？
+    const c = L.chest;
+    if (Math.abs(x - c.x) < c.w / 2 + 20 && Math.abs(y - c.y) < c.h / 2 + 20) {
+      ref.lock = false;
+      tryChest(ref);
+    }
+    // 电子秤托盘？
+    else if (Math.abs(x - (L.scale.x + L.scale.w / 2)) < L.scale.w * 0.5 && Math.abs(y - (L.scale.y + 26)) < 60) {
+      startWeigh(ref);
+    }
+    // 量筒口？
+    else if (Math.abs(x - L.cyl.cx) < L.cyl.w && y > L.cyl.top - 60 && y < L.cyl.top + L.cyl.h * 0.6) {
+      startDunk(ref);
+    }
+    else {
+      animateHome(ref);
+    }
+  } else {
+    ref.drag = false;
+    // 工具落到金属条上？
+    const b = hitBar(x, y) || nearestBar(x, y);
+    if (ref === magnetTool) {
+      if (b) applyMagnet(b);
+      else showHint("把磁铁拖到某根金属条上试试");
+    } else {
+      if (b) applyScratch(b);
+      else showHint("把试金石拖到某根金属条上刮一刮");
+    }
+    // 工具回家
+    addTween(0.25, k => {
+      ref.x = ref.x + (ref.hx - ref.x) * 0.3;
+      ref.y = ref.y + (ref.hy - ref.y) * 0.3;
+    }, () => { ref.x = ref.hx; ref.y = ref.hy; });
+  }
+  drag = null;
+});
+
+function nearestBar(x, y) {
+  let best = null, bd = 70;
+  for (const b of bars) {
+    if (b.lock || celebrating) continue;
+    const d = Math.hypot(x - b.x, y - b.y);
+    if (d < bd) { bd = d; best = b; }
+  }
+  return best;
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function update(dt) {
+  stepTweens(dt);
+  // 气泡
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.y += b.vy * dt;
+    if (b.y < cylWaterY() + 4) bubbles.splice(i, 1);
+  }
+  // 彩纸
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.vy += 500 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+    if (c.y > H + 20) confetti.splice(i, 1);
+  }
+  // 刮痕动画
+  if (scratchFx) {
+    scratchFx.t += dt * 2.5;
+    if (scratchFx.t >= 1) scratchFx = null;
+  }
+}
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function spawnConfetti() {
+  const colors = ["#ffd54a", "#ff5252", "#2fbf4a", "#3a86d8", "#ff7a1a", "#e93bb0"];
+  for (let i = 0; i < 90; i++) {
+    confetti.push({
+      x: W / 2 + (Math.random() - 0.5) * 300,
+      y: H * 0.25 + (Math.random() - 0.5) * 60,
+      vx: (Math.random() - 0.5) * 320,
+      vy: -150 - Math.random() * 300,
+      rot: Math.random() * 7,
+      vr: (Math.random() - 0.5) * 10,
+      color: colors[i % colors.length]
+    });
+  }
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+const ding = () => { tone(880, 0.25, 0.12); setTimeout(() => tone(1320, 0.3, 0.1), 120); };
+const glug = () => { tone(300, 0.12, 0.1, "triangle"); setTimeout(() => tone(220, 0.14, 0.1, "triangle"), 110); setTimeout(() => tone(320, 0.12, 0.08, "triangle"), 230); };
+const cling = () => tone(500, 0.3, 0.12, "square");
+const thud = () => tone(140, 0.12, 0.1, "triangle");
+const boing = () => { tone(300, 0.15, 0.1, "square"); setTimeout(() => tone(200, 0.2, 0.08, "square"), 120); };
+const scratchSound = () => { tone(1800, 0.08, 0.05, "sawtooth"); setTimeout(() => tone(1400, 0.08, 0.05, "sawtooth"), 90); };
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2400);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+// 启动
+resize();
+resetGame();
+requestAnimationFrame(loop);
+
+// 测试钩子（不影响游戏）
+window.__lab = { bars: () => bars, MATS, update, draw, startWeigh, startDunk, applyMagnet, applyScratch, tryChest, setupRound, state: () => ({ roundIdx, found, water: cyl.water }) };
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

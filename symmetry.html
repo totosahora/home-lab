@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>对称小画家</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#fdf3e3; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #toolbar {
+    position:absolute; top:10px; left:50%; transform:translateX(-50%);
+    display:flex; gap:10px; z-index:10; white-space:nowrap;
+  }
+  #toolbar button {
+    font-size:18px; font-weight:bold; padding:10px 18px;
+    border-radius:24px; border:3px solid #e8c98f; background:#fffdf6; color:#7a5a20;
+    cursor:pointer; box-shadow:0 3px 8px rgba(120,80,20,0.18);
+    font-family:inherit;
+  }
+  #toolbar button:active { transform:scale(1.06); }
+  #toolbar button.on { background:#ffd54a; border-color:#e0a800; color:#5a3d00; }
+  #toolbar button.go { background:#2fbf4a; border-color:#1e8a36; color:#fff; font-size:20px; padding:10px 26px; }
+  #palette {
+    position:absolute; bottom:56px; left:50%; transform:translateX(-50%);
+    display:flex; gap:12px; z-index:10;
+  }
+  #palette .sw {
+    width:56px; height:56px; border-radius:50%; border:4px solid rgba(0,0,0,0.12);
+    cursor:pointer; box-shadow:0 3px 6px rgba(0,0,0,0.2);
+    display:flex; align-items:center; justify-content:center; font-size:26px;
+    transition:transform 0.12s;
+  }
+  #palette .sw.sel { border-color:#333; transform:scale(1.18); }
+  #hint {
+    position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+    background:rgba(60,40,10,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="toolbar">
+  <button id="modeMirror" class="on">✨ 魔法镜子</button>
+  <button id="modeComplete">🦋 补全另一半</button>
+  <button id="axisBtn">🔃 换成横镜</button>
+  <button id="clearBtn">🧽 清空</button>
+  <button id="checkBtn" class="go" style="display:none">✔ 检查</button>
+  <button id="nextBtn" style="display:none">🔄 换一个</button>
+</div>
+<div id="palette"></div>
+<div id="hint">选个颜色，在左边的格子上涂色，镜子里会出现一模一样的图案！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 网格与视图 ================= */
+const COLS = 12, ROWS = 8;          // 12x8 大格子
+const lay = { cell:40, ox:0, oy:0 }; // 格子像素大小与左上角
+function fitView() {
+  const availW = W - 48, availH = H - 84 - 150;   // 顶部工具条 + 底部色板/提示
+  lay.cell = Math.max(24, Math.min(availW / COLS, availH / ROWS));
+  lay.ox = (W - lay.cell * COLS) / 2;
+  lay.oy = 84 + (availH - lay.cell * ROWS) / 2;
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 颜色与图形数据 ================= */
+const COLORS = ["#e93b3b", "#ff7a1a", "#ffd54a", "#2fbf4a", "#2f7fe9", "#9b3de0"];
+const RED = 0, ORANGE = 1, YELLOW = 2, GREEN = 3, BLUE = 4, PURPLE = 5;
+// 补全模式的左半图形（竖直镜轴，列 0-5）
+const SHAPES = [
+  { name:"蝴蝶", emoji:"🦋", cells:[
+    [5,1,PURPLE],[5,2,PURPLE],[5,3,PURPLE],[5,4,PURPLE],[5,5,PURPLE],[4,0,PURPLE],
+    [2,1,RED],[3,1,RED],[4,1,RED],
+    [1,2,RED],[2,2,YELLOW],[3,2,RED],[4,2,RED],
+    [1,3,RED],[2,3,RED],[3,3,YELLOW],[4,3,RED],
+    [2,4,RED],[3,4,RED],[4,4,RED],
+    [2,5,ORANGE],[3,5,ORANGE],[4,5,ORANGE],[3,6,ORANGE],[4,6,ORANGE]
+  ]},
+  { name:"爱心", emoji:"❤️", cells:[
+    [2,1,RED],[3,1,RED],
+    [1,2,RED],[2,2,YELLOW],[3,2,RED],[4,2,RED],[5,2,RED],
+    [1,3,RED],[2,3,YELLOW],[3,3,RED],[4,3,RED],[5,3,RED],
+    [2,4,RED],[3,4,RED],[4,4,RED],[5,4,RED],
+    [3,5,RED],[4,5,RED],[5,5,RED],
+    [4,6,RED],[5,6,RED],
+    [5,7,RED]
+  ]},
+  { name:"小树", emoji:"🌳", cells:[
+    [4,1,GREEN],[5,1,GREEN],
+    [3,2,GREEN],[4,2,GREEN],[5,2,GREEN],
+    [2,3,GREEN],[3,3,GREEN],[4,3,RED],[5,3,GREEN],
+    [1,4,GREEN],[2,4,GREEN],[3,4,GREEN],[4,4,GREEN],[5,4,GREEN],
+    [2,5,GREEN],[3,5,RED],[4,5,GREEN],[5,5,GREEN],
+    [4,6,ORANGE],[5,6,ORANGE],
+    [4,7,ORANGE],[5,7,ORANGE]
+  ]}
+];
+
+/* ================= 游戏状态 ================= */
+let mode = "mirror";        // mirror 魔法镜子 | complete 补全另一半
+let axis = "v";             // v 竖直镜轴 | h 水平镜轴（仅魔法镜子模式）
+let grid = [];              // grid[r][c] = 颜色下标 | null
+let selColor = 0;           // -1 = 橡皮
+let shapeIdx = 0;
+let painting = false;
+let shakeUntil = 0;         // 晃动提示截止时间
+let mismatches = [];        // 检查失败的格子 [c, r]
+let mismatchUntil = 0;
+let celebrateT = 0;         // >0 表示庆祝动画开始时刻
+let confetti = [];
+
+function emptyGrid() {
+  grid = [];
+  for (let r = 0; r < ROWS; r++) grid.push(new Array(COLS).fill(null));
+}
+function mirrorCell(c, r) {
+  return axis === "v" ? [COLS - 1 - c, r] : [c, ROWS - 1 - r];
+}
+function isSourceSide(c, r) {
+  return axis === "v" ? c < COLS / 2 : r < ROWS / 2;
+}
+function loadShape(i) {
+  shapeIdx = i % SHAPES.length;
+  emptyGrid();
+  for (const [c, r, col] of SHAPES[shapeIdx].cells) grid[r][c] = col;
+  mismatches = []; celebrateT = 0;
+}
+function setMode(m) {
+  mode = m;
+  document.getElementById("modeMirror").classList.toggle("on", m === "mirror");
+  document.getElementById("modeComplete").classList.toggle("on", m === "complete");
+  document.getElementById("axisBtn").style.display = m === "mirror" ? "" : "none";
+  document.getElementById("clearBtn").style.display = m === "mirror" ? "" : "none";
+  document.getElementById("checkBtn").style.display = m === "complete" ? "" : "none";
+  document.getElementById("nextBtn").style.display = m === "complete" ? "" : "none";
+  if (m === "mirror") {
+    emptyGrid();
+    showHint("选个颜色，在左边的格子上涂色，镜子里会出现一模一样的图案！");
+  } else {
+    axis = "v";
+    loadShape(shapeIdx);
+    showHint(`左边是半个${SHAPES[shapeIdx].name}，在右边画出对称的另一半，再点"检查"！`);
+  }
+}
+emptyGrid();
+
+/* ================= 涂色交互 ================= */
+function cellAt(sx, sy) {
+  const c = Math.floor((sx - lay.ox) / lay.cell);
+  const r = Math.floor((sy - lay.oy) / lay.cell);
+  if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return null;
+  return [c, r];
+}
+// 在格子 (c,r) 涂当前颜色（含模式规则），返回是否真正涂了
+function paintCell(c, r) {
+  if (celebrateT > 0) return false;
+  const val = selColor < 0 ? null : selColor;
+  if (mode === "mirror") {
+    if (!isSourceSide(c, r)) { showHint("那边是镜子里的图案哦，在这一边画吧！"); return false; }
+    grid[r][c] = val;
+    const [mc, mr] = mirrorCell(c, r);
+    grid[mr][mc] = val;
+  } else {
+    if (c < COLS / 2) { showHint("左边已经画好啦，在右边补全另一半吧！"); return false; }
+    grid[r][c] = val;
+  }
+  pop(500 + Math.random() * 300);
+  return true;
+}
+canvas.addEventListener("pointerdown", e => {
+  const p = cellAt(e.clientX, e.clientY);
+  hintEl.style.opacity = "0";
+  if (!p) return;
+  painting = true;
+  canvas.setPointerCapture(e.pointerId);
+  paintCell(p[0], p[1]);
+});
+canvas.addEventListener("pointermove", e => {
+  if (!painting) return;
+  const p = cellAt(e.clientX, e.clientY);
+  if (p) paintCell(p[0], p[1]);
+});
+window.addEventListener("pointerup", () => { painting = false; });
+
+/* ================= 检查对称 ================= */
+function checkSymmetry() {
+  mismatches = [];
+  for (let r = 0; r < ROWS; r++)
+    for (let c = 0; c < COLS / 2; c++) {
+      if (grid[r][c] !== grid[r][COLS - 1 - c]) mismatches.push([COLS - 1 - c, r]);
+    }
+  if (mismatches.length === 0) {
+    celebrateT = performance.now();
+    fanfare();
+    spawnConfetti();
+    showHint(`🎉 完全对称！${SHAPES[shapeIdx].name}飞走啦，太棒了！`);
+  } else {
+    shakeUntil = performance.now() + 650;
+    mismatchUntil = performance.now() + 2400;
+    tone(180, 0.25, 0.12, "triangle");
+    showHint("还差一点点，看看闪红框的格子哪里不一样？");
+  }
+}
+
+/* ================= 色板与按钮 ================= */
+const paletteEl = document.getElementById("palette");
+function buildPalette() {
+  paletteEl.innerHTML = "";
+  COLORS.forEach((col, i) => {
+    const d = document.createElement("div");
+    d.className = "sw" + (selColor === i ? " sel" : "");
+    d.style.background = col;
+    d.addEventListener("pointerdown", e => { e.stopPropagation(); selColor = i; buildPalette(); pop(700); });
+    paletteEl.appendChild(d);
+  });
+  const er = document.createElement("div");
+  er.className = "sw" + (selColor === -1 ? " sel" : "");
+  er.style.background = "#fff";
+  er.textContent = "🧽";
+  er.addEventListener("pointerdown", e => { e.stopPropagation(); selColor = -1; buildPalette(); pop(400); });
+  paletteEl.appendChild(er);
+}
+buildPalette();
+
+document.getElementById("modeMirror").addEventListener("click", () => { setMode("mirror"); pop(880); });
+document.getElementById("modeComplete").addEventListener("click", () => { setMode("complete"); pop(880); });
+document.getElementById("axisBtn").addEventListener("click", function() {
+  axis = axis === "v" ? "h" : "v";
+  this.textContent = axis === "v" ? "🔃 换成横镜" : "🔃 换成竖镜";
+  emptyGrid();
+  showHint(axis === "v" ? "现在是竖直镜子，在左边画吧！" : "现在是水平镜子，在上边画吧！");
+  pop(660);
+});
+document.getElementById("clearBtn").addEventListener("click", () => { emptyGrid(); showHint("擦干净啦，重新画吧！"); pop(400); });
+document.getElementById("checkBtn").addEventListener("click", checkSymmetry);
+document.getElementById("nextBtn").addEventListener("click", () => { loadShape(shapeIdx + 1); showHint(`来补全${SHAPES[shapeIdx].name}的另一半吧！`); pop(660); });
+
+/* ================= 动画 ================= */
+function spawnConfetti() {
+  confetti = [];
+  for (let i = 0; i < 50; i++)
+    confetti.push({
+      x: W / 2 + (Math.random() - 0.5) * 300,
+      y: lay.oy + 40,
+      vx: (Math.random() - 0.5) * 360,
+      vy: -120 - Math.random() * 260,
+      rot: Math.random() * 7,
+      col: COLORS[i % COLORS.length]
+    });
+}
+
+/* ================= 绘制 ================= */
+function draw(now) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#fdf3e3";
+  ctx.fillRect(0, 0, W, H);
+
+  // 晃动提示
+  let sx = 0;
+  if (now < shakeUntil) {
+    const t = (shakeUntil - now) / 650;
+    sx = Math.sin(now / 28) * 10 * t;
+  }
+  ctx.save();
+  ctx.translate(sx, 0);
+
+  const cell = lay.cell;
+  // 棋盘底色：镜像侧稍暗，提示"这边不用画"
+  for (let r = 0; r < ROWS; r++)
+    for (let c = 0; c < COLS; c++) {
+      const x = lay.ox + c * cell, y = lay.oy + r * cell;
+      const src = mode === "complete" ? c < COLS / 2 : isSourceSide(c, r);
+      ctx.fillStyle = src ? "#ffffff" : "#f3ece0";
+      ctx.fillRect(x, y, cell, cell);
+    }
+
+  // 涂色格（庆祝时整幅图形摇摆飞走）
+  let fly = 0, wig = 0, alpha = 1;
+  if (celebrateT > 0) {
+    const t = (now - celebrateT) / 1000;
+    fly = -t * t * 320;
+    wig = Math.sin(t * 7) * 12 * Math.min(1, t);
+    if (t > 1.1) alpha = Math.max(0, 1 - (t - 1.1) / 0.9);
+  }
+  ctx.save();
+  if (celebrateT > 0) { ctx.translate(wig, fly); ctx.globalAlpha = alpha; }
+  for (let r = 0; r < ROWS; r++)
+    for (let c = 0; c < COLS; c++) {
+      const v = grid[r][c];
+      if (v === null) continue;
+      const x = lay.ox + c * cell, y = lay.oy + r * cell;
+      ctx.fillStyle = COLORS[v];
+      roundRect(x + 2, y + 2, cell - 4, cell - 4, cell * 0.18, true);
+      // 高光
+      ctx.fillStyle = "rgba(255,255,255,0.25)";
+      roundRect(x + 4, y + 4, cell - 8, cell * 0.3, cell * 0.14, true);
+    }
+  ctx.restore();
+
+  // 网格线
+  ctx.strokeStyle = "rgba(150,110,60,0.35)";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let c = 0; c <= COLS; c++) { ctx.moveTo(lay.ox + c * cell, lay.oy); ctx.lineTo(lay.ox + c * cell, lay.oy + ROWS * cell); }
+  for (let r = 0; r <= ROWS; r++) { ctx.moveTo(lay.ox, lay.oy + r * cell); ctx.lineTo(lay.ox + COLS * cell, lay.oy + r * cell); }
+  ctx.stroke();
+
+  // 镜轴（虚线）
+  ctx.save();
+  ctx.setLineDash([12, 10]);
+  ctx.strokeStyle = "#9b3de0";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  if (axis === "v") {
+    const mx = lay.ox + COLS / 2 * cell;
+    ctx.moveTo(mx, lay.oy - 12); ctx.lineTo(mx, lay.oy + ROWS * cell + 12);
+  } else {
+    const my = lay.oy + ROWS / 2 * cell;
+    ctx.moveTo(lay.ox - 12, my); ctx.lineTo(lay.ox + COLS * cell + 12, my);
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.font = "26px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  if (axis === "v") ctx.fillText("✨", lay.ox + COLS / 2 * cell, lay.oy - 26);
+  else ctx.fillText("✨", lay.ox - 26, lay.oy + ROWS / 2 * cell);
+  ctx.restore();
+
+  // 检查失败：红框 pulse 标出不一样的格子
+  if (now < mismatchUntil && celebrateT === 0) {
+    const a = 0.45 + 0.4 * Math.sin(now / 110);
+    ctx.strokeStyle = `rgba(233,59,59,${a})`;
+    ctx.lineWidth = 4;
+    for (const [c, r] of mismatches)
+      roundRect(lay.ox + c * cell + 3, lay.oy + r * cell + 3, cell - 6, cell - 6, cell * 0.18, false, true);
+  }
+  ctx.restore();
+
+  // 五彩纸屑
+  for (const p of confetti) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.fillStyle = p.col;
+    ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+}
+
+function roundRect(x, y, w, h, r, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  // 纸屑物理
+  for (const p of confetti) {
+    p.vy += 620 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.rot += 4 * dt;
+  }
+  confetti = confetti.filter(p => p.y < H + 30);
+  // 庆祝动画结束 → 下一个图形
+  if (celebrateT > 0 && now - celebrateT > 2200) {
+    loadShape(shapeIdx + 1);
+    showHint(`太棒了！再来补全${SHAPES[shapeIdx].name}的另一半吧！`);
+  }
+  draw(now);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

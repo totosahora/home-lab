@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>果汁调配店</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#2b3a2e; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(15,25,18,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(15,25,18,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #dumpBtn {
+    position:absolute; right:20px; bottom:64px; z-index:10;
+    font-size:19px; font-weight:bold; padding:14px 26px;
+    border-radius:30px; border:none; background:#ff8a65; color:#4a1c00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #dumpBtn:active { transform:scale(1.06); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">第 1 / 5 关 · 🍹 已调出 0 杯</div>
+<div id="hint">按住龙头的手柄往下拉，就会流出液体，松手停止！</div>
+<button id="dumpBtn">🪣 倒掉重来</button>
+<div id="winPanel">
+  <div class="msg">🎉 全部调好！果汁店开张啦！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const dumpBtn = document.getElementById("dumpBtn");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 场景与视图 ================= */
+// 世界坐标 1200 x 800（y 向下），整屏缩放居中
+const WORLD_W = 1200, WORLD_H = 800;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / (WORLD_W + 40), H / (WORLD_H + 40));
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+// 龙头：手柄在竖直滑轨上，往下拉开大水流
+const TRACK_Y0 = 196, TRACK_Y1 = 296;   // 滑轨范围（世界坐标）
+const MAX_RATE = 150;                    // 最大流速 ml/秒
+const CAPACITY = 700;                    // 杯子容量 ml
+const GLASS = { cx:600, top:390, bot:730, halfW:150 };
+const ML_PER_PX = CAPACITY / (GLASS.bot - GLASS.top);
+const TAPS = {
+  juice: { x:300, spoutX:490, color:"#ff9a1f", dark:"#e07b00", label:"原汁 🍊", knobY:TRACK_Y0 },
+  water: { x:900, spoutX:710, color:"#4db2ff", dark:"#1a7fd8", label:"水 💧",  knobY:TRACK_Y0 }
+};
+
+/* ================= 关卡与状态 ================= */
+const LEVELS = [
+  { j:100, w:300, label:"1 : 3" },
+  { j:150, w:150, label:"1 : 1" },
+  { j:200, w:300, label:"2 : 3" },
+  { j:150, w:300, label:"1 : 2" },
+  { j:300, w:200, label:"3 : 2" }
+];
+const TOL = 12;                          // 每种液体允许的误差 ml
+let levelIdx = 0, doneCups = 0;
+let juiceMl = 0, waterMl = 0;
+let state = "mixing";                    // mixing | cheer
+let cheerT = 0;
+let dragging = null;                     // "juice" | "water"
+let confetti = [];                       // {x,y,vx,vy,color,rot,vr,life}
+let bubbles = [];                        // 杯中装饰气泡
+let streamAnim = 0;
+
+function level() { return LEVELS[levelIdx]; }
+function totalMl() { return juiceMl + waterMl; }
+
+function resetGame() {
+  levelIdx = 0; doneCups = 0;
+  juiceMl = 0; waterMl = 0;
+  state = "mixing"; confetti = []; bubbles = [];
+  TAPS.juice.knobY = TRACK_Y0; TAPS.water.knobY = TRACK_Y0;
+  winPanel.style.display = "none";
+  updateScore();
+}
+function updateScore() {
+  scorebar.textContent = `第 ${Math.min(levelIdx + 1, LEVELS.length)} / ${LEVELS.length} 关 · 🍹 已调出 ${doneCups} 杯`;
+}
+resetGame();
+
+/* ================= 比例与判定 ================= */
+function gcd(a, b) { return b ? gcd(b, a % b) : a; }
+function ratioText(j, w) {
+  if (j <= 0 && w <= 0) return "—";
+  if (j <= 0) return "全是水";
+  if (w <= 0) return "纯原汁";
+  const g = gcd(Math.round(j), Math.round(w));
+  const a = Math.round(j) / g, b = Math.round(w) / g;
+  if (a <= 20 && b <= 20) return a + " : " + b;          // 能约成整数比就显示整数比
+  const r = Math.round(w / j * 10) / 10;                  // 否则显示 1 : x.x
+  return "1 : " + r;
+}
+function matched() {
+  const t = level();
+  return Math.abs(juiceMl - t.j) <= TOL && Math.abs(waterMl - t.w) <= TOL;
+}
+// 方向提示：太浓/太淡/继续倒/超量
+function directionTip() {
+  const t = level();
+  if (totalMl() <= 0) return "";
+  const margin = (t.j + t.w) * 0.08;
+  const cross = waterMl * t.j - juiceMl * t.w;   // <0 太浓，>0 太淡
+  if (cross < -margin) return "太浓啦，加点水 💧";
+  if (cross > margin)  return "太淡啦，加点原汁 🍊";
+  if (totalMl() < t.j + t.w - TOL) return `比例很好！继续倒到 ${t.j + t.w} ml`;
+  if (totalMl() > t.j + t.w + TOL) return "超量啦，点右下角倒掉重来 🪣";
+  return "";
+}
+
+function checkMatch() {
+  if (state !== "mixing" || dragging) return;
+  if (!matched()) return;
+  // 调好一杯：撒花庆祝
+  state = "cheer";
+  cheerT = performance.now() + 1700;
+  doneCups++;
+  updateScore();
+  fanfare();
+  spawnConfetti();
+  showHint("🎉 调出成功！比例刚刚好！");
+}
+function spawnConfetti() {
+  const colors = ["#ff5252", "#ffd54a", "#2fbf4a", "#4db2ff", "#ff9a1f", "#e07bff"];
+  for (let i = 0; i < 80; i++) {
+    confetti.push({
+      x: GLASS.cx + (Math.random() - 0.5) * 200,
+      y: GLASS.top - 20,
+      vx: (Math.random() - 0.5) * 500,
+      vy: -200 - Math.random() * 400,
+      color: colors[i % colors.length],
+      rot: Math.random() * 7, vr: (Math.random() - 0.5) * 12,
+      life: 1.6 + Math.random() * 0.8
+    });
+  }
+}
+
+/* ================= 交互（Pointer Events） ================= */
+function hitKnob(wx, wy, side) {
+  const t = TAPS[side];
+  return Math.hypot(wx - t.x, wy - t.knobY) < 44;
+}
+canvas.addEventListener("pointerdown", e => {
+  if (state !== "mixing" || winPanel.style.display === "flex") return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  for (const side of ["juice", "water"]) {
+    if (hitKnob(wx, wy, side)) {
+      dragging = side;
+      canvas.setPointerCapture(e.pointerId);
+      hintEl.style.opacity = "0";
+      pop(side === "juice" ? 700 : 900);
+      return;
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  const [, wy] = toWorld(e.clientX, e.clientY);
+  TAPS[dragging].knobY = Math.max(TRACK_Y0, Math.min(TRACK_Y1, wy));
+});
+window.addEventListener("pointerup", () => {
+  if (!dragging) return;
+  TAPS[dragging].knobY = TRACK_Y0;   // 松手手柄弹回，停止流出
+  dragging = null;
+  checkMatch();
+});
+dumpBtn.addEventListener("click", () => {
+  if (state !== "mixing" || totalMl() <= 0) return;
+  juiceMl = 0; waterMl = 0;
+  pop(240);
+  showHint("倒掉了，重新调配吧！");
+});
+
+/* ================= 物理 / 更新 ================= */
+let glugT = 0;
+function update(dt, now) {
+  streamAnim += dt * 8;
+  // 拉着手柄时持续流出
+  if (dragging && state === "mixing") {
+    const t = TAPS[dragging];
+    const frac = (t.knobY - TRACK_Y0) / (TRACK_Y1 - TRACK_Y0);
+    const rate = MAX_RATE * frac;
+    if (rate > 0 && totalMl() < CAPACITY) {
+      let add = rate * dt;
+      add = Math.min(add, CAPACITY - totalMl());
+      if (dragging === "juice") juiceMl += add; else waterMl += add;
+      glugT -= dt;
+      if (glugT <= 0) { glugT = 0.22; glug(dragging); }
+      // 气泡
+      if (Math.random() < 0.3) {
+        bubbles.push({ x: GLASS.cx + (Math.random() - 0.5) * GLASS.halfW * 1.4,
+                       y: surfaceY(), r: 2 + Math.random() * 4, vy: 40 + Math.random() * 40, life: 1 });
+      }
+    } else if (totalMl() >= CAPACITY) {
+      showHint("杯子满啦！");
+    }
+  }
+  // 气泡上升
+  for (const b of bubbles) {
+    b.y -= b.vy * dt; b.life -= dt * 1.4;
+  }
+  bubbles = bubbles.filter(b => b.life > 0 && b.y > GLASS.top - 10 && b.y > surfaceY() - (GLASS.bot - GLASS.top));
+  // 撒花
+  for (const c of confetti) {
+    c.vy += 700 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += c.vr * dt; c.life -= dt;
+  }
+  confetti = confetti.filter(c => c.life > 0 && c.y < WORLD_H + 40);
+  // 庆祝结束 → 下一关
+  if (state === "cheer" && now >= cheerT) {
+    levelIdx++;
+    if (levelIdx >= LEVELS.length) {
+      winPanel.style.display = "flex";
+      fanfare();
+      state = "mixing";
+      return;
+    }
+    juiceMl = 0; waterMl = 0; bubbles = [];
+    state = "mixing";
+    updateScore();
+    showHint(`第 ${levelIdx + 1} 关：调出 ${level().label} 的橙汁 ${level().j + level().w} ml！`);
+  }
+}
+function surfaceY() {
+  return GLASS.bot - totalMl() / ML_PER_PX;
+}
+// 混合颜色：浓度越高越橙
+function mixColor() {
+  const tot = totalMl();
+  if (tot <= 0) return "#cfe8ff";
+  const c = juiceMl / tot;   // 原汁浓度
+  const lerp = (a, b) => Math.round(a + (b - a) * c);
+  return `rgb(${lerp(207, 255)}, ${lerp(232, 138)}, ${lerp(255, 26)})`;
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+  g.addColorStop(0, "#3d5c43"); g.addColorStop(1, "#24382a");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+  // 操作台
+  ctx.fillStyle = "#6b4423";
+  ctx.fillRect(0, GLASS.bot + 16, WORLD_W, WORLD_H - GLASS.bot);
+  ctx.fillStyle = "#8a5a2e";
+  ctx.fillRect(0, GLASS.bot + 16, WORLD_W, 10);
+}
+
+function drawTaskCard() {
+  const t = level();
+  const cw = 580, ch = 74, cx = WORLD_W / 2 - cw / 2, cy = 60;
+  ctx.fillStyle = "rgba(15,25,18,0.82)";
+  roundRect(cx, cy, cw, ch, 18, true);
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3;
+  roundRect(cx, cy, cw, ch, 18, false); ctx.stroke();
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 28px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(`🎯 任务：调出 ${t.label} 的橙汁 ${t.j + t.w} ml`, WORLD_W / 2, cy + ch / 2);
+}
+
+function drawTap(side) {
+  const t = TAPS[side];
+  const x = t.x;
+  // 滑轨
+  ctx.strokeStyle = "rgba(255,255,255,0.35)";
+  ctx.lineWidth = 8; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(x, TRACK_Y0); ctx.lineTo(x, TRACK_Y1); ctx.stroke();
+  // 下拉箭头提示
+  if (t.knobY <= TRACK_Y0 + 2 && !dragging && state === "mixing" && totalMl() === 0) {
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.font = "26px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("⬇", x, TRACK_Y1 + 44);
+  }
+  // 龙头主体：横管 + 向下出水口
+  ctx.strokeStyle = "#b0b8c0"; ctx.lineWidth = 18;
+  ctx.beginPath(); ctx.moveTo(x, 250); ctx.lineTo(t.spoutX, 250); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(t.spoutX, 250); ctx.lineTo(t.spoutX, 320); ctx.stroke();
+  ctx.fillStyle = "#8a929c";
+  roundRect(t.spoutX - 16, 310, 32, 22, 6, true);
+  // 手柄（大圆形旋钮）
+  const grad = ctx.createRadialGradient(x - 8, t.knobY - 9, 3, x, t.knobY, 30);
+  grad.addColorStop(0, "#ffffff"); grad.addColorStop(1, t.color);
+  ctx.beginPath(); ctx.arc(x, t.knobY, 28, 0, 7);
+  ctx.fillStyle = grad; ctx.fill();
+  ctx.strokeStyle = dragging === side ? "#ffd54a" : "rgba(0,0,0,0.35)";
+  ctx.lineWidth = dragging === side ? 5 : 3; ctx.stroke();
+  // 标签
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 28px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(t.label, x, 152);
+  // 流量读数
+  if (dragging === side) {
+    const frac = (t.knobY - TRACK_Y0) / (TRACK_Y1 - TRACK_Y0);
+    ctx.fillStyle = t.color;
+    ctx.font = "bold 24px sans-serif";
+    ctx.fillText(`${Math.round(MAX_RATE * frac)} ml/秒`, x, TRACK_Y1 + 44);
+  }
+}
+
+function drawStream(side) {
+  const t = TAPS[side];
+  const frac = (t.knobY - TRACK_Y0) / (TRACK_Y1 - TRACK_Y0);
+  if (frac <= 0.02 || state !== "mixing") return;
+  const landX = side === "juice" ? GLASS.cx - 50 : GLASS.cx + 50;
+  const landY = Math.max(GLASS.top + 6, surfaceY());
+  ctx.save();
+  ctx.strokeStyle = t.color;
+  ctx.lineWidth = 5 + frac * 7;
+  ctx.lineCap = "round";
+  ctx.globalAlpha = 0.85;
+  ctx.setLineDash([16, 14]);
+  ctx.lineDashOffset = -streamAnim * 14;
+  ctx.beginPath();
+  ctx.moveTo(t.spoutX, 340);
+  ctx.quadraticCurveTo(t.spoutX, 372, landX, landY);
+  ctx.stroke();
+  ctx.restore();
+  // 落点水花
+  ctx.beginPath();
+  ctx.arc(landX, landY, 8 + Math.sin(streamAnim * 3) * 3, 0, 7);
+  ctx.fillStyle = t.color; ctx.globalAlpha = 0.6; ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function drawGlass() {
+  const { cx, top, bot, halfW } = GLASS;
+  // 杯内液体（圆角矩形 + 颜色浓度渐变）
+  const tot = totalMl();
+  if (tot > 0) {
+    const sy = surfaceY();
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(cx - halfW + 6, top, halfW * 2 - 12, bot - top);
+    ctx.clip();
+    const g = ctx.createLinearGradient(0, sy, 0, bot);
+    const mc = mixColor();
+    g.addColorStop(0, mc);
+    g.addColorStop(1, juiceMl / tot > 0.5 ? "#e07b00" : mc);
+    ctx.fillStyle = g;
+    ctx.fillRect(cx - halfW + 6, sy, halfW * 2 - 12, bot - sy);
+    // 液面高光
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.beginPath();
+    ctx.ellipse(cx, sy, halfW - 10, 9, 0, 0, 7);
+    ctx.fill();
+    // 气泡
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    for (const b of bubbles) {
+      if (b.y > sy + 4 && b.y < bot) {
+        ctx.globalAlpha = Math.max(0, b.life) * 0.6;
+        ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+  // 目标刻度线
+  const t = level();
+  const ty = bot - (t.j + t.w) / ML_PER_PX;
+  ctx.save();
+  ctx.setLineDash([10, 8]);
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx - halfW, ty); ctx.lineTo(cx + halfW, ty); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 20px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText(`${t.j + t.w} ml`, cx + halfW + 10, ty);
+  ctx.restore();
+  // 杯壁
+  ctx.strokeStyle = "rgba(255,255,255,0.75)";
+  ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(cx - halfW, top); ctx.lineTo(cx - halfW, bot);
+  ctx.lineTo(cx + halfW, bot); ctx.lineTo(cx + halfW, top);
+  ctx.stroke();
+  // 杯底高光
+  ctx.strokeStyle = "rgba(255,255,255,0.3)"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx - halfW + 14, top + 20); ctx.lineTo(cx - halfW + 14, bot - 30); ctx.stroke();
+}
+
+function drawInfoPanel() {
+  const t = level();
+  const px = 40, py = 370, pw = 330, ph = 250;
+  ctx.fillStyle = "rgba(15,25,18,0.78)";
+  roundRect(px, py, pw, ph, 18, true);
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  const rows = [
+    ["🍊 原汁", `${Math.round(juiceMl)} ml`, `目标 ${t.j} ml`, "#ff9a1f"],
+    ["💧 水",   `${Math.round(waterMl)} ml`, `目标 ${t.w} ml`, "#4db2ff"],
+    ["⚖️ 比例", ratioText(Math.round(juiceMl), Math.round(waterMl)), `目标 ${t.label}`, "#ffd54a"],
+    ["🥛 总量", `${Math.round(totalMl())} ml`, `目标 ${t.j + t.w} ml`, "#ffffff"]
+  ];
+  rows.forEach((r, i) => {
+    const y = py + 36 + i * 58;
+    ctx.font = "bold 24px sans-serif";
+    ctx.fillStyle = r[3];
+    ctx.fillText(r[0], px + 18, y);
+    ctx.fillStyle = "#fff";
+    ctx.fillText(r[1], px + 118, y);
+    ctx.font = "18px sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.fillText(r[2], px + 215, y + 2);
+  });
+}
+
+function drawDirection() {
+  if (state !== "mixing") return;
+  const tip = matched() ? "" : directionTip();
+  if (!tip) return;
+  ctx.font = "bold 23px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(15,25,18,0.75)";
+  const tw = ctx.measureText(tip).width;
+  roundRect(190 - tw / 2 - 20, 646, tw + 40, 46, 23, true);
+  ctx.fillStyle = "#ffe08a";
+  ctx.fillText(tip, 190, 670);
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-6, -4, 12, 8);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#24382a";
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  drawBackground();
+  drawTaskCard();
+  drawGlass();
+  drawStream("juice");
+  drawStream("water");
+  drawTap("juice");
+  drawTap("water");
+  drawInfoPanel();
+  drawDirection();
+  drawConfetti();
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  update(dt, now);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const glug = side => tone((side === "juice" ? 260 : 340) + Math.random() * 120, 0.09, 0.07, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2000);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

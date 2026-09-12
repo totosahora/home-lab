@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>虚拟滴定实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#e8eef3; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(255,255,255,0.88); color:#1f4e79; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,0.12);
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(31,78,121,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  #hint.blink { animation:blink 0.5s infinite alternate; background:rgba(214,48,110,0.92); }
+  @keyframes blink { from { opacity:1; } to { opacity:0.35; } }
+  #resetBtn {
+    position:absolute; top:12px; right:14px; z-index:10;
+    font-size:16px; font-weight:bold; padding:10px 18px;
+    border-radius:22px; border:2px solid #1f4e79; background:rgba(255,255,255,0.85);
+    color:#1f4e79; cursor:pointer;
+  }
+  #resetBtn.urgent {
+    background:#d6306e; border-color:#d6306e; color:#fff;
+    animation:blink 0.5s infinite alternate;
+  }
+  #resetBtn:active { transform:scale(1.06); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:18px;
+    background:rgba(255,255,255,0.55);
+  }
+  #winPanel .card {
+    background:rgba(255,255,255,0.96); border-radius:22px; padding:28px 36px;
+    box-shadow:0 8px 30px rgba(0,0,0,0.25); text-align:center; max-width:88vw;
+  }
+  #winPanel .msg { font-size:34px; font-weight:bold; color:#d6306e; margin-bottom:12px; }
+  #winPanel .calc { font-size:19px; color:#333; line-height:1.9; font-family:"PingFang SC","Microsoft YaHei",sans-serif; }
+  #winPanel .calc b { color:#1f4e79; }
+  #winPanel button {
+    margin-top:16px; font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#d6306e; color:#fff;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.3);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar"></div>
+<div id="hint">按住右下大按钮逐滴加入 NaOH，溶液刚好变浅粉色时松手！点我可以关掉提示</div>
+<button id="resetBtn">🔄 重置本关</button>
+<div id="winPanel">
+  <div class="card">
+    <div class="msg">🎉 滴定终点！</div>
+    <div class="calc"></div>
+    <button id="nextBtn">下一关 ▶</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const resetBtn = document.getElementById("resetBtn");
+const winPanel = document.getElementById("winPanel");
+const calcEl = winPanel.querySelector(".calc");
+const msgEl = winPanel.querySelector(".msg");
+const nextBtn = document.getElementById("nextBtn");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 场景数据 ================= */
+// 锥形瓶：20.00 mL 未知浓度盐酸 + 酚酞（无色）
+// 滴定管：0.020 mol/L NaOH 标准液（共 50 mL）
+const C_NAOH = 0.020;        // mol/L
+const V_ACID = 20.00;        // mL
+const LEVELS = [
+  { cHCl: 0.010 },           // 终点理论体积 10.00 mL
+  { cHCl: 0.015 },           // 终点理论体积 15.00 mL
+];
+const DROP_FAST = 0.15, DROP_SLOW = 0.05;  // 每滴体积 mL（远离/接近终点）
+const T_FAST = 0.11, T_SLOW = 0.42;        // 滴加间隔 s
+const PH_SUCCESS_LO = 8.0, PH_SUCCESS_HI = 10.0;  // 微粉终点窗口
+const PH_WARN = 4.5;         // 超过此 pH 提示“慢点”
+
+let levelIdx = 0;
+let addedVol = 0;            // 已加入 NaOH 体积 mL
+let state = "run";           // run | success | over
+let dropping = false;
+let dropAcc = 0;
+let droplets = [];           // 下落液滴 {y, vy}
+let ripples = [];            // 液面涟漪 {r, a}
+let confetti = [];           // 庆祝彩纸 {x,y,vx,vy,c,rot,vr}
+let btnPulse = 0;
+let warned = false;
+
+function calcPH(vNaOH) {     // 强酸强碱滴定，v 单位 mL
+  const diff = level().cHCl * V_ACID - C_NAOH * vNaOH;  // mmol，正=酸过量
+  const vTot = V_ACID + vNaOH;                          // mL（mmol/mL = mol/L）
+  if (Math.abs(diff) / vTot < 1e-7) return 7;
+  if (diff > 0) return -Math.log10(diff / vTot);
+  return 14 + Math.log10(-diff / vTot);
+}
+const curPH = () => calcPH(addedVol);
+const level = () => LEVELS[levelIdx];
+// 酚酞显色比例：pH 8.2 以下无色，8.2~10 渐粉，10 以上深粉红
+function phenolphthalein(pH) { return 1 / (1 + Math.pow(10, 8.9 - pH)); }
+
+function resetLevel() {
+  addedVol = 0; state = "run"; dropping = false; dropAcc = 0;
+  droplets = []; ripples = []; warned = false;
+  winPanel.style.display = "none";
+  resetBtn.classList.remove("urgent");
+  updateScore();
+  showHint(levelIdx === 0
+    ? "按住右下大按钮逐滴加入 NaOH，溶液刚好变浅粉色时松手！"
+    : "第 2 关：这瓶盐酸浓度不同，重新滴定出它的浓度！");
+}
+function updateScore() {
+  scorebar.textContent = `第 ${levelIdx + 1} / ${LEVELS.length} 关 · 任务：测出未知盐酸的浓度`;
+}
+
+/* ================= 滴定模拟 ================= */
+function addDrop() {
+  const ph = curPH();
+  const dv = ph < 5 ? DROP_FAST : DROP_SLOW;
+  addedVol = Math.min(49.5, addedVol + dv);
+  droplets.push({ y: tipY(), vy: 60 });
+  drip(ph < 5 ? 1 : 0.6);
+  if (curPH() > PH_SUCCESS_HI) overTitrate();
+}
+
+function overTitrate() {
+  state = "over";
+  dropping = false;
+  buzz();
+  resetBtn.classList.add("urgent");
+  showHint("滴过量啦，溶液变得太红了 😅 点右上角「重置」再来一次，不扣分！");
+}
+
+function finishRelease() {     // 松手时判定
+  if (state !== "run") return;
+  const ph = curPH();
+  if (ph >= PH_SUCCESS_LO && ph <= PH_SUCCESS_HI) success();
+  else if (state === "run") showHint("还没到终点，酚酞还没变粉，继续滴加～");
+}
+
+function success() {
+  state = "success";
+  fanfare();
+  for (let i = 0; i < 90; i++) {
+    confetti.push({
+      x: W / 2 + (Math.random() - 0.5) * 300, y: H * 0.25,
+      vx: (Math.random() - 0.5) * 420, vy: -Math.random() * 380 - 60,
+      c: `hsl(${Math.random() * 360},85%,60%)`,
+      rot: Math.random() * 7, vr: (Math.random() - 0.5) * 10,
+    });
+  }
+  const c = C_NAOH * addedVol / V_ACID;
+  calcEl.innerHTML =
+    `溶液刚好变成微粉色，且不再褪去！<br>` +
+    `<b>c(盐酸) = c(NaOH) × V(NaOH) ÷ V(盐酸)</b><br>` +
+    `= 0.020 mol/L × ${addedVol.toFixed(2)} mL ÷ 20.00 mL<br>` +
+    `≈ <b>${c.toFixed(3)} mol/L</b>`;
+  msgEl.textContent = levelIdx + 1 >= LEVELS.length ? "🎓 全部关卡完成！" : "🎉 滴定终点！";
+  nextBtn.textContent = levelIdx + 1 >= LEVELS.length ? "再玩一次" : "下一关 ▶";
+  setTimeout(() => { winPanel.style.display = "flex"; }, 700);
+}
+
+/* ================= 布局 ================= */
+const bx = () => W * 0.30;                 // 滴定管中心 x
+const tubeTop = () => H * 0.14;
+const tubeBot = () => H * 0.46;
+const tipY = () => tubeBot() + 26;
+const flaskMouthY = () => H * 0.56;
+const flaskBaseY = () => Math.min(H * 0.84, H - 90);
+const flaskBW = () => Math.min(W * 0.115, 130);   // 瓶底半宽
+const btnCX = () => W * 0.80;
+const btnCY = () => H * 0.82;
+const BTN_R = 72;
+
+/* ================= 绘制 ================= */
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#dfeaf2"); g.addColorStop(1, "#cfdde8");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 实验台面
+  ctx.fillStyle = "#b08d5f";
+  ctx.fillRect(0, flaskBaseY() + 8, W, H - flaskBaseY() - 8);
+  ctx.fillStyle = "rgba(0,0,0,0.12)";
+  ctx.fillRect(0, flaskBaseY() + 8, W, 5);
+}
+
+function drawStand() {
+  const x = bx() - 105;
+  ctx.strokeStyle = "#5a6570"; ctx.lineWidth = 9; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(x, flaskBaseY() + 4); ctx.lineTo(x, tubeTop() - 24); ctx.stroke();
+  ctx.lineWidth = 7;
+  ctx.beginPath(); ctx.moveTo(x, tubeTop() + 18); ctx.lineTo(bx() - 16, tubeTop() + 18); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x, tubeBot() - 30); ctx.lineTo(bx() - 16, tubeBot() - 30); ctx.stroke();
+  // 底座
+  ctx.fillStyle = "#5a6570";
+  ctx.fillRect(x - 40, flaskBaseY() - 2, 80, 12);
+}
+
+function drawBurette() {
+  const x = bx(), tw = 15, top = tubeTop(), bot = tubeBot();
+  // 玻璃管
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.fillRect(x - tw, top, tw * 2, bot - top);
+  ctx.strokeStyle = "#6a7c8c"; ctx.lineWidth = 3;
+  ctx.strokeRect(x - tw, top, tw * 2, bot - top);
+  // NaOH 液柱（50 mL 满管）
+  const frac = Math.max(0, 1 - addedVol / 50);
+  const lh = (bot - top - 6) * frac;
+  ctx.fillStyle = "rgba(120,180,235,0.75)";
+  ctx.fillRect(x - tw + 2, bot - 3 - lh, tw * 2 - 4, lh);
+  ctx.fillStyle = "rgba(80,140,210,0.9)";
+  ctx.fillRect(x - tw + 2, bot - 3 - lh, tw * 2 - 4, 3);  // 液面
+  // 刻度：每 10 mL 一长线并标数，每 2 mL 一短线
+  ctx.strokeStyle = "#42525f"; ctx.fillStyle = "#42525f";
+  ctx.font = "12px sans-serif"; ctx.textAlign = "left";
+  for (let v = 0; v <= 50; v += 2) {
+    const y = top + 3 + (bot - top - 6) * (v / 50);
+    const long = v % 10 === 0;
+    ctx.lineWidth = long ? 2 : 1;
+    ctx.beginPath(); ctx.moveTo(x - tw, y); ctx.lineTo(x - tw + (long ? 10 : 6), y); ctx.stroke();
+    if (long) ctx.fillText(String(v), x - tw - 26, y + 4);
+  }
+  // 旋塞与尖嘴
+  ctx.fillStyle = "#8a97a5";
+  ctx.fillRect(x - tw - 6, bot, tw * 2 + 12, 9);
+  ctx.fillStyle = "#d6306e";
+  ctx.fillRect(x - 22, bot + 2, 44, 5);   // 旋塞把手
+  ctx.strokeStyle = "#6a7c8c"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(x - 5, bot + 9); ctx.lineTo(x - 3, tipY());
+  ctx.lineTo(x + 3, tipY()); ctx.lineTo(x + 5, bot + 9); ctx.closePath();
+  ctx.fillStyle = "rgba(255,255,255,0.6)"; ctx.fill(); ctx.stroke();
+  // 标签
+  ctx.fillStyle = "#1f4e79"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("NaOH 标准液", x, top - 26);
+  ctx.fillText("0.020 mol/L", x, top - 10);
+}
+
+function flaskPath(inset) {
+  const cx = bx(), mY = flaskMouthY(), bY = flaskBaseY();
+  const nw = 26 - inset * 0.4, bw = flaskBW() - inset, neckH = 34;
+  ctx.beginPath();
+  ctx.moveTo(cx - nw, mY + inset);
+  ctx.lineTo(cx - nw, mY + neckH);
+  ctx.lineTo(cx - bw, bY - inset);
+  ctx.lineTo(cx + bw, bY - inset);
+  ctx.lineTo(cx + nw, mY + neckH);
+  ctx.lineTo(cx + nw, mY + inset);
+  ctx.closePath();
+}
+
+function drawFlask(now) {
+  const cx = bx(), bY = flaskBaseY();
+  // 液体（夹在瓶内）
+  const ph = curPH();
+  const f = phenolphthalein(ph);
+  const liqFrac = Math.min(1, (V_ACID + addedVol) / 62);
+  const liqY = bY - 6 - (bY - flaskMouthY() - 46) * liqFrac;
+  ctx.save();
+  flaskPath(5); ctx.clip();
+  const rC = Math.round(248 + (255 - 248) * f);
+  const gC = Math.round(250 + (46 - 250) * f);
+  const bC = Math.round(252 + (136 - 252) * f);
+  ctx.fillStyle = `rgba(${rC},${gC},${bC},${0.35 + 0.6 * f})`;
+  ctx.fillRect(cx - flaskBW(), liqY, flaskBW() * 2, bY - liqY);
+  // 涟漪
+  for (const rp of ripples) {
+    ctx.beginPath(); ctx.ellipse(cx, liqY + 3, rp.r, rp.r * 0.28, 0, 0, 7);
+    ctx.strokeStyle = `rgba(255,255,255,${rp.a})`; ctx.lineWidth = 2; ctx.stroke();
+  }
+  ctx.restore();
+  // 玻璃瓶身
+  flaskPath(0);
+  ctx.fillStyle = "rgba(255,255,255,0.28)"; ctx.fill();
+  ctx.strokeStyle = "#6a7c8c"; ctx.lineWidth = 4; ctx.stroke();
+  // 过滴时瓶身闪红光
+  if (state === "over" && Math.floor(now / 300) % 2 === 0) {
+    flaskPath(-4); ctx.strokeStyle = "rgba(214,48,110,0.85)"; ctx.lineWidth = 5; ctx.stroke();
+  }
+  // 高光
+  ctx.beginPath();
+  ctx.moveTo(cx - flaskBW() * 0.55, flaskMouthY() + 60);
+  ctx.lineTo(cx - flaskBW() * 0.78, bY - 16);
+  ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 7; ctx.stroke();
+  // 标签
+  ctx.fillStyle = "#1f4e79"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("20.00 mL 未知盐酸 + 酚酞", cx, bY + 28);
+  // 下落液滴
+  for (const d of droplets) {
+    ctx.beginPath(); ctx.ellipse(cx, d.y, 4.5, 7, 0, 0, 7);
+    ctx.fillStyle = "rgba(120,180,235,0.95)"; ctx.fill();
+  }
+}
+
+function drawPanel() {
+  const px = W * 0.55, pw = W * 0.43, py = H * 0.14;
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.strokeStyle = "rgba(31,78,121,0.35)"; ctx.lineWidth = 2;
+  roundRect(px, py, pw, 250, 16, true); ctx.stroke();
+  const ph = curPH();
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#1f4e79"; ctx.font = "bold 22px sans-serif";
+  ctx.fillText(`pH = ${ph.toFixed(2)}`, px + 22, py + 42);
+  ctx.font = "16px sans-serif"; ctx.fillStyle = "#333";
+  ctx.fillText(`已加入 NaOH：${addedVol.toFixed(2)} mL`, px + 22, py + 72);
+  ctx.fillText(`酚酞：${ph < 8.2 ? "无色" : ph <= 10 ? "微粉色 ✨" : "深粉红（过滴）"}`, px + 22, py + 98);
+  // pH 试纸色卡条
+  ctx.fillText("pH 试纸色卡：", px + 22, py + 124);
+  const sx = px + 22, sy = py + 152, sw = pw - 44, sh = 30;
+  const stops = [[0,"#e8322a"],[2,"#f2682a"],[4,"#f5a623"],[6,"#e8d44d"],[7,"#5cb85c"],
+                 [9,"#3fa7a0"],[11,"#3f7fbf"],[13,"#7b4fa6"],[14,"#6a3d9a"]];
+  const grad = ctx.createLinearGradient(sx, 0, sx + sw, 0);
+  for (const [v, c] of stops) grad.addColorStop(v / 14, c);
+  ctx.fillStyle = grad;
+  roundRect(sx, sy, sw, sh, 6, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 1.5;
+  roundRect(sx, sy, sw, sh, 6, false); ctx.stroke();
+  ctx.fillStyle = "#333"; ctx.font = "11px sans-serif"; ctx.textAlign = "center";
+  for (let v = 0; v <= 14; v += 2) ctx.fillText(String(v), sx + sw * v / 14, sy + sh + 14);
+  // 当前 pH 指针（接近终点时闪烁）
+  const mx = sx + sw * Math.max(0, Math.min(14, ph)) / 14;
+  const flash = state === "run" && ph > PH_WARN && Math.floor(performance.now() / 280) % 2 === 0;
+  ctx.beginPath();
+  ctx.moveTo(mx, sy - 3); ctx.lineTo(mx - 8, sy - 17); ctx.lineTo(mx + 8, sy - 17);
+  ctx.closePath();
+  ctx.fillStyle = flash ? "#d6306e" : "#1f4e79"; ctx.fill();
+}
+
+function drawButton(now) {
+  btnPulse += 0.03;
+  const pulse = dropping ? 0.92 : 1 + Math.sin(btnPulse) * 0.045;
+  const r = BTN_R * pulse, x = btnCX(), y = btnCY();
+  ctx.beginPath(); ctx.arc(x, y, r + 10, 0, 7);
+  ctx.fillStyle = dropping ? "rgba(214,48,110,0.25)" : "rgba(31,78,121,0.14)"; ctx.fill();
+  const g = ctx.createRadialGradient(x - r * 0.3, y - r * 0.35, r * 0.1, x, y, r);
+  g.addColorStop(0, dropping ? "#ff6ba0" : "#5b9bd5");
+  g.addColorStop(1, dropping ? "#d6306e" : "#1f4e79");
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 4; ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.textAlign = "center";
+  ctx.font = "bold 24px sans-serif";
+  ctx.fillText(dropping ? "滴加中…" : "按住滴加", x, y - 4);
+  ctx.font = "15px sans-serif";
+  ctx.fillText("松手即停", x, y + 22);
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.c;
+    ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+}
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function draw(now) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawStand();
+  drawFlask(now);
+  drawBurette();
+  drawPanel();
+  drawButton(now);
+  drawConfetti();
+}
+
+/* ================= 交互 ================= */
+canvas.addEventListener("pointerdown", e => {
+  if (state !== "run" || winPanel.style.display === "flex") return;
+  if (Math.hypot(e.clientX - btnCX(), e.clientY - btnCY()) <= BTN_R + 24) {
+    dropping = true;
+    dropAcc = T_FAST;   // 立刻先滴一滴
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(660);
+  }
+});
+window.addEventListener("pointerup", () => {
+  if (!dropping) return;
+  dropping = false;
+  finishRelease();
+});
+window.addEventListener("pointercancel", () => {
+  if (!dropping) return;
+  dropping = false;
+  finishRelease();
+});
+resetBtn.addEventListener("click", () => { resetLevel(); pop(880); });
+nextBtn.addEventListener("click", () => {
+  if (levelIdx + 1 >= LEVELS.length) levelIdx = 0; else levelIdx++;
+  resetLevel();
+  pop(880);
+});
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  // 按住滴加
+  if (dropping && state === "run") {
+    dropAcc += dt;
+    const iv = curPH() < 5 ? T_FAST : T_SLOW;
+    while (dropAcc >= iv && state === "run") { dropAcc -= iv; addDrop(); }
+  }
+  // 液滴下落
+  const liqY = flaskBaseY() - 6 - (flaskBaseY() - flaskMouthY() - 46) * Math.min(1, (V_ACID + addedVol) / 62);
+  for (let i = droplets.length - 1; i >= 0; i--) {
+    const d = droplets[i];
+    d.vy += 1400 * dt; d.y += d.vy * dt;
+    if (d.y >= liqY) { droplets.splice(i, 1); ripples.push({ r: 6, a: 0.8 }); }
+  }
+  for (let i = ripples.length - 1; i >= 0; i--) {
+    const rp = ripples[i];
+    rp.r += 90 * dt; rp.a -= 1.6 * dt;
+    if (rp.a <= 0) ripples.splice(i, 1);
+  }
+  // 彩纸
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.vy += 700 * dt; c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+    if (c.y > H + 20) confetti.splice(i, 1);
+  }
+  // 接近终点的闪烁警告
+  const ph = curPH();
+  if (state === "run" && ph > PH_WARN && !warned) {
+    warned = true;
+    beep();
+    hintEl.classList.add("blink");
+    showHint("⚠️ 慢点！pH 开始猛升，一滴一滴来，变浅粉就松手！", 60000);
+  } else if ((state !== "run" || ph <= PH_WARN) && warned) {
+    warned = false;
+    hintEl.classList.remove("blink");
+  }
+  draw(now);
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const drip = v => tone(950 + Math.random() * 200, 0.06, 0.05 + 0.08 * v, "sine");
+const beep = () => { tone(660, 0.18, 0.1, "square"); setTimeout(() => tone(660, 0.18, 0.1, "square"), 240); };
+const buzz = () => tone(180, 0.4, 0.14, "sawtooth");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 5000);
+}
+resetLevel();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

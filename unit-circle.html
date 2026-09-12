@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>单位圆探秘</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#16222e; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,18,28,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,18,28,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🎯 任务：找到 sinθ = 1/2 的角 · 已找到 0/2</div>
+<div id="hint">按住圆周上的发光点拖动（或点圆周任意处），观察 sin / cos / tan 的变化！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+const COL_SIN = "#ff5252";   // sin 红
+const COL_COS = "#4da3ff";   // cos 蓝
+const COL_TAN = "#ffb800";   // tan 橙
+const COL_GOLD = "#ffd54a";
+
+/* ================= 布局 ================= */
+// 圆：cx, cy, R；波形图：graph {x,y,w,h}，横轴 θ∈[0,2π]，纵轴 [-1.3,1.3]
+let cx = 0, cy = 0, R = 100;
+const graph = { x:0, y:0, w:100, h:100 };
+function layout() {
+  if (W >= H * 1.05) {           // 横屏：左圆右图
+    cx = W * 0.27; cy = H * 0.56;
+    R = Math.min(W * 0.20, H * 0.34);
+    graph.x = W * 0.56; graph.y = H * 0.30;
+    graph.w = W * 0.40; graph.h = H * 0.42;
+  } else {                       // 竖屏：上圆下图
+    cx = W * 0.5; cy = H * 0.36;
+    R = Math.min(W * 0.36, H * 0.24);
+    graph.x = W * 0.08; graph.y = H * 0.66;
+    graph.w = W * 0.84; graph.h = H * 0.24;
+  }
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 角度与特殊值 ================= */
+let theta = Math.PI / 3;         // 当前角（弧度，可超出 [0,2π]）
+let dragging = false;
+let found30 = false, found150 = false, celebrated = false;
+
+const TAU = Math.PI * 2;
+function normTau(a) { a %= TAU; return a < 0 ? a + TAU : a; }
+function angDiff(a, b) {         // a-b 的最短角差（-π, π]
+  let d = normTau(a) - normTau(b);
+  if (d > Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
+  return d;
+}
+const rad2deg = a => normTau(a) * 180 / Math.PI;
+
+// 特殊角：0/30/45/60/90/.../330
+const SNAP_DEGS = [0,30,45,60,90,120,135,150,180,210,225,240,270,300,315,330];
+const RAD_TEXT = {
+  0:"0", 30:"π/6", 45:"π/4", 60:"π/3", 90:"π/2", 120:"2π/3", 135:"3π/4", 150:"5π/6",
+  180:"π", 210:"7π/6", 225:"5π/4", 240:"4π/3", 270:"3π/2", 300:"5π/3", 315:"7π/4", 330:"11π/6"
+};
+// 基础值表（第一象限/坐标轴）
+const BASE = { 0:["0","1","0"], 30:["1/2","√3/2","√3/3"], 45:["√2/2","√2/2","1"], 60:["√3/2","1/2","√3"] };
+function exactVals(deg) {        // deg ∈ {SNAP_DEGS} → {sin,cos,tan} 精确值文本
+  if (deg % 90 === 0) {          // 坐标轴上的角：0/90/180/270
+    const a = (deg / 90) % 4;    // 0:+x  1:+y  2:-x  3:-y
+    return {
+      sin: ["0", "1", "0", "-1"][a],
+      cos: ["1", "0", "-1", "0"][a],
+      tan: a % 2 === 0 ? "0" : "不存在"
+    };
+  }
+  const q = Math.floor(deg / 90);        // 象限 0..3
+  const ref = q % 2 === 0 ? deg % 90 : 90 - deg % 90;
+  const b = BASE[ref];
+  const sign = (v, pos) => v === "0" ? v : (pos ? v : "-" + v);
+  const sinPos = (q === 0 || q === 1), cosPos = (q === 0 || q === 3);
+  const sin = sign(b[0], sinPos), cos = sign(b[1], cosPos);
+  const tan = sign(b[2], sinPos === cosPos);
+  return { sin, cos, tan };
+}
+function nearestSpecial(deg) {   // 7° 以内吸附
+  let best = null, bd = 8;
+  for (const s of SNAP_DEGS) {
+    const d = Math.abs(angDiff(deg * Math.PI / 180, s * Math.PI / 180)) * 180 / Math.PI;
+    if (d < bd) { bd = d; best = s; }
+  }
+  return best;
+}
+
+function setTheta(a, allowSnap) {
+  if (allowSnap) {
+    const s = nearestSpecial(rad2deg(a));
+    if (s !== null) a = s * Math.PI / 180;
+  }
+  theta = theta + angDiff(a, theta);   // 保持圈数连续
+  checkTask();
+}
+
+/* ================= 任务：找到 sinθ = 1/2 的角 ================= */
+function checkTask() {
+  const deg = rad2deg(theta);
+  const near = t => Math.abs(angDiff(deg * Math.PI / 180, t * Math.PI / 180)) * 180 / Math.PI < 2;
+  if (!found30 && near(30)) {
+    found30 = true;
+    showHint(found150 ? "🎉 都找到了！" : "✅ 找到一个：θ = 30°！还有一个角也在上面……");
+    pop(880); setTimeout(() => pop(1175), 100);
+  }
+  if (!found150 && near(150)) {
+    found150 = true;
+    showHint(found30 ? "🎉 都找到了！" : "✅ 找到一个：θ = 150°！还有一个角……");
+    pop(880); setTimeout(() => pop(1175), 100);
+  }
+  updateScore();
+  if (found30 && found150 && !celebrated) {
+    celebrated = true;
+    fanfare();
+    setTimeout(() => showHint("🎉 答案：θ = 30°（π/6）和 150°（5π/6），正弦值都是 1/2！"), 1800);
+  }
+}
+function updateScore() {
+  const n = (found30 ? 1 : 0) + (found150 ? 1 : 0);
+  scorebar.textContent = n >= 2
+    ? "🎉 任务完成！sinθ = 1/2 → θ = 30° 或 150°"
+    : `🎯 任务：找到 sinθ = 1/2 的角 · 已找到 ${n}/2`;
+}
+
+/* ================= 交互（Pointer Events） ================= */
+canvas.addEventListener("pointerdown", e => {
+  dragging = true;
+  canvas.setPointerCapture(e.pointerId);
+  handlePointer(e.clientX, e.clientY);
+  hintEl.style.opacity = "0";
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  handlePointer(e.clientX, e.clientY);
+});
+window.addEventListener("pointerup", () => { dragging = false; });
+
+function handlePointer(sx, sy) {
+  // 点在波形图区域：横坐标直接映射为 θ
+  if (sx >= graph.x && sx <= graph.x + graph.w && sy >= graph.y - 30 && sy <= graph.y + graph.h + 30) {
+    setTheta((sx - graph.x) / graph.w * TAU, false);
+    return;
+  }
+  setTheta(Math.atan2(cy - sy, sx - cx), true);   // 屏幕 y 向下 → 取反
+}
+
+/* ================= 绘制：坐标换算 ================= */
+function circlePt(a, r) { return [cx + (r === undefined ? R : r) * Math.cos(a), cy - (r === undefined ? R : r) * Math.sin(a)]; }
+function gx(t) { return graph.x + t / TAU * graph.w; }
+function gy(v) { return graph.y + graph.h / 2 - v / 1.3 * (graph.h / 2); }
+
+function roundRect(x, y, w, h, r, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+/* ================= 绘制：单位圆 ================= */
+function drawCircle() {
+  const t = normTau(theta);
+  const [px, py] = circlePt(t);
+  const fx = px, fy = cy;        // 垂足（x 轴上）
+
+  // 坐标轴
+  ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(cx - R - 30, cy); ctx.lineTo(cx + R + 56, cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx, cy + R + 30); ctx.lineTo(cx, cy - R - 30); ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  ctx.font = "13px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("x", cx + R + 48, cy - 8);
+  ctx.fillText("y", cx + 10, cy - R - 16);
+  ctx.fillText("O", cx - 12, cy + 16);
+
+  // 圆周
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU);
+  ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 2.5; ctx.stroke();
+
+  // 特殊角刻度点与标签
+  ctx.font = "12px sans-serif";
+  for (const d of SNAP_DEGS) {
+    const a = d * Math.PI / 180;
+    const [tx, ty] = circlePt(a);
+    ctx.beginPath(); ctx.arc(tx, ty, 3, 0, TAU);
+    ctx.fillStyle = "rgba(255,255,255,0.45)"; ctx.fill();
+    const [lx, ly] = circlePt(a, R + 18);
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.fillText(d + "°", lx, ly + 4);
+  }
+
+  // 任务辅助线：sinθ = 1/2（金色虚线，与圆两交点即答案）
+  const hy = cy - R * 0.5;
+  ctx.save();
+  ctx.setLineDash([7, 6]);
+  ctx.strokeStyle = COL_GOLD; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(cx - R - 24, hy); ctx.lineTo(cx + R + 24, hy); ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = COL_GOLD; ctx.font = "13px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("sinθ = 1/2", cx + R * 0.12, hy - 7);
+  // 两个答案交点（找到后点亮）
+  for (const [d, got] of [[30, found30], [150, found150]]) {
+    const [ax, ay] = circlePt(d * Math.PI / 180);
+    ctx.beginPath(); ctx.arc(ax, ay, 7, 0, TAU);
+    if (got) {
+      ctx.fillStyle = COL_GOLD; ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+    } else {
+      ctx.strokeStyle = "rgba(255,213,74,0.55)"; ctx.lineWidth = 2; ctx.stroke();
+    }
+  }
+
+  // 角度扇形
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, R * 0.30, 0, -t, t < 0 ? false : true);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(255,213,74,0.20)"; ctx.fill();
+  ctx.strokeStyle = "rgba(255,213,74,0.7)"; ctx.lineWidth = 1.5; ctx.stroke();
+  const [alx, aly] = circlePt(t / 2, R * 0.44);
+  ctx.fillStyle = COL_GOLD; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("θ", alx, aly + 5);
+
+  // cos：水平分量（蓝），圆心 → 垂足
+  ctx.strokeStyle = COL_COS; ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(fx, fy); ctx.stroke();
+  // sin：竖直分量（红），垂足 → 圆上点
+  ctx.strokeStyle = COL_SIN;
+  ctx.beginPath(); ctx.moveTo(fx, fy); ctx.lineTo(px, py); ctx.stroke();
+  // 到 y 轴的虚线投影
+  ctx.save();
+  ctx.setLineDash([5, 5]);
+  ctx.strokeStyle = "rgba(255,82,82,0.5)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(cx, py); ctx.lineTo(px, py); ctx.stroke();
+  ctx.strokeStyle = "rgba(77,163,255,0.5)";
+  ctx.beginPath(); ctx.moveTo(px, cy); ctx.lineTo(px, cy); ctx.stroke();
+  ctx.restore();
+
+  // tan：切线 x=1 上的交点（橙）
+  const tanV = Math.tan(t);
+  const cosV = Math.cos(t);
+  const txX = cx + R * (cosV >= 0 ? 1 : -1);   // 切线取点所在一侧
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,184,0,0.4)"; ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(txX, cy - R * 1.5); ctx.lineTo(txX, cy + R * 1.5); ctx.stroke();
+  ctx.restore();
+  if (Math.abs(cosV) > 0.02 && Math.abs(tanV) < 20) {
+    const tyY = cy - R * tanV;
+    // 半径延长线到切线交点
+    ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(txX, tyY); ctx.stroke();
+    // tan 线段
+    ctx.strokeStyle = COL_TAN; ctx.lineWidth = 5; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(txX, cy); ctx.lineTo(txX, tyY); ctx.stroke();
+    ctx.beginPath(); ctx.arc(txX, tyY, 5, 0, TAU);
+    ctx.fillStyle = COL_TAN; ctx.fill();
+  }
+
+  // 半径
+  ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(px, py); ctx.stroke();
+
+  // 可拖动角度点（发光）
+  const pulse = 1 + 0.12 * Math.sin(performance.now() / 300);
+  const gr = ctx.createRadialGradient(px, py, 2, px, py, 22 * pulse);
+  gr.addColorStop(0, "rgba(255,213,74,0.8)"); gr.addColorStop(1, "rgba(255,213,74,0)");
+  ctx.beginPath(); ctx.arc(px, py, 22 * pulse, 0, TAU);
+  ctx.fillStyle = gr; ctx.fill();
+  ctx.beginPath(); ctx.arc(px, py, 10, 0, TAU);
+  ctx.fillStyle = COL_GOLD; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.stroke();
+}
+
+/* ================= 绘制：数值面板 ================= */
+function drawPanel() {
+  const deg = rad2deg(theta);
+  const degR = Math.round(deg);
+  const sp = SNAP_DEGS.includes(degR) && Math.abs(deg - degR) < 0.01 ? exactVals(degR) : null;
+  const sV = Math.sin(theta), cV = Math.cos(theta), tV = Math.tan(theta);
+  const f = v => (v >= 0 ? "" : "-") + Math.abs(v).toFixed(3);
+
+  const pw = 235, ph = sp ? 132 : 118;
+  const px0 = 16, py0 = 64;
+  ctx.fillStyle = "rgba(10,18,28,0.78)";
+  ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 1;
+  roundRect(px0, py0, pw, ph, 14, true, true);
+  ctx.textAlign = "left";
+  let ty = py0 + 28;
+  ctx.fillStyle = "#fff"; ctx.font = "bold 17px sans-serif";
+  ctx.fillText(sp ? `θ = ${degR}° = ${RAD_TEXT[degR]}` : `θ = ${degR}° ≈ ${(deg * Math.PI / 180).toFixed(2)} rad`, px0 + 16, ty);
+  ctx.font = "16px sans-serif";
+  ty += 27;
+  ctx.fillStyle = COL_SIN;
+  ctx.fillText(`sinθ = ${sp ? sp.sin : f(sV)}${sp ? "  ≈ " + f(sV) : ""}`, px0 + 16, ty);
+  ty += 27;
+  ctx.fillStyle = COL_COS;
+  ctx.fillText(`cosθ = ${sp ? sp.cos : f(cV)}${sp ? "  ≈ " + f(cV) : ""}`, px0 + 16, ty);
+  ty += 27;
+  ctx.fillStyle = COL_TAN;
+  const tanTxt = sp ? sp.tan : (Math.abs(cV) < 0.02 ? "不存在" : f(tV));
+  ctx.fillText(`tanθ = ${tanTxt}${sp && sp.tan !== "不存在" ? "  ≈ " + f(tV) : ""}`, px0 + 16, ty);
+}
+
+/* ================= 绘制：波形图 ================= */
+function drawGraph() {
+  const t = normTau(theta);
+  // 底板
+  ctx.fillStyle = "rgba(10,18,28,0.55)";
+  ctx.strokeStyle = "rgba(255,255,255,0.15)"; ctx.lineWidth = 1;
+  roundRect(graph.x - 14, graph.y - 34, graph.w + 28, graph.h + 62, 14, true, true);
+  ctx.fillStyle = "rgba(255,255,255,0.8)"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("波形图（随 θ 生长）", graph.x, graph.y - 14);
+
+  // 网格：y = -1, 0, 1 与 y = 1/2（任务线）
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 1;
+  for (const v of [-1, 0, 1]) {
+    ctx.beginPath(); ctx.moveTo(graph.x, gy(v)); ctx.lineTo(graph.x + graph.w, gy(v)); ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.5)"; ctx.font = "11px sans-serif"; ctx.textAlign = "right";
+    ctx.fillText(v === 0 ? "0" : v + "", graph.x - 4, gy(v) + 4);
+  }
+  ctx.save();
+  ctx.setLineDash([6, 5]);
+  ctx.strokeStyle = COL_GOLD; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(graph.x, gy(0.5)); ctx.lineTo(graph.x + graph.w, gy(0.5)); ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = COL_GOLD; ctx.font = "11px sans-serif"; ctx.textAlign = "right";
+  ctx.fillText("1/2", graph.x - 4, gy(0.5) + 4);
+
+  // x 轴刻度
+  ctx.fillStyle = "rgba(255,255,255,0.5)"; ctx.font = "11px sans-serif"; ctx.textAlign = "center";
+  const ticks = [[0, "0"], [Math.PI/2, "π/2"], [Math.PI, "π"], [3*Math.PI/2, "3π/2"], [TAU, "2π"]];
+  for (const [tv, label] of ticks) {
+    ctx.fillText(label, gx(tv), graph.y + graph.h + 16);
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.beginPath(); ctx.moveTo(gx(tv), graph.y); ctx.lineTo(gx(tv), graph.y + graph.h); ctx.stroke();
+  }
+
+  // 参考全波形（淡）
+  ctx.lineWidth = 1.5;
+  for (const [fn, col] of [[Math.sin, "rgba(255,82,82,0.18)"], [Math.cos, "rgba(77,163,255,0.18)"]]) {
+    ctx.strokeStyle = col;
+    ctx.beginPath();
+    for (let i = 0; i <= 200; i++) {
+      const a = i / 200 * TAU;
+      i === 0 ? ctx.moveTo(gx(a), gy(fn(a))) : ctx.lineTo(gx(a), gy(fn(a)));
+    }
+    ctx.stroke();
+  }
+  // 已生长部分（亮），随 θ 同步
+  ctx.lineWidth = 3; ctx.lineCap = "round";
+  const N = Math.max(2, Math.round(t / TAU * 200));
+  for (const [fn, col] of [[Math.sin, COL_SIN], [Math.cos, COL_COS]]) {
+    ctx.strokeStyle = col;
+    ctx.beginPath();
+    for (let i = 0; i <= N; i++) {
+      const a = i / N * t;
+      i === 0 ? ctx.moveTo(gx(a), gy(fn(a))) : ctx.lineTo(gx(a), gy(fn(a)));
+    }
+    ctx.stroke();
+    // 当前点高亮
+    ctx.beginPath(); ctx.arc(gx(t), gy(fn(t)), 6, 0, TAU);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+  }
+  // 当前 θ 竖线
+  ctx.save();
+  ctx.setLineDash([4, 4]);
+  ctx.strokeStyle = "rgba(255,213,74,0.6)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(gx(t), graph.y); ctx.lineTo(gx(t), graph.y + graph.h); ctx.stroke();
+  ctx.restore();
+
+  // 答案点在 sin 曲线上（找到后点亮）
+  for (const [tv, got] of [[Math.PI/6, found30], [5*Math.PI/6, found150]]) {
+    ctx.beginPath(); ctx.arc(gx(tv), gy(0.5), got ? 7 : 5, 0, TAU);
+    if (got) {
+      ctx.fillStyle = COL_GOLD; ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+    } else {
+      ctx.strokeStyle = "rgba(255,213,74,0.5)"; ctx.lineWidth = 1.5; ctx.stroke();
+    }
+  }
+
+  // 图例
+  ctx.font = "13px sans-serif"; ctx.textAlign = "left";
+  ctx.fillStyle = COL_SIN; ctx.fillText("— sinθ", graph.x + graph.w - 118, graph.y - 14);
+  ctx.fillStyle = COL_COS; ctx.fillText("— cosθ", graph.x + graph.w - 58, graph.y - 14);
+}
+
+/* ================= 绘制：主函数 ================= */
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#16222e";
+  ctx.fillRect(0, 0, W, H);
+  drawGraph();
+  drawCircle();
+  drawPanel();
+}
+
+/* ================= 主循环 ================= */
+function loop() {
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2400);
+}
+updateScore();
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

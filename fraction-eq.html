@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>分数拼图与等值</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#f7ecd9; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(90,60,20,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(90,60,20,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(60,40,10,0.45);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.5); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">⭐ 等值墙：0 / 6</div>
+<div id="hint">把左边的分数块拖到圆盘和长条盘上，拼出完整的 1！</div>
+<div id="winPanel">
+  <div class="msg">🎉 等值墙集齐啦！<br>你是分数小达人！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+const DENS = [2, 3, 4, 6, 8, 12];
+const COLORS = { 2:"#e74c3c", 3:"#f39c12", 4:"#2fbf4a", 6:"#3498db", 8:"#9b59b6", 12:"#e91e8c" };
+// 等值墙要收集的 6 组等值对
+const TARGETS = [
+  { key:"2/4=1/2",  text:"2/4 = 1/2" },
+  { key:"3/6=1/2",  text:"3/6 = 1/2" },
+  { key:"4/8=1/2",  text:"4/8 = 1/2" },
+  { key:"6/12=1/2", text:"6/12 = 1/2" },
+  { key:"2/8=1/4",  text:"2/8 = 1/4" },
+  { key:"3/12=1/4", text:"3/12 = 1/4" },
+];
+const EPS = 1e-6;
+
+// 两个拼盘：圆盘（上）和长条盘（下）
+const plates = {
+  circle: { type:"circle", pieces:[], cx:0, cy:0, R:100, celebrateT:0 },
+  bar:    { type:"bar",    pieces:[], x:0, y:0, w:300, h:60, celebrateT:0 },
+};
+let paletteItems = [];   // {den, shape, cx,cy,r | x,y,w,h} 命中区域
+let wallSlots = [];      // {x,y,w,h}
+let wallBox = { x:0, y:0, w:0, h:0 };
+let found = new Set();   // 已发现的等值 key
+let equalInfo = null;    // {text, until} 两盘相等时展示的等式
+let confetti = [];
+let won = false;
+
+function layout() {
+  const panL = 10, panR = Math.min(240, W * 0.24);
+  const wallR = W - 10, wallL = Math.max(panR + 320, W - Math.min(270, W * 0.26));
+  // 左侧工具箱：圆形一列 + 长条一列，共 6 行
+  paletteItems = [];
+  const top = 104, rowH = Math.min(108, (H - top - 30) / 6);
+  const cCol = panL + (panR - panL) * 0.28, bCol = panL + (panR - panL) * 0.72;
+  const pr = Math.min(33, rowH * 0.34);
+  const bw = Math.min(92, (panR - panL) * 0.42), bh = Math.min(30, rowH * 0.3);
+  DENS.forEach((d, i) => {
+    const y = top + rowH * (i + 0.5);
+    paletteItems.push({ den:d, shape:"circle", cx:cCol, cy:y, r:pr });
+    paletteItems.push({ den:d, shape:"bar", x:bCol - bw / 2, y:y - bh / 2, w:bw, h:bh });
+  });
+  // 中央拼盘
+  const cx = (panR + wallL) / 2;
+  const R = Math.max(70, Math.min(118, (wallL - panR) * 0.19, H * 0.16));
+  plates.circle.cx = cx; plates.circle.cy = H * 0.30; plates.circle.R = R;
+  plates.bar.w = R * 2.6; plates.bar.h = Math.max(48, R * 0.52);
+  plates.bar.x = cx - plates.bar.w / 2; plates.bar.y = H * 0.64;
+  // 右侧等值墙
+  wallBox = { x:wallL, y:70, w:wallR - wallL, h:54 + TARGETS.length * 56 };
+  wallSlots = TARGETS.map((t, i) => ({ x:wallL + 12, y:wallBox.y + 48 + i * 56, w:wallBox.w - 24, h:46 }));
+}
+resize();
+
+function totalOf(p) { return p.pieces.reduce((s, pc) => s + 1 / pc.den, 0); }
+function gcd(a, b) { return b ? gcd(b, a % b) : a; }
+function lcm(a, b) { return a / gcd(a, b) * b; }
+// 把一盘分数块写成带共同分母的分数，并约分
+function writtenForm(p) {
+  if (!p.pieces.length) return null;
+  let l = p.pieces[0].den;
+  for (const pc of p.pieces) l = lcm(l, pc.den);
+  let num = 0;
+  for (const pc of p.pieces) num += l / pc.den;
+  const g = gcd(num, l);
+  return { num, den:l, rnum:num / g, rden:l / g };
+}
+function updateScore() { scorebar.textContent = `⭐ 等值墙：${found.size} / ${TARGETS.length}`; }
+function resetGame() {
+  plates.circle.pieces = []; plates.bar.pieces = [];
+  plates.circle.celebrateT = 0; plates.bar.celebrateT = 0;
+  found = new Set(); equalInfo = null; confetti = []; won = false;
+  winPanel.style.display = "none";
+  updateScore();
+}
+resetGame();
+
+/* ================= 判定：拼满与等值 ================= */
+function afterChange() {
+  const now = performance.now();
+  // 拼满整圆 / 整条 → 「= 1 个整体！」
+  for (const key of ["circle", "bar"]) {
+    const p = plates[key];
+    if (!p.celebrateT && Math.abs(totalOf(p) - 1) < EPS) {
+      p.celebrateT = now + 1700;
+      fanfare();
+      spawnConfetti(key === "circle" ? p.cx : p.x + p.w / 2, key === "circle" ? p.cy : p.y, 60);
+      showHint("🎉 = 1 个整体！拼满啦！");
+    }
+  }
+  // 两盘相等 → 等值发现
+  const tc = totalOf(plates.circle), tb = totalOf(plates.bar);
+  if (tc > EPS && Math.abs(tc - tb) < EPS) {
+    const wc = writtenForm(plates.circle), wb = writtenForm(plates.bar);
+    let txt;
+    if (wc.num === wc.den && wb.num === wb.den) txt = "1 = 1";
+    else txt = `${wc.num}/${wc.den} = ${wb.num}/${wb.den}`;
+    equalInfo = { text:txt, until: now + 2600 };
+    // 任一侧写成未约分形式且命中目标 → 收集上墙
+    for (const w of [wc, wb]) {
+      if (w.den !== w.rden) {
+        const key = `${w.num}/${w.den}=${w.rnum}/${w.rden}`;
+        const t = TARGETS.find(t => t.key === key);
+        if (t && !found.has(key)) {
+          found.add(key);
+          updateScore();
+          showHint(`🌟 发现等值：${t.text}！已贴上等值墙`);
+          setTimeout(() => fanfare(), 250);
+          spawnConfetti(wallBox.x + wallBox.w / 2, wallBox.y + 40, 40);
+          if (found.size >= TARGETS.length && !won) {
+            won = true;
+            setTimeout(() => {
+              winPanel.style.display = "flex";
+              fanfare(); setTimeout(() => fanfare(), 500);
+            }, 900);
+          }
+        }
+      }
+    }
+  }
+}
+
+/* ================= 拖拽交互 ================= */
+let drag = null;   // {den, shape, fromPlate|null, x, y}
+
+function pickPalette(x, y) {
+  for (const it of paletteItems) {
+    if (it.shape === "circle") {
+      if (Math.hypot(x - it.cx, y - it.cy) < it.r + 14) return it;
+    } else if (x > it.x - 10 && x < it.x + it.w + 10 && y > it.y - 12 && y < it.y + it.h + 12) {
+      return it;
+    }
+  }
+  return null;
+}
+function pickPlaced(x, y) {
+  const c = plates.circle;
+  if (!c.celebrateT) {
+    const d = Math.hypot(x - c.cx, y - c.cy);
+    if (d < c.R) {
+      // 从正上方起顺时针找扇区
+      let rel = (Math.atan2(y - c.cy, x - c.cx) + Math.PI / 2) % (Math.PI * 2);
+      if (rel < 0) rel += Math.PI * 2;
+      let acc = 0;
+      for (let i = 0; i < c.pieces.length; i++) {
+        acc += (1 / c.pieces[i].den) * Math.PI * 2;
+        if (rel < acc + EPS) return { plate:c, idx:i };
+      }
+      return null;
+    }
+  }
+  const b = plates.bar;
+  if (!b.celebrateT && x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h) {
+    let acc = b.x;
+    for (let i = 0; i < b.pieces.length; i++) {
+      acc += b.w / b.pieces[i].den;
+      if (x < acc + EPS) return { plate:b, idx:i };
+    }
+  }
+  return null;
+}
+function overPlate(x, y, shape) {
+  const c = plates.circle, b = plates.bar;
+  if (shape === "circle" && Math.hypot(x - c.cx, y - c.cy) < c.R + 26) return c;
+  if (shape === "bar" && x > b.x - 20 && x < b.x + b.w + 20 && y > b.y - 26 && y < b.y + b.h + 26) return b;
+  return null;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const x = e.clientX, y = e.clientY;
+  const hit = pickPlaced(x, y);
+  if (hit) {   // 从拼盘上拿起一块
+    const pc = hit.plate.pieces.splice(hit.idx, 1)[0];
+    drag = { den:pc.den, shape:hit.plate.type, fromPlate:hit.plate, x, y };
+    pop(500);
+  } else {
+    const it = pickPalette(x, y);
+    if (it) {
+      drag = { den:it.den, shape:it.shape, fromPlate:null, x, y };
+      pop(600);
+    }
+  }
+  if (drag) {
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  drag.x = e.clientX; drag.y = e.clientY;
+});
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  const x = e.clientX, y = e.clientY;
+  const target = overPlate(x, y, drag.shape);
+  const wrong = overPlate(x, y, drag.shape === "circle" ? "bar" : "circle");
+  if (target && !target.celebrateT) {
+    if (totalOf(target) + 1 / drag.den < 1 + EPS) {
+      target.pieces.push({ den:drag.den });
+      pop(880); setTimeout(() => pop(1175), 80);
+      afterChange();
+    } else {
+      if (drag.fromPlate) drag.fromPlate.pieces.push({ den:drag.den });   // 放回去
+      showHint("放不下啦，会超过 1，换块小的试试～");
+      pop(220);
+    }
+  } else if (wrong) {
+    if (drag.fromPlate) drag.fromPlate.pieces.push({ den:drag.den });
+    showHint(drag.shape === "circle" ? "圆形块要放到圆盘上哦～" : "长条块要放到长条盘上哦～");
+    pop(220);
+  } else if (drag.fromPlate) {
+    pop(300);   // 拖出拼盘 = 放回工具箱
+  }
+  drag = null;
+});
+
+/* ================= 绘制 ================= */
+function fracText(den) { return "1/" + den; }
+function label(text, x, y, size, light) {
+  ctx.font = `bold ${size}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.lineWidth = 3; ctx.strokeStyle = light ? "rgba(0,0,0,0.45)" : "rgba(255,255,255,0.85)";
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = light ? "#ffffff" : "#5a3d00";
+  ctx.fillText(text, x, y);
+}
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+function sector(cx, cy, r, a0, a1) {
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, r, a0, a1);
+  ctx.closePath();
+}
+
+function drawPaletteItem(it) {
+  ctx.save();
+  if (it.shape === "circle") {
+    // 整圆虚线底 + 1/n 扇形
+    ctx.beginPath(); ctx.arc(it.cx, it.cy, it.r, 0, 7);
+    ctx.setLineDash([5, 4]); ctx.strokeStyle = "rgba(120,90,40,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.setLineDash([]);
+    sector(it.cx, it.cy, it.r, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 / it.den);
+    ctx.fillStyle = COLORS[it.den]; ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 2; ctx.stroke();
+    const mid = -Math.PI / 2 + Math.PI / it.den;
+    label(fracText(it.den), it.cx + Math.cos(mid) * it.r * 0.62, it.cy + Math.sin(mid) * it.r * 0.62, Math.max(12, it.r * 0.42), true);
+  } else {
+    // 整条虚线底 + 1/n 小段
+    ctx.setLineDash([5, 4]); ctx.strokeStyle = "rgba(120,90,40,0.5)"; ctx.lineWidth = 2;
+    roundRect(it.x, it.y, it.w, it.h, 7, false); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = COLORS[it.den];
+    roundRect(it.x + 1, it.y + 1, Math.max(6, it.w / it.den - 2), it.h - 2, 5, true);
+    const segW = it.w / it.den;
+    if (segW >= 30) label(fracText(it.den), it.x + segW / 2, it.y + it.h / 2, 14, true);
+    else label(fracText(it.den), it.x + segW + 20, it.y + it.h / 2, 13, false);
+  }
+  ctx.restore();
+}
+
+function drawCirclePlate() {
+  const p = plates.circle, now = performance.now();
+  const celebrating = p.celebrateT > 0;
+  ctx.save();
+  // 底盘
+  ctx.beginPath(); ctx.arc(p.cx, p.cy, p.R + 10, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.fill();
+  ctx.strokeStyle = "rgba(120,90,40,0.35)"; ctx.lineWidth = 3; ctx.stroke();
+  if (!p.pieces.length) {
+    ctx.setLineDash([8, 7]); ctx.strokeStyle = "rgba(120,90,40,0.45)"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(p.cx, p.cy, p.R, 0, 7); ctx.stroke();
+    ctx.setLineDash([]);
+    label("把圆形块放这里", p.cx, p.cy - 10, 17, false);
+    label("拼成完整的 1", p.cx, p.cy + 14, 17, false);
+  }
+  // 已放扇形
+  let a = -Math.PI / 2;
+  for (const pc of p.pieces) {
+    const a1 = a + Math.PI * 2 / pc.den;
+    sector(p.cx, p.cy, p.R, a, a1);
+    ctx.fillStyle = COLORS[pc.den]; ctx.fill();
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3; ctx.stroke();
+    const mid = (a + a1) / 2;
+    const halfArc = Math.PI * p.R * 0.62 / pc.den;   // 小扇形收窄字号防重叠
+    label(fracText(pc.den), p.cx + Math.cos(mid) * p.R * 0.62, p.cy + Math.sin(mid) * p.R * 0.62,
+      Math.max(11, Math.min(p.R * 0.17, halfArc * 0.9)), true);
+    a = a1;
+  }
+  // 拖拽悬停高亮
+  if (drag && drag.shape === "circle" && overPlate(drag.x, drag.y, "circle") && !celebrating) {
+    const fits = totalOf(p) + 1 / drag.den < 1 + EPS;
+    ctx.beginPath(); ctx.arc(p.cx, p.cy, p.R + 10, 0, 7);
+    ctx.strokeStyle = fits ? "rgba(47,191,74,0.9)" : "rgba(230,80,80,0.8)";
+    ctx.lineWidth = 6; ctx.stroke();
+  }
+  // 拼满庆祝文字
+  if (celebrating) {
+    const k = 1 + 0.12 * Math.sin(now / 90);
+    ctx.save();
+    ctx.translate(p.cx, p.cy - p.R - 34); ctx.scale(k, k);
+    label("= 1 个整体！", 0, 0, 30, false);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawBarPlate() {
+  const p = plates.bar, now = performance.now();
+  const celebrating = p.celebrateT > 0;
+  ctx.save();
+  // 底盘
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  roundRect(p.x - 10, p.y - 10, p.w + 20, p.h + 20, 16, true);
+  ctx.strokeStyle = "rgba(120,90,40,0.35)"; ctx.lineWidth = 3;
+  roundRect(p.x - 10, p.y - 10, p.w + 20, p.h + 20, 16, false); ctx.stroke();
+  if (!p.pieces.length) {
+    ctx.setLineDash([8, 7]); ctx.strokeStyle = "rgba(120,90,40,0.45)"; ctx.lineWidth = 3;
+    roundRect(p.x, p.y, p.w, p.h, 10, false); ctx.stroke();
+    ctx.setLineDash([]);
+    label("把长条块放这里，拼成完整的 1", p.x + p.w / 2, p.y + p.h / 2, 17, false);
+  }
+  // 已放小段
+  let x = p.x;
+  for (const pc of p.pieces) {
+    const w = p.w / pc.den;
+    ctx.fillStyle = COLORS[pc.den];
+    roundRect(x + 1, p.y + 1, w - 2, p.h - 2, 8, true);
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2.5;
+    roundRect(x + 1, p.y + 1, w - 2, p.h - 2, 8, false); ctx.stroke();
+    if (w >= 34) label(fracText(pc.den), x + w / 2, p.y + p.h / 2, Math.min(20, p.h * 0.36), true);
+    else label(fracText(pc.den), x + w / 2, p.y - 16, 13, false);
+    x += w;
+  }
+  // 拖拽悬停高亮
+  if (drag && drag.shape === "bar" && overPlate(drag.x, drag.y, "bar") && !celebrating) {
+    const fits = totalOf(p) + 1 / drag.den < 1 + EPS;
+    ctx.strokeStyle = fits ? "rgba(47,191,74,0.9)" : "rgba(230,80,80,0.8)";
+    ctx.lineWidth = 6;
+    roundRect(p.x - 10, p.y - 10, p.w + 20, p.h + 20, 16, false); ctx.stroke();
+  }
+  if (celebrating) {
+    const k = 1 + 0.12 * Math.sin(now / 90);
+    ctx.save();
+    ctx.translate(p.x + p.w / 2, p.y - 40); ctx.scale(k, k);
+    label("= 1 个整体！", 0, 0, 30, false);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawEqualInfo() {
+  if (!equalInfo || performance.now() > equalInfo.until) return;
+  const x = (plates.bar.x + plates.bar.w / 2), y = (plates.circle.cy + plates.circle.R + plates.bar.y) / 2;
+  ctx.save();
+  ctx.font = `bold 26px "PingFang SC","Microsoft YaHei",sans-serif`;
+  const tw = ctx.measureText(equalInfo.text).width;
+  ctx.fillStyle = "rgba(255,213,74,0.95)";
+  roundRect(x - tw / 2 - 20, y - 24, tw + 40, 48, 24, true);
+  ctx.strokeStyle = "rgba(90,61,0,0.6)"; ctx.lineWidth = 3;
+  roundRect(x - tw / 2 - 20, y - 24, tw + 40, 48, 24, false); ctx.stroke();
+  label(equalInfo.text, x, y, 26, false);
+  ctx.restore();
+}
+
+function drawWall() {
+  ctx.save();
+  ctx.fillStyle = "rgba(255,255,255,0.8)";
+  roundRect(wallBox.x, wallBox.y, wallBox.w, wallBox.h, 18, true);
+  ctx.strokeStyle = "rgba(120,90,40,0.4)"; ctx.lineWidth = 3;
+  roundRect(wallBox.x, wallBox.y, wallBox.w, wallBox.h, 18, false); ctx.stroke();
+  label("🏆 等值墙", wallBox.x + wallBox.w / 2, wallBox.y + 26, 20, false);
+  TARGETS.forEach((t, i) => {
+    const s = wallSlots[i], got = found.has(t.key);
+    ctx.fillStyle = got ? "rgba(255,240,180,0.95)" : "rgba(120,90,40,0.07)";
+    roundRect(s.x, s.y, s.w, s.h, 12, true);
+    ctx.strokeStyle = got ? "#ffb800" : "rgba(120,90,40,0.25)";
+    ctx.lineWidth = got ? 3 : 2;
+    roundRect(s.x, s.y, s.w, s.h, 12, false); ctx.stroke();
+    if (got) label("⭐ " + t.text, s.x + s.w / 2, s.y + s.h / 2, 19, false);
+    else label("? / ?  =  ? / ?", s.x + s.w / 2, s.y + s.h / 2, 16, false);
+  });
+  ctx.restore();
+}
+
+function drawDrag() {
+  if (!drag) return;
+  ctx.save();
+  ctx.globalAlpha = 0.92;
+  if (drag.shape === "circle") {
+    const r = 46, a1 = -Math.PI / 2 + Math.PI * 2 / drag.den;
+    sector(drag.x, drag.y, r, -Math.PI / 2, a1);
+    ctx.fillStyle = COLORS[drag.den]; ctx.fill();
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3; ctx.stroke();
+    const mid = -Math.PI / 2 + Math.PI / drag.den;
+    label(fracText(drag.den), drag.x + Math.cos(mid) * r * 0.62, drag.y + Math.sin(mid) * r * 0.62, 18, true);
+  } else {
+    const w = Math.max(56, 200 / drag.den), h = 44;
+    ctx.fillStyle = COLORS[drag.den];
+    roundRect(drag.x - w / 2, drag.y - h / 2, w, h, 10, true);
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3;
+    roundRect(drag.x - w / 2, drag.y - h / 2, w, h, 10, false); ctx.stroke();
+    label(fracText(drag.den), drag.x, drag.y, 19, true);
+  }
+  ctx.restore();
+}
+
+function spawnConfetti(x, y, n) {
+  const cols = ["#e74c3c", "#f39c12", "#2fbf4a", "#3498db", "#9b59b6", "#ffd54a"];
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 320;
+    confetti.push({
+      x, y, vx:Math.cos(a) * sp, vy:Math.sin(a) * sp - 160,
+      rot:Math.random() * 7, vr:(Math.random() - 0.5) * 12,
+      color:cols[i % cols.length], life:1.2 + Math.random() * 0.9, size:5 + Math.random() * 6
+    });
+  }
+}
+function drawConfetti(dt) {
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.life -= dt;
+    if (c.life <= 0) { confetti.splice(i, 1); continue; }
+    c.vy += 620 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.size / 2, -c.size / 3, c.size, c.size * 0.66);
+    ctx.restore();
+  }
+}
+
+function drawPanels() {
+  // 左侧工具箱面板
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  roundRect(8, 66, Math.min(240, W * 0.24) - 16, H - 100, 18, true);
+  label("🧩 分数块", 8 + (Math.min(240, W * 0.24) - 16) / 2, 84, 18, false);
+}
+
+function draw(dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#f7ecd9";
+  ctx.fillRect(0, 0, W, H);
+  drawPanels();
+  for (const it of paletteItems) drawPaletteItem(it);
+  drawCirclePlate();
+  drawBarPlate();
+  drawEqualInfo();
+  drawWall();
+  drawConfetti(dt);
+  drawDrag();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  // 拼满庆祝结束 → 清空拼盘，继续下一轮
+  for (const key of ["circle", "bar"]) {
+    const p = plates[key];
+    if (p.celebrateT && now >= p.celebrateT) {
+      p.pieces = []; p.celebrateT = 0;
+    }
+  }
+  draw(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2000);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

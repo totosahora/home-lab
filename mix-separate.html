@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>混合与分离小实验</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#eaf4fb; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,80,0.85); color:#ffe082; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,80,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.45);
+  }
+  #winPanel .msg {
+    font-size:34px; font-weight:bold; color:#ffe082;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.6;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffe082; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🔬 已完成 0 / 3 个实验</div>
+<div id="hint">拖一拖实验台上的工具，把三种混合物分开！</div>
+<div id="winPanel">
+  <div class="msg">🎉 三个实验都完成啦！<br>混合物有三种分开的办法：<br>过滤、蒸发、用磁铁吸！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+// 尺寸缩放因子：以 1280x800 为基准
+function SC() { return Math.max(0.62, Math.min(1.25, Math.min(W / 1280, H / 800))); }
+
+/* ================= 场景数据 ================= */
+// 所有可动元素用归一化坐标 {nx, ny}，resize 后布局自动适配
+let s1, s2, s3;           // 三个实验台状态
+let filterPos, cup1Pos, cup2Pos, magnetPos;
+let nails = [], chips = [];
+let steam = [], confetti = [];
+let drag = null;          // {kind, dx, dy}
+let pour = null;          // 倒水动画 {t, fromNx, fromNy}
+let heatT = -1;           // 加热进度 -1=未开始
+let pulse = 0;            // 高亮呼吸动画相位
+
+function layout() {
+  const s = SC();
+  const bt = H * 0.70;                 // 台面顶边 y
+  const cupW = 76 * s, cupH = 104 * s;
+  const cx1 = W / 6, cx2 = W / 2, cx3 = W * 5 / 6;
+  return {
+    s, bt, cupW, cupH, cx1, cx2, cx3,
+    cup1Home: { nx: (cx1 - 46 * s) / W, ny: (bt - cupH / 2) / H },
+    bowl1: { x: cx1 + 72 * s, y: bt, w: 124 * s, h: 52 * s },
+    filterHome: { nx: (cx1 - 20 * s) / W, ny: 0.30 },
+    cup2Home: { nx: (cx2 - 62 * s) / W, ny: (bt - cupH / 2) / H },
+    pad2: { x: cx2 + 58 * s, y: bt, w: 104 * s, h: 18 * s },
+    cup2OnPad: { nx: (cx2 + 58 * s) / W, ny: (bt - cupH / 2) / H },
+    tray3: { x: cx3, y: bt, w: 216 * s, h: 60 * s },
+    magnetHome: { nx: cx3 / W, ny: 0.28 },
+    titleY: H * 0.15
+  };
+}
+
+function init() {
+  const L = layout();
+  s1 = { phase: "filter", water: 1, bowlFill: 0, tilt: 0 };  // filter→pour→pouring→done
+  s2 = { phase: "move", water: 1 };                          // move→heating→done
+  s3 = { phase: "attract", stuck: 0 };                       // attract→done
+  filterPos = { nx: L.filterHome.nx, ny: L.filterHome.ny };
+  cup1Pos = { nx: L.cup1Home.nx, ny: L.cup1Home.ny };
+  cup2Pos = { nx: L.cup2Home.nx, ny: L.cup2Home.ny };
+  magnetPos = { nx: L.magnetHome.nx, ny: L.magnetHome.ny };
+  // 铁钉与木屑撒在托盘里（托盘内归一化坐标）
+  nails = [];
+  const nailSpot = [[0.18,0.30],[0.42,0.62],[0.60,0.28],[0.78,0.60],[0.32,0.72]];
+  for (let i = 0; i < 5; i++)
+    nails.push({ u: nailSpot[i][0], v: nailSpot[i][1], rot: (i * 1.3) % Math.PI, stuck: false, slot: i });
+  chips = [];
+  for (let i = 0; i < 12; i++)
+    chips.push({ u: 0.08 + 0.84 * ((i * 0.37 + 0.11) % 1), v: 0.12 + 0.72 * ((i * 0.53 + 0.29) % 1), rot: i * 0.9 });
+  steam = []; confetti = [];
+  drag = null; pour = null; heatT = -1;
+  winPanel.style.display = "none";
+  updateScore();
+}
+function updateScore() {
+  const n = (s1.phase === "done") + (s2.phase === "done") + (s3.phase === "done");
+  scorebar.textContent = `🔬 已完成 ${n} / 3 个实验`;
+}
+init();
+
+// 归一化坐标 → 像素
+function px(p) { return [p.nx * W, p.ny * H]; }
+function nailPx(n) {
+  const L = layout();
+  return [L.tray3.x - L.tray3.w / 2 + n.u * L.tray3.w, L.tray3.y - L.tray3.h + n.v * L.tray3.h];
+}
+
+/* ================= 动画与物理 ================= */
+function step(dt) {
+  pulse += dt;
+  // --- 实验① 倒水动画 ---
+  if (pour) {
+    pour.t += dt / 3.2;
+    const L = layout();
+    const t = Math.min(1, pour.t);
+    const target = { nx: L.bowl1.x / W, ny: (L.bowl1.y - L.cupH / 2 - 120 * L.s) / H };
+    let from, to, k;
+    if (t < 0.22) {          // 移到碗上方并倾斜
+      k = ease(t / 0.22);
+      cup1Pos.nx = lerp(pour.fromNx, target.nx, k);
+      cup1Pos.ny = lerp(pour.fromNy, target.ny, k);
+      s1.tilt = 1.9 * k;
+    } else if (t < 0.72) {   // 保持倾斜，水漏下去
+      k = (t - 0.22) / 0.5;
+      s1.tilt = 1.9;
+      s1.water = 1 - k;
+      s1.bowlFill = k;
+      if (Math.random() < 0.5) drip();
+    } else {                 // 杯子回家
+      k = ease((t - 0.72) / 0.28);
+      cup1Pos.nx = lerp(target.nx, L.cup1Home.nx, k);
+      cup1Pos.ny = lerp(target.ny, L.cup1Home.ny, k);
+      s1.tilt = 1.9 * (1 - k);
+      s1.water = 0; s1.bowlFill = 1;
+    }
+    if (pour.t >= 1) {
+      pour = null; s1.tilt = 0;
+      finishStation(1, "过滤：沙子被滤网拦住，水流走啦！");
+    }
+  }
+  // --- 实验② 加热蒸发 ---
+  if (heatT >= 0 && s2.phase === "heating") {
+    heatT += dt / 3.5;
+    s2.water = Math.max(0, 1 - heatT);
+    if (s2.water > 0 && Math.random() < 0.6) spawnSteam();
+    if (Math.random() < 0.25) sizzle();
+    if (heatT >= 1) {
+      heatT = -1;
+      finishStation(2, "蒸发：水变成水汽跑掉，盐留下来啦！");
+    }
+  }
+  // 水汽粒子
+  for (let i = steam.length - 1; i >= 0; i--) {
+    const p = steam[i];
+    p.y += p.vy * dt; p.x += p.vx * dt; p.life -= dt;
+    if (p.life <= 0) steam.splice(i, 1);
+  }
+  // --- 实验③ 磁铁吸铁钉（仅拖动磁铁时生效）---
+  if (drag && drag.kind === "magnet" && s3.phase !== "done") {
+    const L = layout();
+    const [mx, my] = px(magnetPos);
+    const R = 150 * L.s;
+    for (const n of nails) {
+      if (n.stuck) continue;
+      const [nx2, ny2] = nailPx(n);
+      const d = Math.hypot(mx - nx2, my - ny2);
+      if (d < R) {
+        const sp = (1 - d / R) * 700 * dt + 60 * dt;
+        const ux = (mx - nx2) / (d || 1), uy = (my - ny2) / (d || 1);
+        n.u += ux * sp / L.tray3.w;
+        n.v += uy * sp / L.tray3.h;
+        if (d < 30 * L.s) {
+          n.stuck = true;
+          s3.stuck++;
+          cling();
+          if (s3.stuck === nails.length)
+            finishStation(3, "磁铁把铁钉都吸走啦！");
+        }
+      }
+    }
+  }
+  // 彩带
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.vy += 300 * dt; c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+    if (c.y > H + 30) confetti.splice(i, 1);
+  }
+}
+function lerp(a, b, k) { return a + (b - a) * k; }
+function ease(k) { k = Math.max(0, Math.min(1, k)); return k * k * (3 - 2 * k); }
+function spawnSteam() {
+  const L = layout();
+  const [cx, cy] = px(cup2Pos);
+  steam.push({ x: cx + (Math.random() - 0.5) * L.cupW * 0.6, y: cy - L.cupH / 2,
+    vx: (Math.random() - 0.5) * 20, vy: -50 - Math.random() * 40, life: 1 + Math.random() });
+}
+function drip() { /* 水滴由绘制时用流动虚线表现，这里仅保留节奏钩子 */ }
+
+function finishStation(idx, msg) {
+  if (idx === 1) s1.phase = "done";
+  if (idx === 2) s2.phase = "done";
+  if (idx === 3) s3.phase = "done";
+  updateScore();
+  showHint(msg);
+  fanfare();
+  if (s1.phase === "done" && s2.phase === "done" && s3.phase === "done") {
+    setTimeout(() => {
+      winPanel.style.display = "flex";
+      bigFanfare();
+      spawnConfetti();
+    }, 900);
+  }
+}
+function spawnConfetti() {
+  const colors = ["#ff5252", "#ffb800", "#2fbf4a", "#42a5f5", "#ab47bc", "#ffe082"];
+  for (let i = 0; i < 130; i++)
+    confetti.push({ x: Math.random() * W, y: -20 - Math.random() * H * 0.5,
+      vx: (Math.random() - 0.5) * 80, vy: 40 + Math.random() * 120,
+      rot: Math.random() * 6, vr: (Math.random() - 0.5) * 8,
+      w: 8 + Math.random() * 8, h: 5 + Math.random() * 5,
+      color: colors[i % colors.length] });
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#dff0fb"); g.addColorStop(1, "#bfe0f2");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  const L = layout();
+  // 实验台面
+  ctx.fillStyle = "#c89b6a";
+  ctx.fillRect(0, L.bt, W, H - L.bt);
+  ctx.fillStyle = "#a87c4e";
+  ctx.fillRect(0, L.bt, W, 8 * L.s);
+  ctx.fillStyle = "rgba(120,80,40,0.25)";
+  for (let y = L.bt + 30 * L.s; y < H; y += 34 * L.s) ctx.fillRect(0, y, W, 2);
+  // 分隔线
+  ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 3;
+  ctx.setLineDash([10, 10]);
+  for (const x of [W / 3, W * 2 / 3]) {
+    ctx.beginPath(); ctx.moveTo(x, H * 0.09); ctx.lineTo(x, L.bt); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+}
+
+function drawTitle(cx, text, done) {
+  const L = layout();
+  ctx.font = `bold ${Math.round(24 * L.s)}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#1d4e79";
+  ctx.fillText(text, cx, L.titleY);
+  if (done) {
+    const r = 16 * L.s, x = cx + ctx.measureText(text).width / 2 + r + 10 * L.s;
+    ctx.beginPath(); ctx.arc(x, L.titleY, r, 0, 7);
+    ctx.fillStyle = "#2fbf4a"; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 3.5 * L.s; ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(x - r * 0.45, L.titleY);
+    ctx.lineTo(x - r * 0.1, L.titleY + r * 0.4);
+    ctx.lineTo(x + r * 0.5, L.titleY - r * 0.35);
+    ctx.stroke(); ctx.lineCap = "butt";
+  }
+}
+
+// 玻璃烧杯：中心 (cx,cy)，tilt 为顺时针倾角；opt {water, sand, salt, filter}
+function drawCup(cx, cy, tilt, opt) {
+  const L = layout(), w = L.cupW, h = L.cupH;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(tilt);
+  // 内容物（先画，用杯形裁剪）
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(-w / 2 + 5, -h / 2 + 5); ctx.lineTo(w / 2 - 5, -h / 2 + 5);
+  ctx.lineTo(w * 0.41 - 5, h / 2 - 5); ctx.lineTo(-w * 0.41 + 5, h / 2 - 5);
+  ctx.closePath(); ctx.clip();
+  if (opt.water > 0) {
+    const wh = h * 0.88 * opt.water;
+    ctx.fillStyle = "rgba(80,160,230,0.75)";
+    ctx.fillRect(-w / 2, h / 2 - 5 - wh, w, wh);
+  }
+  if (opt.sand) {
+    const sh = h * 0.30;
+    const shift = tilt * h * 0.16;   // 倾斜时沙子滑向杯口方向
+    ctx.fillStyle = "#d9a849";
+    ctx.beginPath();
+    ctx.moveTo(-w / 2, h / 2 - 5);
+    ctx.lineTo(-w / 2, h / 2 - 5 - sh + shift);
+    ctx.quadraticCurveTo(shift * 0.6, h / 2 - 5 - sh - 6, w / 2, h / 2 - 5 - sh - shift);
+    ctx.lineTo(w / 2, h / 2 - 5);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "rgba(150,100,30,0.5)";
+    for (let i = 0; i < 14; i++)
+      ctx.fillRect(-w * 0.3 + (i * 7.3) % (w * 0.6), h / 2 - 10 - (i * 5.1) % (sh - 6), 3, 3);
+  }
+  if (opt.salt) {
+    ctx.fillStyle = "#ffffff";
+    for (let i = 0; i < 12; i++) {
+      const a = i * 2.4;
+      ctx.beginPath();
+      ctx.arc(Math.cos(a) * w * 0.2 * (i % 3) / 2, h / 2 - 8 - (i % 3) * 5, 3.5, 0, 7);
+      ctx.fill();
+    }
+    ctx.strokeStyle = "rgba(160,160,160,0.6)"; ctx.lineWidth = 1;
+    for (let i = 0; i < 12; i++) {
+      const a = i * 2.4;
+      ctx.beginPath();
+      ctx.arc(Math.cos(a) * w * 0.2 * (i % 3) / 2, h / 2 - 8 - (i % 3) * 5, 3.5, 0, 7);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+  // 玻璃杯壁
+  ctx.beginPath();
+  ctx.moveTo(-w / 2, -h / 2); ctx.lineTo(w / 2, -h / 2);
+  ctx.lineTo(w * 0.41, h / 2); ctx.lineTo(-w * 0.41, h / 2);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(210,235,250,0.35)"; ctx.fill();
+  ctx.strokeStyle = "#7a9ab0"; ctx.lineWidth = 3; ctx.stroke();
+  // 高光
+  ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(-w * 0.32, -h * 0.32); ctx.lineTo(-w * 0.26, h * 0.28); ctx.stroke();
+  // 滤网罩在杯口
+  if (opt.filter) {
+    ctx.fillStyle = "rgba(120,140,160,0.85)";
+    ctx.beginPath(); ctx.ellipse(0, -h / 2, w / 2 + 6, 10, 0, 0, 7); ctx.fill();
+    ctx.strokeStyle = "rgba(60,80,100,0.9)"; ctx.lineWidth = 1.5;
+    for (let i = -3; i <= 3; i++) {
+      ctx.beginPath(); ctx.moveTo(i * w / 8, -h / 2 - 8); ctx.lineTo(i * w / 8, -h / 2 + 8); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function drawFilterItem() {
+  if (s1.phase !== "filter") return;
+  const L = layout();
+  const [x, y] = px(filterPos);
+  const r = 30 * L.s;
+  ctx.save();
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+  ctx.fillStyle = "#b8c8d4"; ctx.fill();
+  ctx.strokeStyle = "#5a7488"; ctx.lineWidth = 4 * L.s; ctx.stroke();
+  ctx.strokeStyle = "rgba(70,95,115,0.8)"; ctx.lineWidth = 1.5;
+  for (let i = -3; i <= 3; i++) {
+    ctx.beginPath(); ctx.moveTo(x + i * r / 4, y - r * 0.9); ctx.lineTo(x + i * r / 4, y + r * 0.9); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x - r * 0.9, y + i * r / 4); ctx.lineTo(x + r * 0.9, y + i * r / 4); ctx.stroke();
+  }
+  ctx.restore();
+  drawLabel(x, y - r - 16 * L.s, "滤网");
+}
+
+function drawBowl() {
+  const L = layout(), b = L.bowl1;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(b.x - b.w / 2, b.y - b.h);
+  ctx.lineTo(b.x + b.w / 2, b.y - b.h);
+  ctx.lineTo(b.x + b.w * 0.36, b.y);
+  ctx.lineTo(b.x - b.w * 0.36, b.y);
+  ctx.closePath();
+  ctx.fillStyle = "#e8eef3"; ctx.fill();
+  ctx.strokeStyle = "#8aa0b0"; ctx.lineWidth = 3; ctx.stroke();
+  if (s1.bowlFill > 0) {
+    ctx.save(); ctx.clip();
+    const wh = b.h * 0.8 * s1.bowlFill;
+    ctx.fillStyle = "rgba(80,160,230,0.75)";
+    ctx.fillRect(b.x - b.w / 2, b.y - wh, b.w, wh);
+    ctx.restore();
+  }
+  ctx.restore();
+  drawLabel(b.x, b.y + 18 * L.s, "接水碗");
+}
+
+function drawPourStream() {
+  if (!pour || pour.t < 0.22 || pour.t > 0.74 || s1.water <= 0) return;
+  const L = layout(), b = L.bowl1;
+  const [cx, cy] = px(cup1Pos);
+  // 杯口位置（旋转后的右边缘）
+  const lx = L.cupW * 0.45, ly = -L.cupH / 2;
+  const c = Math.cos(s1.tilt), sn = Math.sin(s1.tilt);
+  const lipX = cx + lx * c - ly * sn, lipY = cy + lx * sn + ly * c;
+  ctx.save();
+  ctx.strokeStyle = "rgba(80,160,230,0.85)";
+  ctx.lineWidth = 6 * L.s; ctx.lineCap = "round";
+  ctx.setLineDash([14, 12]);
+  ctx.lineDashOffset = -pulse * 220;
+  ctx.beginPath();
+  ctx.moveTo(lipX, lipY);
+  ctx.quadraticCurveTo((lipX + b.x) / 2 + 20 * L.s, (lipY + b.y - b.h) / 2, b.x, b.y - b.h + 4);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawPad() {
+  const L = layout(), p = L.pad2;
+  const hot = s2.phase === "heating";
+  ctx.save();
+  if (hot) {
+    ctx.shadowColor = "rgba(255,90,40,0.9)";
+    ctx.shadowBlur = 18 * L.s * (1 + 0.3 * Math.sin(pulse * 8));
+  }
+  ctx.fillStyle = hot ? "#e2553a" : "#8a9099";
+  roundRect(p.x - p.w / 2, p.y - p.h, p.w, p.h, 8 * L.s, true);
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2;
+  roundRect(p.x - p.w / 2, p.y - p.h, p.w, p.h, 8 * L.s, false);
+  ctx.stroke();
+  // 电热丝
+  ctx.strokeStyle = hot ? "#ffd54a" : "#5c636b"; ctx.lineWidth = 2.5 * L.s;
+  ctx.beginPath();
+  for (let i = 0; i < 5; i++) {
+    const x0 = p.x - p.w * 0.36 + i * p.w * 0.18;
+    ctx.moveTo(x0, p.y - p.h * 0.3);
+    ctx.lineTo(x0 + p.w * 0.09, p.y - p.h * 0.75);
+  }
+  ctx.stroke();
+  ctx.restore();
+  drawLabel(p.x, p.y + 18 * L.s, "加热垫");
+}
+
+function drawTray() {
+  const L = layout(), t = L.tray3;
+  ctx.save();
+  ctx.fillStyle = "#f4e9d4";
+  roundRect(t.x - t.w / 2, t.y - t.h, t.w, t.h, 10 * L.s, true);
+  ctx.strokeStyle = "#b09872"; ctx.lineWidth = 3;
+  roundRect(t.x - t.w / 2, t.y - t.h, t.w, t.h, 10 * L.s, false);
+  ctx.stroke();
+  ctx.restore();
+  // 木屑
+  for (const ch of chips) {
+    const x = t.x - t.w / 2 + ch.u * t.w, y = t.y - t.h + ch.v * t.h;
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(ch.rot);
+    ctx.fillStyle = "#c98f4e";
+    roundRect(-8 * L.s, -3.5 * L.s, 16 * L.s, 7 * L.s, 3 * L.s, true);
+    ctx.restore();
+  }
+}
+
+function drawNail(x, y, rot, scale) {
+  const L = layout(), s = L.s * (scale || 1);
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(rot);
+  ctx.fillStyle = "#9aa4ae";
+  roundRect(-11 * s, -2.5 * s, 22 * s, 5 * s, 2.5 * s, true);
+  ctx.fillStyle = "#6e7883";
+  ctx.beginPath(); ctx.arc(-11 * s, 0, 4.5 * s, 0, 7); ctx.fill();  // 钉头
+  ctx.fillStyle = "#c3ccd4";
+  ctx.beginPath();
+  ctx.moveTo(11 * s, -2.5 * s); ctx.lineTo(16 * s, 0); ctx.lineTo(11 * s, 2.5 * s);
+  ctx.closePath(); ctx.fill();  // 钉尖
+  ctx.restore();
+}
+
+function drawNails() {
+  const [mx, my] = px(magnetPos);
+  const L = layout();
+  for (const n of nails) {
+    if (n.stuck) {
+      // 吸在磁铁两端，依次排开
+      const side = n.slot % 2 === 0 ? -1 : 1;
+      const k = Math.floor(n.slot / 2);
+      drawNail(mx + side * 17 * L.s, my + 30 * L.s + k * 12 * L.s, Math.PI / 2, 0.9);
+    } else {
+      const [x, y] = nailPx(n);
+      drawNail(x, y, n.rot, 1);
+    }
+  }
+}
+
+function drawMagnet() {
+  const L = layout();
+  const [x, y] = px(magnetPos);
+  const s = L.s;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.lineWidth = 15 * s; ctx.lineCap = "butt";
+  // 红色 U 形
+  ctx.strokeStyle = "#d43d2a";
+  ctx.beginPath();
+  ctx.arc(0, 0, 24 * s, Math.PI, 0, false);
+  ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-24 * s, 0); ctx.lineTo(-24 * s, 20 * s); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(24 * s, 0); ctx.lineTo(24 * s, 20 * s); ctx.stroke();
+  // 银色磁极
+  ctx.strokeStyle = "#dfe6ec";
+  ctx.beginPath(); ctx.moveTo(-24 * s, 12 * s); ctx.lineTo(-24 * s, 22 * s); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(24 * s, 12 * s); ctx.lineTo(24 * s, 22 * s); ctx.stroke();
+  // 拖动时的吸力波
+  if (drag && drag.kind === "magnet" && s3.phase !== "done") {
+    ctx.strokeStyle = "rgba(212,61,42,0.35)";
+    ctx.lineWidth = 2.5 * s;
+    for (let i = 0; i < 3; i++) {
+      const rr = ((pulse * 60 + i * 22) % 66) * s + 20 * s;
+      ctx.beginPath(); ctx.arc(0, 10 * s, rr, 0.25 * Math.PI, 0.75 * Math.PI); ctx.stroke();
+    }
+  }
+  ctx.restore();
+  if (s3.phase === "attract") drawLabel(x, y - 42 * L.s, "磁铁");
+}
+
+function drawSteam() {
+  for (const p of steam) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, Math.min(0.6, p.life * 0.6));
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath(); ctx.arc(p.x, p.y, 8 + (1.6 - p.life) * 8, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawLabel(x, y, text) {
+  const L = layout();
+  ctx.font = `bold ${Math.round(15 * L.s)}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const wdt = ctx.measureText(text).width + 16 * L.s;
+  ctx.fillStyle = "rgba(29,78,121,0.8)";
+  roundRect(x - wdt / 2, y - 11 * L.s, wdt, 22 * L.s, 11 * L.s, true);
+  ctx.fillStyle = "#fff";
+  ctx.fillText(text, x, y + 1);
+}
+
+// 当前可操作物上的呼吸高亮圈
+function drawHighlight() {
+  const L = layout();
+  const a = 0.35 + 0.25 * Math.sin(pulse * 5);
+  ctx.save();
+  ctx.strokeStyle = `rgba(255,170,0,${a})`;
+  ctx.lineWidth = 5 * L.s;
+  ctx.setLineDash([12, 9]);
+  ctx.lineDashOffset = -pulse * 40;
+  let target = null, r = 46 * L.s;
+  if (s1.phase === "filter") { target = px(filterPos); }
+  else if (s1.phase === "pour") { target = px(cup1Pos); r = 62 * L.s; }
+  else if (s2.phase === "move") { target = px(cup2Pos); r = 62 * L.s; }
+  else if (s3.phase === "attract") { target = px(magnetPos); r = 52 * L.s; }
+  if (target) {
+    ctx.beginPath(); ctx.arc(target[0], target[1], r, 0, 7); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.w / 2, -c.h / 2, c.w, c.h);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  const L = layout();
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawTitle(L.cx1, "① 沙 + 水", s1.phase === "done");
+  drawTitle(L.cx2, "② 盐 + 水", s2.phase === "done");
+  drawTitle(L.cx3, "③ 铁钉 + 木屑", s3.phase === "done");
+  // 台①
+  drawBowl();
+  const [c1x, c1y] = px(cup1Pos);
+  drawCup(c1x, c1y, s1.tilt, { water: s1.water, sand: true, filter: s1.phase !== "filter" });
+  drawPourStream();
+  drawFilterItem();
+  // 台②
+  drawPad();
+  const [c2x, c2y] = px(cup2Pos);
+  drawCup(c2x, c2y, 0, { water: s2.water, salt: s2.phase === "done" });
+  drawSteam();
+  // 台③
+  drawTray();
+  drawNails();
+  drawMagnet();
+  drawHighlight();
+  drawConfetti();
+}
+
+/* ================= 交互 ================= */
+function hitTest(e) {
+  const L = layout();
+  const ex = e.clientX, ey = e.clientY;
+  const near = (p, r) => { const [x, y] = px(p); return Math.hypot(ex - x, ey - y) < r; };
+  if (s3.phase !== "done" && near(magnetPos, 52 * L.s)) return { kind: "magnet", pos: magnetPos };
+  if (s3.phase === "done" && near(magnetPos, 52 * L.s)) return { kind: "magnet", pos: magnetPos };
+  if (s1.phase === "filter" && near(filterPos, 48 * L.s)) return { kind: "filter", pos: filterPos };
+  if (s1.phase === "pour" && !pour && near(cup1Pos, 70 * L.s)) return { kind: "cup1", pos: cup1Pos };
+  if (s2.phase === "move" && near(cup2Pos, 70 * L.s)) return { kind: "cup2", pos: cup2Pos };
+  return null;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const hit = hitTest(e);
+  if (!hit) return;
+  const [x, y] = px(hit.pos);
+  drag = { kind: hit.kind, pos: hit.pos, dx: x - e.clientX, dy: y - e.clientY };
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+  pop(700);
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  drag.pos.nx = Math.max(0.02, Math.min(0.98, (e.clientX + drag.dx) / W));
+  drag.pos.ny = Math.max(0.05, Math.min(0.95, (e.clientY + drag.dy) / H));
+});
+window.addEventListener("pointerup", () => {
+  if (!drag) return;
+  dropItem(drag.kind);
+  drag = null;
+});
+
+function dropItem(kind) {
+  const L = layout();
+  if (kind === "filter") {
+    const [fx, fy] = px(filterPos);
+    const [cx, cy] = px(cup1Pos);
+    if (Math.hypot(fx - cx, fy - (cy - L.cupH / 2)) < 80 * L.s) {
+      s1.phase = "pour";
+      pop(900);
+      showHint("罩好啦！现在把杯子拖到碗上倒一倒！");
+    } else {
+      filterPos.nx = L.filterHome.nx; filterPos.ny = L.filterHome.ny;
+    }
+  } else if (kind === "cup1") {
+    const [cx, cy] = px(cup1Pos);
+    const b = L.bowl1;
+    if (Math.hypot(cx - b.x, cy - (b.y - b.h)) < 130 * L.s) {
+      s1.phase = "pouring";
+      pour = { t: 0, fromNx: cup1Pos.nx, fromNy: cup1Pos.ny };
+      whoosh();
+    } else {
+      cup1Pos.nx = L.cup1Home.nx; cup1Pos.ny = L.cup1Home.ny;
+    }
+  } else if (kind === "cup2") {
+    const [cx, cy] = px(cup2Pos);
+    const p = L.pad2;
+    if (Math.abs(cx - p.x) < 80 * L.s && Math.abs(cy - (p.y - L.cupH / 2)) < 80 * L.s) {
+      cup2Pos.nx = L.cup2OnPad.nx; cup2Pos.ny = L.cup2OnPad.ny;
+      s2.phase = "heating";
+      heatT = 0;
+      showHint("加热啦！看，水慢慢变成水汽跑走了……");
+    } else {
+      cup2Pos.nx = L.cup2Home.nx; cup2Pos.ny = L.cup2Home.ny;
+    }
+  }
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const cling = () => { tone(1500 + Math.random() * 400, 0.09, 0.12, "square"); tone(2300, 0.06, 0.06, "square"); };
+const whoosh = () => tone(300, 0.35, 0.10, "triangle");
+const sizzle = () => tone(90 + Math.random() * 60, 0.08, 0.03, "sawtooth");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+function bigFanfare() {
+  [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => setTimeout(() => pop(f), i * 140));
+}
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2400);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { init(); pop(880); showHint("拖一拖工具，把三种混合物分开！"); });
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  step(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

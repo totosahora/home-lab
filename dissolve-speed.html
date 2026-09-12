@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>溶解快慢小实验</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#bfe8ff; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,80,0.82); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; max-width:94vw; overflow:hidden; text-overflow:ellipsis;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,80,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:94vw; overflow:hidden; text-overflow:ellipsis;
+  }
+  #resetBtn {
+    position:absolute; top:12px; right:12px; z-index:10;
+    font-size:18px; font-weight:bold; padding:10px 20px;
+    border-radius:24px; border:none; background:#ff8a65; color:#fff;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.25);
+  }
+  #resetBtn:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🧪 准备实验…</div>
+<button id="resetBtn">🔄 重置</button>
+<div id="hint">把方糖拖进水杯，比比哪杯溶得快！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 屏幕坐标直接布局：三只杯子 A/B/C 居中并排，托盘方糖在左下，压碎垫在右下
+let tSim = 0;          // 模拟时钟（秒），溶解计时用它
+let cups = [];         // {idx,name,label,x,y,w,h,cx,waterT,barY,btnRect, cube,progress,startT,done,doneTime,labelT,stirT,grains}
+let cubes = [];        // {id,x,y,homeX,homeY,size,crushed,inCup,gone,selected,badge}
+let pad = {};          // 压碎垫 {x,y,w,h}
+let drag = null;       // {cube, dx, dy, moved, overPad, pid}
+let droplets = [];     // 入水水花 {x,y,vx,vy,life}
+let stirAngle = 0;     // 搅拌旋涡角度
+let summarized = false;
+let firstDrop = false;
+
+function layout() {
+  const cw = Math.min(190, W * 0.26), ch = Math.min(280, H * 0.42);
+  const top = Math.max(122, H * 0.16);
+  const gap = (W - cw * 3) / 4;
+  for (const c of cups) {
+    c.x = gap + c.idx * (cw + gap); c.y = top; c.w = cw; c.h = ch;
+    c.cx = c.x + cw / 2;
+    c.waterT = c.y + ch * 0.24;
+    c.barY = c.y + ch + 12;
+    if (c.idx === 1) c.btnRect = { x: c.cx - cw * 0.45, y: c.barY + 28, w: cw * 0.9, h: 40 };
+    if (c.cube) placeCubeInCup(c);
+  }
+  const sz = Math.max(42, Math.min(56, W * 0.11));
+  cubes.forEach((cb, i) => {
+    cb.size = sz;
+    cb.homeX = W * 0.14 + i * W * 0.13;
+    cb.homeY = H - sz / 2 - 48;
+    if (cb.inCup < 0 && (!drag || drag.cube !== cb)) { cb.x = cb.homeX; cb.y = cb.homeY; }
+  });
+  pad = { x: W * 0.56, y: H - sz - 52, w: W * 0.4, h: sz + 36 };
+}
+
+function placeCubeInCup(c) {
+  c.cube.x = c.cx;
+  c.cube.y = c.y + c.h - 8 - c.cube.size * 0.45;
+}
+
+function resetGame() {
+  cups = [
+    { idx:0, name:"A", label:"冷水 🧊" },
+    { idx:1, name:"B", label:"搅拌 🥄" },
+    { idx:2, name:"C", label:"热水 ♨️" },
+  ].map(o => Object.assign(o, {
+    cube:null, progress:0, startT:0, done:false, doneTime:0, labelT:0, stirT:0, grains:[]
+  }));
+  cubes = [0, 1, 2].map(i => ({ id:i, x:0, y:0, homeX:0, homeY:0, size:50, crushed:false, inCup:-1, gone:false, selected:false, badge:null }));
+  droplets = []; drag = null; stirAngle = 0;
+  summarized = false; firstDrop = false;
+  layout();
+  showHint("把方糖 🍬 拖进水杯，比比哪杯溶得快！拖到 🔨 上可以先压碎哦");
+  lastScore = "";
+}
+
+/* ================= 溶解模拟 ================= */
+// 溶解速率（进度/秒）：冷水静置最慢，热水快，搅拌时最快；糖粉 ×1.8
+function rateOf(c) {
+  let r;
+  if (c.idx === 2) r = 0.09;                    // C 热水
+  else if (c.idx === 1 && c.stirT > 0) r = 0.13; // B 搅拌中
+  else r = 0.042;                                // A 冷水静置 / B 不搅
+  if (c.cube && c.cube.crushed) r *= 1.8;
+  return r;
+}
+
+function step(dt) {
+  tSim += dt;
+  stirAngle += dt * 2;
+  // 水花
+  for (const d of droplets) {
+    d.vy += 900 * dt;
+    d.x += d.vx * dt; d.y += d.vy * dt;
+    d.life -= dt;
+  }
+  droplets = droplets.filter(d => d.life > 0);
+  // 每杯
+  for (const c of cups) {
+    if (c.stirT > 0) c.stirT -= dt;
+    if (c.cube && !c.done) {
+      const before = c.progress;
+      c.progress = Math.min(1, c.progress + rateOf(c) * dt);
+      // 糖粒粒子：溶解多少就撒多少
+      let n = Math.round((c.progress - before) * 320);
+      while (n-- > 0) spawnGrain(c);
+      if (c.progress >= 1) {
+        c.done = true;
+        c.doneTime = tSim - c.startT;
+        c.labelT = 0;
+        pop(880); setTimeout(() => pop(1175), 130);
+        checkSummary();
+      }
+    }
+    if (c.done) c.labelT += dt;
+    // 糖粒扩散
+    const wcx = c.cx, wcy = (c.waterT + c.y + c.h) / 2;
+    for (const g of c.grains) {
+      g.vx += (Math.random() - 0.5) * 90 * dt;
+      g.vy += (Math.random() - 0.5) * 90 * dt;
+      g.x += g.vx * dt; g.y += g.vy * dt;
+      // 搅拌时绕杯心旋转，形成旋涡
+      if (c.idx === 1 && c.stirT > 0) {
+        const ang = dt * 4.5, dx = g.x - wcx, dy = g.y - wcy;
+        const cs = Math.cos(ang), sn = Math.sin(ang);
+        g.x = wcx + dx * cs - dy * sn;
+        g.y = wcy + dx * sn + dy * cs;
+      }
+      g.x = Math.max(c.x + 10, Math.min(c.x + c.w - 10, g.x));
+      g.y = Math.max(c.waterT + 6, Math.min(c.y + c.h - 10, g.y));
+      g.life -= dt;
+    }
+    c.grains = c.grains.filter(g => g.life > 0);
+    if (c.grains.length > 140) c.grains.splice(0, c.grains.length - 140);
+  }
+}
+
+function spawnGrain(c) {
+  const cb = c.cube;
+  const a = Math.random() * Math.PI * 2;
+  const rr = cb.size * 0.5 * (1 - c.progress * 0.7);
+  c.grains.push({
+    x: cb.x + Math.cos(a) * rr, y: cb.y + Math.sin(a) * rr,
+    vx: Math.cos(a) * (20 + Math.random() * 40),
+    vy: Math.sin(a) * (20 + Math.random() * 40),
+    life: 1.4 + Math.random() * 1.6
+  });
+}
+
+function checkSummary() {
+  if (summarized) return;
+  if (!cups.every(c => c.cube && c.done)) return;
+  summarized = true;
+  const fastest = cups.reduce((a, b) => (a.doneTime <= b.doneTime ? a : b));
+  showHint(`🏆 ${fastest.name} 杯最快（${Math.round(fastest.doneTime)} 秒）！热水和搅拌让糖溶得更快！`, true);
+  fanfare();
+}
+
+/* ================= 交互 ================= */
+function inRect(x, y, r) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+canvas.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  // B 杯搅拌按钮
+  const b = cups[1];
+  if (b.btnRect && inRect(x, y, b.btnRect)) { stir(); return; }
+  // 方糖的 ✕ 手柄（点选后出现，点 ✕ 收走方糖）
+  for (const cb of cubes) {
+    if (cb.gone || cb.inCup >= 0 || !cb.selected || !cb.badge) continue;
+    if (Math.hypot(x - cb.badge.x, y - cb.badge.y) < cb.badge.r + 8) {
+      cb.gone = true; cb.selected = false;
+      pop(300); showHint("方糖收走啦，点 🔄 重置可以拿回来");
+      lastScore = "";
+      return;
+    }
+  }
+  // 拖起托盘里的方糖
+  for (let i = cubes.length - 1; i >= 0; i--) {
+    const cb = cubes[i];
+    if (cb.gone || cb.inCup >= 0) continue;
+    if (Math.abs(x - cb.x) < cb.size * 0.75 && Math.abs(y - cb.y) < cb.size * 0.75) {
+      drag = { cube: cb, dx: x - cb.x, dy: y - cb.y, moved: false, overPad: false, pid: e.pointerId, sx: x, sy: y };
+      cubes.forEach(o => { o.selected = false; });
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
+  }
+  cubes.forEach(o => { o.selected = false; });
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!drag || e.pointerId !== drag.pid) return;
+  const cb = drag.cube;
+  cb.x = e.clientX - drag.dx; cb.y = e.clientY - drag.dy;
+  if (Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) > 8) drag.moved = true;
+  // 拖到压碎垫上：整块变糖粉
+  drag.overPad = inRect(cb.x, cb.y, pad);
+  if (drag.overPad && !cb.crushed) {
+    cb.crushed = true;
+    crunch();
+    showHint("压成糖粉啦！糖粉会溶得更快哦 ✨");
+  }
+});
+
+window.addEventListener("pointerup", e => {
+  if (!drag || e.pointerId !== drag.pid) return;
+  const cb = drag.cube;
+  let dropped = false;
+  for (const c of cups) {
+    if (c.cube) continue;   // 每杯限一块
+    if (cb.x > c.x - 20 && cb.x < c.x + c.w + 20 && cb.y > c.y - 40 && cb.y < c.y + c.h + 20) {
+      dropInto(c, cb);
+      dropped = true;
+      break;
+    }
+  }
+  if (!dropped) {
+    if (!drag.moved) cb.selected = !cb.selected;   // 轻点 = 选中，出现 ✕ 手柄
+    cb.x = cb.homeX; cb.y = cb.homeY;
+  }
+  drag = null;
+});
+
+function dropInto(c, cb) {
+  c.cube = cb; cb.inCup = c.idx; cb.selected = false;
+  placeCubeInCup(c);
+  c.progress = 0; c.startT = tSim; c.done = false; c.grains = [];
+  // 水花
+  for (let i = 0; i < 10; i++) {
+    droplets.push({
+      x: c.cx + (Math.random() - 0.5) * c.w * 0.5, y: c.waterT,
+      vx: (Math.random() - 0.5) * 160, vy: -120 - Math.random() * 160,
+      life: 0.5 + Math.random() * 0.3
+    });
+  }
+  plop();
+  if (!firstDrop) { firstDrop = true; hintEl.style.opacity = "0"; }
+  lastScore = "";
+}
+
+function stir() {
+  const b = cups[1];
+  b.stirT = 4;   // 搅 4 秒
+  pop(660);
+  showHint(b.cube && !b.done ? "搅拌中…糖溶得更快啦！🌀" : "先放一块糖到 B 杯，再搅拌试试！");
+}
+
+document.getElementById("resetBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function cupPath(c, inset) {
+  const x0 = c.x + inset, x1 = c.x + c.w - inset;
+  const yT = c.y + inset, yB = c.y + c.h - 5;
+  const nar = c.w * 0.05;   // 杯底略窄
+  ctx.beginPath();
+  ctx.moveTo(x0, yT);
+  ctx.lineTo(x0 + nar, yB);
+  ctx.lineTo(x1 - nar, yB);
+  ctx.lineTo(x1, yT);
+  ctx.closePath();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#bfe8ff"); g.addColorStop(1, "#e8f7ff");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 桌面
+  ctx.fillStyle = "#d9a86c";
+  ctx.fillRect(0, H - 130, W, 130);
+  ctx.fillStyle = "rgba(255,255,255,0.25)";
+  ctx.fillRect(0, H - 130, W, 6);
+}
+
+function drawPad() {
+  const hot = drag && drag.overPad;
+  ctx.save();
+  ctx.setLineDash([8, 6]);
+  ctx.fillStyle = hot ? "rgba(255,213,74,0.55)" : "rgba(255,255,255,0.45)";
+  ctx.strokeStyle = hot ? "#ff8f00" : "rgba(120,80,30,0.5)";
+  ctx.lineWidth = 3;
+  roundRect(pad.x, pad.y, pad.w, pad.h, 16, true);
+  roundRect(pad.x, pad.y, pad.w, pad.h, 16, false);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#5a3d00";
+  ctx.font = `bold ${Math.max(16, pad.h * 0.28)}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("🔨 压碎", pad.x + pad.w / 2, pad.y + pad.h / 2 - pad.h * 0.14);
+  ctx.font = `${Math.max(11, pad.h * 0.16)}px sans-serif`;
+  ctx.fillText("拖糖到这里变糖粉", pad.x + pad.w / 2, pad.y + pad.h / 2 + pad.h * 0.24);
+  ctx.restore();
+}
+
+function drawSugarCube(x, y, size, crushed, scale) {
+  const s = size * (scale || 1);
+  ctx.save();
+  ctx.translate(x, y);
+  if (crushed) {
+    // 糖粉：一小堆白点
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "rgba(150,150,180,0.5)"; ctx.lineWidth = 1;
+    const dots = [[-0.32,0.18],[-0.12,0.24],[0.1,0.2],[0.3,0.16],[-0.2,0.02],[0.02,0.04],[0.22,-0.02],[-0.05,-0.14],[0.14,-0.18],[-0.28,-0.08]];
+    for (const d of dots) {
+      ctx.beginPath();
+      ctx.arc(d[0] * s, d[1] * s * 0.8, s * 0.11, 0, 7);
+      ctx.fill(); ctx.stroke();
+    }
+  } else {
+    // 方糖：白色圆角方块 + 纹理格
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "rgba(150,150,180,0.6)"; ctx.lineWidth = 2;
+    roundRect(-s / 2, -s / 2, s, s, s * 0.18, true);
+    roundRect(-s / 2, -s / 2, s, s, s * 0.18, false);
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(180,180,210,0.5)"; ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(-s / 6, -s / 2 + 3); ctx.lineTo(-s / 6, s / 2 - 3);
+    ctx.moveTo(s / 6, -s / 2 + 3); ctx.lineTo(s / 6, s / 2 - 3);
+    ctx.moveTo(-s / 2 + 3, -s / 6); ctx.lineTo(s / 2 - 3, -s / 6);
+    ctx.moveTo(-s / 2 + 3, s / 6); ctx.lineTo(s / 2 - 3, s / 6);
+    ctx.stroke();
+    // 高光
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.beginPath(); ctx.arc(-s * 0.22, -s * 0.24, s * 0.1, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawCup(c) {
+  const cupColors = ["#64b5f6", "#ffb74d", "#ef5350"];
+  // 杯身背玻璃
+  ctx.fillStyle = "rgba(255,255,255,0.18)";
+  cupPath(c, 0); ctx.fill();
+
+  // ---- 杯内（裁剪） ----
+  ctx.save();
+  cupPath(c, 5);
+  ctx.clip();
+  // 水
+  const wg = ctx.createLinearGradient(0, c.waterT, 0, c.y + c.h);
+  if (c.idx === 2) { wg.addColorStop(0, "rgba(255,170,140,0.5)"); wg.addColorStop(1, "rgba(255,120,100,0.42)"); }
+  else { wg.addColorStop(0, "rgba(140,195,255,0.5)"); wg.addColorStop(1, "rgba(90,150,240,0.42)"); }
+  ctx.fillStyle = wg;
+  ctx.fillRect(c.x, c.waterT, c.w, c.y + c.h - c.waterT);
+  // 甜味晕开（把看不见的"甜"画出来）
+  if (c.progress > 0 || c.done) {
+    const p = c.done ? 1 : c.progress;
+    const hr = 14 + p * c.w * 0.62;
+    const hx = c.cube ? c.cube.x : c.cx, hy = c.cube ? c.cube.y : c.y + c.h - 20;
+    const hg = ctx.createRadialGradient(hx, hy, 2, hx, hy, hr);
+    hg.addColorStop(0, `rgba(255,215,90,${0.4 * p})`);
+    hg.addColorStop(1, "rgba(255,215,90,0)");
+    ctx.fillStyle = hg;
+    ctx.fillRect(c.x, c.waterT, c.w, c.y + c.h - c.waterT);
+  }
+  // 糖粒粒子
+  for (const g of c.grains) {
+    ctx.globalAlpha = Math.min(1, g.life) * 0.9;
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath(); ctx.arc(g.x, g.y, 2.4, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // 水中的糖块（越溶越小）
+  if (c.cube && !c.done) {
+    const p = c.progress;
+    ctx.globalAlpha = 1 - p * p * 0.6;
+    drawSugarCube(c.cube.x, c.cube.y, c.cube.size * (1 - p * 0.85), c.cube.crushed, 1);
+    ctx.globalAlpha = 1;
+  }
+  // A 杯浮冰
+  if (c.idx === 0) {
+    ctx.fillStyle = "rgba(230,245,255,0.85)";
+    ctx.strokeStyle = "rgba(150,190,230,0.8)"; ctx.lineWidth = 1.5;
+    const bob = Math.sin(tSim * 1.6) * 2;
+    roundRect(c.cx - c.w * 0.28, c.waterT - 6 + bob, 24, 14, 4, true); ctx.stroke();
+    roundRect(c.cx + c.w * 0.08, c.waterT - 5 - bob, 20, 12, 4, true); ctx.stroke();
+  }
+  // B 杯搅拌棒 + 旋涡
+  if (c.idx === 1) {
+    if (c.stirT > 0) {
+      ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 3;
+      for (let k = 0; k < 3; k++) {
+        const rr = c.w * (0.18 + k * 0.12);
+        const a0 = stirAngle * 2 + k * 2.1;
+        ctx.beginPath();
+        ctx.ellipse(c.cx, (c.waterT + c.y + c.h) / 2, rr, rr * 0.42, 0, a0, a0 + 2.4);
+        ctx.stroke();
+      }
+    }
+    const sw = c.stirT > 0 ? Math.sin(stirAngle * 6) * c.w * 0.1 : 0;
+    ctx.strokeStyle = "#8d6e63"; ctx.lineWidth = 6; ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(c.cx + c.w * 0.22 + sw, c.y - 14);
+    ctx.lineTo(c.cx - c.w * 0.05 + sw * 0.4, c.y + c.h - 24);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // 水面线
+  ctx.strokeStyle = "rgba(255,255,255,0.75)"; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(c.x + 5, c.waterT); ctx.lineTo(c.x + c.w - 5, c.waterT);
+  ctx.stroke();
+  // 杯身边框 + 高光
+  ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 3;
+  cupPath(c, 0); ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,0.45)"; ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(c.x + 12, c.y + 16); ctx.lineTo(c.x + 15, c.y + c.h - 30);
+  ctx.stroke();
+  // C 杯热气
+  if (c.idx === 2) {
+    ctx.strokeStyle = "rgba(150,160,180,0.65)"; ctx.lineWidth = 3; ctx.lineCap = "round";
+    for (let i = -1; i <= 1; i++) {
+      const sx = c.cx + i * c.w * 0.2;
+      ctx.beginPath();
+      for (let yy = 0; yy <= 58; yy += 4) {
+        const xx = sx + Math.sin(tSim * 2.4 + i * 2 + yy * 0.12) * 6;
+        if (yy === 0) ctx.moveTo(xx, c.waterT - 4 - yy);
+        else ctx.lineTo(xx, c.waterT - 4 - yy);
+      }
+      ctx.stroke();
+    }
+  }
+  // 杯名标签
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  roundRect(c.cx - c.w * 0.42, c.y + 8, c.w * 0.84, 24, 12, true);
+  ctx.fillStyle = "#37474f";
+  ctx.font = "bold 14px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(`${c.name} · ${c.label}`, c.cx, c.y + 21);
+
+  // 进度条（杯下方，状态文字画在条内）
+  const bw = c.w, bh = 16;
+  ctx.fillStyle = "rgba(0,0,0,0.25)";
+  roundRect(c.x, c.barY, bw, bh, 8, true);
+  if (c.cube) {
+    ctx.fillStyle = cupColors[c.idx];
+    const p = c.done ? 1 : c.progress;
+    if (p > 0.02) roundRect(c.x + 2, c.barY + 2, (bw - 4) * p, bh - 4, 6, true);
+  }
+  let st = "等待方糖";
+  if (c.cube) {
+    st = c.done ? `✅ ${Math.round(c.doneTime)} 秒`
+         : `${Math.floor(c.progress * 100)}% · ${(tSim - c.startT).toFixed(0)} 秒`;
+  }
+  ctx.font = "bold 11px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.lineWidth = 3; ctx.strokeStyle = "rgba(0,0,0,0.35)";
+  ctx.strokeText(st, c.cx, c.barY + bh / 2 + 1);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(st, c.cx, c.barY + bh / 2 + 1);
+
+  // 完成标签（弹跳出现）
+  if (c.done) {
+    const t = Math.min(1, c.labelT / 0.45);
+    const s = 1 + 2.7 * t - 3.4 * t * t + 1.7 * t * t * t;  // easeOutBack 近似
+    ctx.save();
+    ctx.translate(c.cx, c.y - 34);
+    ctx.scale(s, s);
+    ctx.font = "bold 15px sans-serif";
+    const msg = `✅ 溶完啦！用时 ${Math.round(c.doneTime)} 秒`;
+    const tw = ctx.measureText(msg).width;
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
+    roundRect(-tw / 2 - 12, -15, tw + 24, 30, 15, true);
+    ctx.strokeStyle = "#66bb6a"; ctx.lineWidth = 2;
+    roundRect(-tw / 2 - 12, -15, tw + 24, 30, 15, false); ctx.stroke();
+    ctx.fillStyle = "#2e7d32";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(msg, 0, 1);
+    ctx.restore();
+  }
+
+  // B 杯搅拌按钮
+  if (c.btnRect) {
+    const r = c.btnRect, on = c.stirT > 0;
+    ctx.fillStyle = on ? "#ffd54a" : "#ffffff";
+    ctx.strokeStyle = on ? "#ff8f00" : "rgba(0,0,0,0.25)"; ctx.lineWidth = 2.5;
+    roundRect(r.x, r.y, r.w, r.h, 20, true);
+    roundRect(r.x, r.y, r.w, r.h, 20, false); ctx.stroke();
+    ctx.fillStyle = "#5a3d00";
+    ctx.font = "bold 17px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(on ? "🌀 搅拌中…" : "🥄 搅拌", r.x + r.w / 2, r.y + r.h / 2 + 1);
+  }
+}
+
+function drawTrayCubes() {
+  for (const cb of cubes) {
+    if (cb.gone || cb.inCup >= 0 || (drag && drag.cube === cb)) continue;
+    drawSugarCube(cb.x, cb.y, cb.size, cb.crushed, 1);
+    // 选中手柄：红色 ✕
+    if (cb.selected) {
+      const bx = cb.x + cb.size * 0.55, by = cb.y - cb.size * 0.55, br = 13;
+      cb.badge = { x: bx, y: by, r: br };
+      ctx.fillStyle = "#ef5350";
+      ctx.beginPath(); ctx.arc(bx, by, br, 0, 7); ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(bx - 5, by - 5); ctx.lineTo(bx + 5, by + 5);
+      ctx.moveTo(bx + 5, by - 5); ctx.lineTo(bx - 5, by + 5);
+      ctx.stroke();
+    } else cb.badge = null;
+  }
+}
+
+function drawDrag() {
+  if (!drag) return;
+  const cb = drag.cube;
+  ctx.save();
+  ctx.shadowColor = "rgba(0,0,0,0.35)"; ctx.shadowBlur = 12; ctx.shadowOffsetY = 5;
+  drawSugarCube(cb.x, cb.y, cb.size, cb.crushed, 1.18);
+  ctx.restore();
+}
+
+function drawDroplets() {
+  ctx.fillStyle = "rgba(180,220,255,0.9)";
+  for (const d of droplets) {
+    ctx.globalAlpha = Math.min(1, d.life * 2);
+    ctx.beginPath(); ctx.arc(d.x, d.y, 3, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawPad();
+  for (const c of cups) drawCup(c);
+  drawTrayCubes();
+  drawDroplets();
+  drawDrag();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+let lastScore = "";
+function cupStatus(c) {
+  if (!c.cube) return "--";
+  if (c.done) return `✅${Math.round(c.doneTime)}秒`;
+  return `${Math.floor(c.progress * 100)}%`;
+}
+function updateScore() {
+  const s = `🧪 A杯 ${cupStatus(cups[0])} · B杯 ${cupStatus(cups[1])} · C杯 ${cupStatus(cups[2])}`;
+  if (s !== lastScore) { lastScore = s; scorebar.textContent = s; }
+}
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  step(dt);
+  draw();
+  updateScore();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const plop = () => { tone(320, 0.12, 0.16); setTimeout(() => tone(180, 0.18, 0.14), 60); };
+const crunch = () => { tone(1600, 0.05, 0.12, "square"); setTimeout(() => tone(1100, 0.06, 0.1, "square"), 70); };
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text, sticky) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  if (!sticky) hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+
+/* ================= 测试钩子 ================= */
+window.__ds = {
+  get cups() { return cups; },
+  get cubes() { return cubes; },
+  get pad() { return pad; },
+  step,
+  dropInto,
+  stir,
+  crush(cb) { cb.crushed = true; },
+  tSim() { return tSim; }
+};
+
+/* ================= 启动 ================= */
+resetGame();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

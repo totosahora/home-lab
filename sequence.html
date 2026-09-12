@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>数列规律侦探</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#1d2b45; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,18,36,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,18,36,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:space-between; flex-direction:column;
+    padding:6vh 0; background:rgba(10,16,32,0.3);
+  }
+  #winPanel .msg {
+    font-size:38px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.7); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#4a3200;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">第 1 / 10 题</div>
+<div id="hint">从下面 4 张卡片里找出规律，拖正确的数字到 ? 的位置！</div>
+<div id="winPanel">
+  <div class="msg">🎉 十题全部完成！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+let hintTimer = null;   // 提示条自动隐藏定时器
+let summaryT = 0;       // 总结墙入场动画起始时刻
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 题目数据 ================= */
+// 每题：seq=已知项，answer=缺失项，options=4 个选项（含答案，加载时打乱）
+// arrows：答对后逐个跳出的规律箭头 {f=起点卡, t=终点卡, l=标签, c=颜色}
+const ARROW_GOLD = "#ffd54a", ARROW_BLUE = "#6ec6ff";
+const QUESTIONS = [
+  { seq:[3,6,9,12], answer:15, options:[15,13,16,18],
+    name:"等差数列", desc:"每次都 +3",
+    tip:"小提示：看看相邻两个数相差多少～",
+    arrows:[{f:0,t:1,l:"+3"},{f:1,t:2,l:"+3"},{f:2,t:3,l:"+3"},{f:3,t:4,l:"+3"}] },
+  { seq:[50,43,36,29], answer:22, options:[22,21,23,26],
+    name:"等差数列", desc:"每次都 −7",
+    tip:"小提示：看看相邻两个数相差多少（这次在变小哦）～",
+    arrows:[{f:0,t:1,l:"−7"},{f:1,t:2,l:"−7"},{f:2,t:3,l:"−7"},{f:3,t:4,l:"−7"}] },
+  { seq:[2,4,8,16], answer:32, options:[32,24,20,48],
+    name:"等比数列", desc:"每次都 ×2",
+    tip:"小提示：看看后一个数是前一个数的几倍～",
+    arrows:[{f:0,t:1,l:"×2"},{f:1,t:2,l:"×2"},{f:2,t:3,l:"×2"},{f:3,t:4,l:"×2"}] },
+  { seq:[3,9,27,81], answer:243, options:[243,162,108,84],
+    name:"等比数列", desc:"每次都 ×3",
+    tip:"小提示：看看后一个数是前一个数的几倍～",
+    arrows:[{f:0,t:1,l:"×3"},{f:1,t:2,l:"×3"},{f:2,t:3,l:"×3"},{f:3,t:4,l:"×3"}] },
+  { seq:[1,3,6,10], answer:15, options:[15,14,16,12],
+    name:"三角形数", desc:"依次 +2、+3、+4、+5",
+    tip:"小提示：相邻的差在慢慢变大：+2、+3、+4……",
+    arrows:[{f:0,t:1,l:"+2"},{f:1,t:2,l:"+3"},{f:2,t:3,l:"+4"},{f:3,t:4,l:"+5"}] },
+  { seq:[1,4,9,16], answer:25, options:[25,20,24,32],
+    name:"平方数", desc:"1²、2²、3²、4²、5²",
+    tip:"小提示：1=1×1，4=2×2，9=3×3，下一个呢？",
+    arrows:[{f:0,t:1,l:"+3"},{f:1,t:2,l:"+5"},{f:2,t:3,l:"+7"},{f:3,t:4,l:"+9"}] },
+  { seq:[2,3,5,8,12], answer:17, options:[17,16,15,18],
+    name:"差在增长", desc:"差依次 +1、+2、+3…",
+    tip:"小提示：先算相邻的差，差本身也有规律～",
+    arrows:[{f:0,t:1,l:"+1"},{f:1,t:2,l:"+2"},{f:2,t:3,l:"+3"},{f:3,t:4,l:"+4"},{f:4,t:5,l:"+5"}] },
+  { seq:[1,1,2,3,5], answer:8, options:[8,7,6,9],
+    name:"斐波那契数列", desc:"前两个相加得下一个",
+    tip:"小提示：从第 3 个数起，每个数 = 前两个数之和～",
+    arrows:[{f:0,t:2,l:"1+1"},{f:1,t:3,l:"1+2"},{f:2,t:4,l:"2+3"},{f:3,t:5,l:"3+5"}] },
+  { seq:[1,20,3,17,5], answer:14, options:[14,8,13,7],
+    name:"间隔数列", desc:"隔着看：一排 +2，一排 −3",
+    tip:"小提示：隔一个数看一看：1、3、5 是一排，20、17、? 是另一排～",
+    arrows:[{f:0,t:2,l:"+2",c:ARROW_GOLD},{f:2,t:4,l:"+2",c:ARROW_GOLD},
+            {f:1,t:3,l:"−3",c:ARROW_BLUE},{f:3,t:5,l:"−3",c:ARROW_BLUE}] },
+  { seq:[1,2,6,24], answer:120, options:[120,48,96,72],
+    name:"乘数递增", desc:"依次 ×2、×3、×4、×5",
+    tip:"小提示：看看每次乘的数怎么变化：×2、×3、×4……",
+    arrows:[{f:0,t:1,l:"×2"},{f:1,t:2,l:"×3"},{f:2,t:3,l:"×4"},{f:3,t:4,l:"×5"}] },
+];
+const TOTAL_Q = QUESTIONS.length;
+
+/* ================= 游戏状态 ================= */
+let qIdx = 0;             // 当前题号
+let state = "play";       // play | reveal | done
+let combo = 0;            // 连击数
+let appearT = 0;          // 本题卡片入场时刻
+let revealT = 0;          // 揭示动画开始时刻
+let slotShakeT = -9999;   // ? 槽抖动时刻
+let optCards = [];        // {val, homeX, homeY, x, y, dragging, back}
+let drag = null;          // 正在拖的卡
+let particles = [];       // 星星粒子
+
+function curQ() { return QUESTIONS[qIdx]; }
+function fullSeq() { return curQ().seq.concat([curQ().answer]); }
+
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function loadQuestion(i) {
+  qIdx = i;
+  state = "play";
+  appearT = performance.now();
+  drag = null;
+  optCards = shuffle(curQ().options.slice()).map(v => ({
+    val:v, homeX:0, homeY:0, x:0, y:0, dragging:false, back:null
+  }));
+  updateScore();
+}
+
+function updateScore() {
+  scorebar.textContent = `第 ${Math.min(qIdx + 1, TOTAL_Q)} / ${TOTAL_Q} 题 · 🔥 连击 x${combo}`;
+}
+
+function resetGame() {
+  combo = 0;
+  particles = [];
+  winPanel.style.display = "none";
+  loadQuestion(0);
+  showHint("从下面 4 张卡片里找出规律，拖正确的数字到 ? 的位置！");
+}
+resetGame();
+
+/* ================= 布局 ================= */
+// 序列卡片排在上方，选项卡片排在下方，全部按窗口宽度自适应
+function seqLayout() {
+  const n = fullSeq().length;
+  let cw = 104, gap = 22;
+  const total = n * cw + (n - 1) * gap;
+  const maxW = Math.min(W * 0.92, 860);
+  if (total > maxW) { const s = maxW / total; cw *= s; gap *= s; }
+  const ch = cw * 1.28;
+  const x0 = (W - (n * cw + (n - 1) * gap)) / 2;
+  const y = Math.max(H * 0.30, 150) - ch / 2;
+  const cards = [];
+  for (let i = 0; i < n; i++) cards.push({ x:x0 + i * (cw + gap), y, w:cw, h:ch });
+  return cards;
+}
+function optLayout() {
+  const cw = Math.min(128, (W - 60 - 3 * 26) / 4), ch = cw * 0.82, gap = 26;
+  const total = 4 * cw + 3 * gap;
+  const x0 = (W - total) / 2;
+  const y = H * 0.74;
+  for (let i = 0; i < 4; i++) {
+    const c = optCards[i];
+    c.homeX = x0 + i * (cw + gap); c.homeY = y; c.w = cw; c.h = ch;
+    if (!c.dragging && !c.back) { c.x = c.homeX; c.y = c.homeY; }
+  }
+}
+
+/* ================= 拖拽交互 ================= */
+canvas.addEventListener("pointerdown", e => {
+  if (state !== "play" || winPanel.style.display !== "none") return;
+  optLayout();
+  const mx = e.clientX, my = e.clientY;
+  // 从最上面的卡开始找（后画的在上）
+  for (let i = optCards.length - 1; i >= 0; i--) {
+    const c = optCards[i];
+    if (mx >= c.x && mx <= c.x + c.w && my >= c.y && my <= c.y + c.h) {
+      c.dragging = true; c.back = null;
+      drag = { card:c, dx:mx - c.x, dy:my - c.y };
+      // 把拖的卡挪到数组末尾，保证画在最上层
+      optCards.splice(i, 1); optCards.push(c);
+      canvas.setPointerCapture(e.pointerId);
+      pop(600);
+      hintEl.style.opacity = "0";
+      break;
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  drag.card.x = e.clientX - drag.dx;
+  drag.card.y = e.clientY - drag.dy;
+});
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  const c = drag.card;
+  c.dragging = false;
+  const slot = seqLayout()[fullSeq().length - 1];   // ? 槽
+  const cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+  const over = cx >= slot.x - 30 && cx <= slot.x + slot.w + 30 &&
+               cy >= slot.y - 40 && cy <= slot.y + slot.h + 40;
+  if (over) {
+    if (c.val === curQ().answer) onCorrect(slot);
+    else onWrong(c);
+  } else {
+    sendBack(c);
+  }
+  drag = null;
+});
+
+function sendBack(c) {
+  c.back = { fx:c.x, fy:c.y, t0:performance.now() };
+}
+
+function onCorrect(slot) {
+  state = "reveal";
+  revealT = performance.now();
+  combo++;
+  updateScore();
+  starBurst(slot.x + slot.w / 2, slot.y + slot.h / 2, 10 + Math.min(combo, 5) * 3);
+  // 连击越高音越高
+  [523, 659, 784].forEach((f, i) => setTimeout(() => pop(f + Math.min(combo, 6) * 40), i * 90));
+  showHint(`✨ 答对啦！${curQ().name}：${curQ().desc}`);
+}
+
+function onWrong(c) {
+  combo = 0;
+  updateScore();
+  slotShakeT = performance.now();
+  sendBack(c);
+  tone(220, 0.2, 0.08, "triangle");
+  showHint("🤔 " + curQ().tip);
+}
+
+/* ================= 动画步进 ================= */
+function easeOutBack(t) {
+  const c1 = 1.70158, c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+}
+function update() {
+  const now = performance.now();
+  // 选项卡弹回
+  for (const c of optCards) {
+    if (c.back) {
+      const p = Math.min(1, (now - c.back.t0) / 220);
+      const e = 1 - Math.pow(1 - p, 3);
+      c.x = c.back.fx + (c.homeX - c.back.fx) * e;
+      c.y = c.back.fy + (c.homeY - c.back.fy) * e;
+      if (p >= 1) c.back = null;
+    }
+  }
+  // 星星粒子
+  for (const p of particles) {
+    p.x += p.vx * 0.016; p.y += p.vy * 0.016;
+    p.vy += 240 * 0.016; p.rot += p.vr * 0.016;
+    p.life -= 0.016;
+  }
+  particles = particles.filter(p => p.life > 0);
+  // 揭示动画放完 → 下一题 / 总结
+  if (state === "reveal") {
+    const doneT = revealT + curQ().arrows.length * 280 + 1500;
+    if (now >= doneT) {
+      if (qIdx + 1 < TOTAL_Q) loadQuestion(qIdx + 1);
+      else finishGame();
+    }
+  }
+}
+function starBurst(x, y, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 260;
+    particles.push({
+      x, y, vx:Math.cos(a) * sp, vy:Math.sin(a) * sp - 140,
+      rot:Math.random() * 6.3, vr:(Math.random() - 0.5) * 8,
+      size:5 + Math.random() * 7, life:0.9 + Math.random() * 0.5,
+      color:["#ffd54a", "#fff3c4", "#ffab40", "#6ec6ff"][i % 4]
+    });
+  }
+}
+function finishGame() {
+  state = "done";
+  winPanel.querySelector(".msg").innerHTML = "🎉 十题全部完成！你是数列侦探！";
+  winPanel.style.display = "flex";
+  fanfare();
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#24365c"); g.addColorStop(1, "#16223c");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 背景小星星点缀
+  ctx.fillStyle = "rgba(255,255,255,0.10)";
+  for (let i = 0; i < 24; i++) {
+    const sx = (i * 397) % W, sy = (i * 233) % H;
+    ctx.beginPath(); ctx.arc(sx, sy, 2 + (i % 3), 0, 7); ctx.fill();
+  }
+}
+
+// 数字卡片：scale 用于入场弹跳；gold=答对高亮
+function drawNumCard(x, y, w, h, text, scale, gold, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+  ctx.translate(x + w / 2, y + h / 2);
+  ctx.scale(scale, scale);
+  const g = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+  if (gold) { g.addColorStop(0, "#ffe082"); g.addColorStop(1, "#ffb300"); }
+  else { g.addColorStop(0, "#ffffff"); g.addColorStop(1, "#dce6f5"); }
+  ctx.shadowColor = "rgba(0,0,0,0.35)"; ctx.shadowBlur = 10; ctx.shadowOffsetY = 4;
+  ctx.fillStyle = g;
+  roundRect(-w / 2, -h / 2, w, h, 14, true);
+  ctx.shadowColor = "transparent";
+  ctx.strokeStyle = gold ? "#ff8f00" : "rgba(60,90,140,0.5)";
+  ctx.lineWidth = 3;
+  roundRect(-w / 2, -h / 2, w, h, 14, false); ctx.stroke();
+  // 数字自适应大小
+  let fs = Math.min(h * 0.44, w * 0.5);
+  ctx.font = `bold ${fs}px sans-serif`;
+  while (ctx.measureText(text).width > w * 0.8 && fs > 12) {
+    fs -= 2; ctx.font = `bold ${fs}px sans-serif`;
+  }
+  ctx.fillStyle = gold ? "#5a3d00" : "#20365c";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(text, 0, 2);
+  ctx.restore();
+}
+
+function drawSequence() {
+  const cards = seqLayout();
+  const seq = curQ().seq;
+  const now = performance.now();
+  const slot = cards[cards.length - 1];
+  for (let i = 0; i < cards.length; i++) {
+    const c = cards[i];
+    const isSlot = i === cards.length - 1;
+    // 入场弹跳
+    const ap = Math.max(0, Math.min(1, (now - appearT - i * 90) / 300));
+    const sc = ap <= 0 ? 0.001 : easeOutBack(ap);
+    if (isSlot && state !== "reveal" && state !== "done") {
+      // ? 空槽：虚线框 + 呼吸脉动
+      const shake = Math.max(0, 1 - (now - slotShakeT) / 400);
+      const ox = shake > 0 ? Math.sin(now / 24) * 8 * shake : 0;
+      ctx.save();
+      ctx.translate(c.x + ox, c.y);
+      ctx.setLineDash([10, 8]);
+      ctx.strokeStyle = drag ? "#ffd54a" : "rgba(255,255,255,0.6)";
+      ctx.lineWidth = 3;
+      roundRect(0, 0, c.w, c.h, 14, false); ctx.stroke();
+      ctx.setLineDash([]);
+      const pulse = 1 + 0.05 * Math.sin(now / 260);
+      ctx.font = `bold ${c.h * 0.42 * pulse}px sans-serif`;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillStyle = drag ? "#ffd54a" : "rgba(255,255,255,0.75)";
+      ctx.fillText("?", c.w / 2, c.h / 2 + 2);
+      ctx.restore();
+    } else if (isSlot) {
+      // 答对后：答案卡金色落位
+      drawNumCard(c.x, c.y, c.w, c.h, String(curQ().answer), 1, true);
+    } else {
+      drawNumCard(c.x, c.y, c.w, c.h, String(seq[i]), sc, false);
+    }
+  }
+  if (state === "reveal") drawArrows(cards, now);
+  // 连击星星提示
+  if (combo >= 2 && state !== "done") {
+    ctx.save();
+    const bob = Math.sin(now / 200) * 4;
+    ctx.font = "bold 22px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = "#ffd54a";
+    ctx.shadowColor = "rgba(0,0,0,0.5)"; ctx.shadowBlur = 6;
+    ctx.fillText(`🔥 连击 x${combo}`, slot.x + slot.w / 2, slot.y - 96 + bob);
+    ctx.restore();
+  }
+}
+
+// 规律箭头逐个跳出：相邻项画直箭头，隔项画弧线跳过中间卡
+function drawArrows(cards, now) {
+  const arrows = curQ().arrows;
+  const top = cards[0].y;
+  for (let i = 0; i < arrows.length; i++) {
+    const a = arrows[i];
+    const t0 = revealT + i * 280;
+    const p = (now - t0) / 300;
+    if (p <= 0) continue;
+    const sc = easeOutBack(Math.min(1, p));
+    const x0 = cards[a.f].x + cards[a.f].w / 2;
+    const x1 = cards[a.t].x + cards[a.t].w / 2;
+    const color = a.c || ARROW_GOLD;
+    const skip = a.t - a.f > 1;
+    const cy = skip ? top - 78 : top - 30;
+    const midX = (x0 + x1) / 2;
+    const labelX = skip ? midX : midX;
+    const labelY = skip ? (top - 8 + 2 * cy + top - 8) / 4 - 14 : cy - 18;
+    ctx.save();
+    ctx.translate(labelX, skip ? cy + 30 : cy);
+    ctx.scale(sc, sc);
+    ctx.translate(-labelX, skip ? -(cy + 30) : -cy);
+    // 箭身
+    ctx.strokeStyle = color; ctx.lineWidth = 4;
+    ctx.beginPath();
+    if (skip) {
+      ctx.moveTo(x0, top - 8);
+      ctx.quadraticCurveTo(midX, cy, x1, top - 8);
+    } else {
+      ctx.moveTo(x0 + 12, cy);
+      ctx.lineTo(x1 - 12, cy);
+    }
+    ctx.stroke();
+    // 箭头
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    if (skip) {
+      // 沿二次贝塞尔末端切线方向
+      const tx = x1 - midX, ty = (top - 8) - cy;
+      const L = Math.hypot(tx, ty) || 1;
+      const ux = tx / L, uy = ty / L;
+      const px = x1, py = top - 8;
+      ctx.moveTo(px, py);
+      ctx.lineTo(px - ux * 14 - uy * 7, py - uy * 14 + ux * 7);
+      ctx.lineTo(px - ux * 14 + uy * 7, py - uy * 14 - ux * 7);
+    } else {
+      ctx.moveTo(x1 - 4, cy);
+      ctx.lineTo(x1 - 18, cy - 8);
+      ctx.lineTo(x1 - 18, cy + 8);
+    }
+    ctx.closePath(); ctx.fill();
+    // 标签
+    ctx.font = "bold 19px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = color;
+    ctx.shadowColor = "rgba(0,0,0,0.6)"; ctx.shadowBlur = 4;
+    ctx.fillText(a.l, labelX, labelY);
+    ctx.restore();
+  }
+}
+
+function drawOptions() {
+  optLayout();
+  const now = performance.now();
+  for (const c of optCards) {
+    if (state === "reveal" || state === "done") continue;   // 答对后选项退场
+    if (c.dragging) {
+      // 原位留下虚影
+      ctx.save();
+      ctx.globalAlpha = 0.25;
+      drawNumCard(c.homeX, c.homeY, c.w, c.h, String(c.val), 1, false, 0.25);
+      ctx.restore();
+      drawNumCard(c.x, c.y, c.w, c.h, String(c.val), 1.08, false);
+    } else {
+      const ap = Math.max(0, Math.min(1, (now - appearT - 500) / 300));
+      const sc = ap <= 0 ? 0.001 : easeOutBack(ap);
+      drawNumCard(c.x, c.y, c.w, c.h, String(c.val), sc, false);
+    }
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.globalAlpha = Math.min(1, p.life * 1.6);
+    ctx.fillStyle = p.color;
+    // 五角星
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const r = i % 2 === 0 ? p.size : p.size * 0.45;
+      const a = i * Math.PI / 5 - Math.PI / 2;
+      if (i === 0) ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+      else ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+}
+
+// 结尾总结：十类规律卡片墙
+function drawSummaryWall() {
+  const cols = 5, rows = 2;
+  const cw = Math.min(224, (W - 80) / cols - 14), ch = 148;
+  const gw = cols * cw + (cols - 1) * 14, gh = rows * ch + (rows - 1) * 14;
+  const x0 = (W - gw) / 2, y0 = Math.max(H * 0.17, (H - gh) / 2);
+  const now = performance.now();
+  for (let i = 0; i < TOTAL_Q; i++) {
+    const q = QUESTIONS[i];
+    const r = Math.floor(i / cols), cIdx = i % cols;
+    const x = x0 + cIdx * (cw + 14), y = y0 + r * (ch + 14);
+    const ap = Math.max(0, Math.min(1, (now - summaryT - i * 110) / 320));
+    if (ap <= 0) continue;
+    const sc = easeOutBack(ap);
+    ctx.save();
+    ctx.translate(x + cw / 2, y + ch / 2);
+    ctx.scale(sc, sc);
+    ctx.translate(-cw / 2, -ch / 2);
+    ctx.shadowColor = "rgba(0,0,0,0.4)"; ctx.shadowBlur = 8; ctx.shadowOffsetY = 3;
+    ctx.fillStyle = "rgba(255,255,255,0.94)";
+    roundRect(0, 0, cw, ch, 12, true);
+    ctx.shadowColor = "transparent";
+    // 顶部色条
+    ctx.fillStyle = ["#ef5350","#ab47bc","#5c6bc0","#29b6f6","#26a69a","#9ccc65","#ffca28","#ffa726","#8d6e63","#78909c"][i];
+    roundRect(0, 0, cw, 26, 12, true);
+    ctx.fillRect(0, 14, cw, 12);
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 16px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(q.name, cw / 2, 13);
+    // 小序列
+    ctx.fillStyle = "#20365c";
+    let fs = 19;
+    const sText = q.seq.concat([q.answer]).join(", ");
+    ctx.font = `bold ${fs}px sans-serif`;
+    while (ctx.measureText(sText).width > cw - 16 && fs > 11) {
+      fs--; ctx.font = `bold ${fs}px sans-serif`;
+    }
+    ctx.fillText(sText, cw / 2, 62);
+    // 规律
+    ctx.fillStyle = "#607d8b";
+    ctx.font = "14px sans-serif";
+    ctx.fillText(q.desc, cw / 2, 100);
+    ctx.fillStyle = "#ffd54a";
+    ctx.font = "18px sans-serif";
+    ctx.fillText("⭐", cw / 2, 126);
+    ctx.restore();
+  }
+}
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  if (state === "done") {
+    drawSummaryWall();
+    drawParticles();
+    return;
+  }
+  drawSequence();
+  drawOptions();
+  drawParticles();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  void dt;
+  update();
+  if (state === "done" && summaryT === 0) summaryT = now;
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { summaryT = 0; resetGame(); pop(880); });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

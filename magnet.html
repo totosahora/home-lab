@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>磁铁吸什么</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#274a6b; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #hint {
+    position:absolute; top:14px; left:50%; transform:translateX(-50%);
+    background:rgba(15,30,45,0.8); color:#fff; padding:10px 22px;
+    border-radius:24px; font-size:16px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="hint">拖着磁铁走一走，看看它会吸住谁？</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  // 窗口变化时把物品和磁铁限制在舞台内
+  for (const it of items) {
+    it.x = Math.max(IT_R + 6, Math.min(W - IT_R - 6, it.x));
+    it.y = Math.max(IT_R + 60, Math.min(H - IT_R - 10, it.y));
+  }
+  magnet.x = Math.max(MAG_R + 30, Math.min(W - MAG_R - 30, magnet.x));
+  magnet.y = Math.max(MAG_R + 90, Math.min(H - MAG_R - 40, magnet.y));
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 物品：iron=true 表示铁做的，会被磁铁吸住
+const IT_R = 30;           // 物品点击半径
+const ITEM_DEFS = [
+  { emoji:"📎", name:"回形针", iron:true  },
+  { emoji:"🔑", name:"钥匙",   iron:true  },
+  { emoji:"🪙", name:"铁币",   iron:true  },
+  { emoji:"🔩", name:"螺丝",   iron:true  },
+  { emoji:"📄", name:"纸",     iron:false },
+  { emoji:"🪵", name:"木块",   iron:false },
+  { emoji:"🍎", name:"苹果",   iron:false },
+  { emoji:"🦆", name:"橡皮鸭", iron:false },
+  { emoji:"🧴", name:"塑料瓶", iron:false },
+  { emoji:"🍬", name:"糖",     iron:false }
+];
+// state: free(散落) | fly(正飞向磁铁) | stuck(吸住了)
+let items = ITEM_DEFS.map(d => ({
+  ...d, x:0, y:0, state:"free",
+  shake:0,                 // 感应抖动相位
+  flyT:0, fx:0, fy:0,      // 飞行进度与起点
+  rot:(Math.random() - 0.5) * 0.5
+}));
+
+const MAG_R = 62;          // 磁铁圆弧半径（到笔画中线）
+const MAG_W = 34;          // 磁铁笔画粗细
+const MAG_LEG = 48;        // 磁极腿长度
+const magnet = { x:0, y:0 };
+const MAX_STUCK = 5;       // 最多吸住 5 个
+
+const SENSE_D = 120;       // <120px 开始抖动（感应）
+const SNAP_D  = 70;        // <70px 啪地吸上去
+let particles = [];        // 吸住时的小星星 {x,y,t}
+
+function stuckItems() { return items.filter(it => it.state === "stuck"); }
+
+// 吸住物品的挂点：沿磁铁底部外弧均匀排开
+function slotPos(i, n) {
+  const a = n === 1 ? Math.PI / 2
+    : Math.PI * (0.82 - 0.64 * (i / (n - 1)));   // 148° ~ 32°（屏幕下方）
+  const r = MAG_R + MAG_W / 2 + 16;
+  return [magnet.x + Math.cos(a) * r, magnet.y + Math.sin(a) * r];
+}
+
+function scatter() {
+  magnet.x = W / 2; magnet.y = H / 2 + 30;
+  for (const it of items) {
+    it.state = "free";
+    // 拒绝采样：物品间不重叠，离磁铁出生地足够远
+    for (let tries = 0; tries < 200; tries++) {
+      const x = IT_R + 20 + Math.random() * (W - 2 * (IT_R + 20));
+      const y = 90 + IT_R + Math.random() * (H - 110 - 2 * IT_R);
+      if (Math.hypot(x - magnet.x, y - magnet.y) < 230) continue;
+      if (items.some(o => o !== it && o.state === "free" && o.x !== 0 &&
+          Math.hypot(x - o.x, y - o.y) < IT_R * 2.4)) continue;
+      it.x = x; it.y = y;
+      break;
+    }
+  }
+}
+
+/* ================= 物理（磁吸判定） ================= */
+function physics(dt) {
+  const stuck = stuckItems();
+  for (const it of items) {
+    if (it.state === "fly") {
+      // 飞向磁铁挂点：快速弹跳过去
+      it.flyT = Math.min(1, it.flyT + dt / 0.16);
+      const idx = stuckItems().indexOf(it);
+      const [tx, ty] = slotPos(Math.max(0, idx), Math.max(1, stuckItems().length));
+      const t = it.flyT, e = 1 - (1 - t) * (1 - t);   // easeOut
+      it.x = it.fx + (tx - it.fx) * e;
+      it.y = it.fy + (ty - it.fy) * e;
+      if (it.flyT >= 1) it.state = "stuck";
+      continue;
+    }
+    if (it.state === "stuck") continue;               // 位置在绘制时按挂点算
+    if (it === drag.item) continue;                   // 手里拖着的不判定
+    if (!it.iron) continue;                           // 非铁物品毫无反应
+    const d = Math.hypot(it.x - magnet.x, it.y - magnet.y);
+    if (d < SNAP_D) {
+      // 啪！吸上去
+      if (stuckItems().length >= MAX_STUCK) {
+        // 吸太多啦：最早吸住的掉下来
+        const oldest = stuckItems()[0];
+        oldest.state = "free";
+        oldest.x += (oldest.x - magnet.x) * 0.3;
+        oldest.y += 36;
+        pop(240);
+        showHint("吸太多啦！最早吸住的掉下来了");
+      }
+      it.state = "fly"; it.flyT = 0; it.fx = it.x; it.fy = it.y;
+      snapSound();
+      burst(it.x, it.y);
+      showHint(`吸住了 ${it.emoji} ${it.name}！它是铁做的`);
+    } else if (d < SENSE_D) {
+      it.shake += dt * 30;                            // 感应抖动
+    }
+  }
+  // 粒子
+  for (const p of particles) p.t += dt;
+  particles = particles.filter(p => p.t < 0.35);
+}
+
+function burst(x, y) {
+  for (let i = 0; i < 6; i++) {
+    const a = Math.random() * Math.PI * 2;
+    particles.push({ x, y, a, t:0 });
+  }
+}
+
+/* ================= 交互 ================= */
+const drag = { item:null, magnet:false, dx:0, dy:0, moved:0 };
+let nagT = 0;   // “不是铁”提示的节流
+
+function hitItem(x, y) {
+  // 从上往下找（后画的在上）
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    const [ix, iy] = it.state === "stuck"
+      ? slotPos(stuckItems().indexOf(it), stuckItems().length)
+      : [it.x, it.y];
+    if (Math.hypot(x - ix, y - iy) < IT_R + 8) return it;
+  }
+  return null;
+}
+function hitMagnet(x, y) {
+  return Math.hypot(x - magnet.x, y - magnet.y) < MAG_R + 34;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  hintEl.style.opacity = "0";
+  const it = hitItem(x, y);
+  if (it) {
+    drag.item = it; drag.magnet = false; drag.moved = 0;
+    const [ix, iy] = it.state === "stuck"
+      ? slotPos(stuckItems().indexOf(it), stuckItems().length)
+      : [it.x, it.y];
+    drag.dx = x - ix; drag.dy = y - iy;
+    // 吸住的物品被抓住：先拿到指针下，拖远才取下
+    if (it.state === "stuck") { it.state = "free"; it.x = ix; it.y = iy; }
+    // 提到最上层
+    items.splice(items.indexOf(it), 1); items.push(it);
+    pop(500);
+  } else if (hitMagnet(x, y)) {
+    drag.magnet = true; drag.item = null; drag.moved = 0;
+    drag.dx = x - magnet.x; drag.dy = y - magnet.y;
+    pop(350);
+  } else {
+    return;
+  }
+  canvas.setPointerCapture(e.pointerId);
+});
+
+canvas.addEventListener("pointermove", e => {
+  const x = e.clientX, y = e.clientY;
+  if (drag.item) {
+    const it = drag.item;
+    it.x = Math.max(IT_R, Math.min(W - IT_R, x - drag.dx));
+    it.y = Math.max(IT_R + 56, Math.min(H - IT_R, y - drag.dy));
+    drag.moved++;
+    // 拖着非铁物品贴近磁铁：科普提示（节流）
+    const now = performance.now();
+    if (!it.iron && Math.hypot(it.x - magnet.x, it.y - magnet.y) < SNAP_D + 30 && now - nagT > 2500) {
+      nagT = now;
+      showHint(`${it.emoji} ${it.name}不是铁做的，磁铁不理它`);
+    }
+  } else if (drag.magnet) {
+    magnet.x = Math.max(MAG_R + 20, Math.min(W - MAG_R - 20, x - drag.dx));
+    magnet.y = Math.max(MAG_R + 80, Math.min(H - MAG_R - 30, y - drag.dy));
+    drag.moved++;
+  }
+});
+
+window.addEventListener("pointerup", () => {
+  if (drag.item) {
+    const it = drag.item;
+    // 松手时如果贴在磁铁上但不是铁，给个小提示
+    if (!it.iron && Math.hypot(it.x - magnet.x, it.y - magnet.y) < SNAP_D + 30) {
+      pop(200);
+    }
+  }
+  drag.item = null; drag.magnet = false;
+});
+
+/* ================= 绘制 ================= */
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#3a6ea8"); g.addColorStop(1, "#274a6b");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 桌面波点装饰
+  ctx.fillStyle = "rgba(255,255,255,0.05)";
+  for (let x = 40; x < W; x += 90)
+    for (let y = 40; y < H; y += 90) {
+      ctx.beginPath(); ctx.arc(x, y, 4, 0, 7); ctx.fill();
+    }
+}
+
+function drawFieldLines() {
+  // 磁铁周围的磁力线（虚线圆弧，淡淡的）
+  ctx.save();
+  ctx.translate(magnet.x, magnet.y);
+  ctx.setLineDash([7, 9]);
+  ctx.lineWidth = 2.5;
+  const t = performance.now() / 1000;
+  for (let i = 0; i < 3; i++) {
+    const r = MAG_R + 42 + i * 34 + Math.sin(t * 2 + i) * 3;
+    ctx.strokeStyle = `rgba(255,255,255,${0.30 - i * 0.07})`;
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawMagnet() {
+  ctx.save();
+  ctx.translate(magnet.x, magnet.y);
+  ctx.lineCap = "butt";
+  const r = MAG_R, w = MAG_W, leg = MAG_LEG;
+  // 右半（红，N 极）：右半圆弧 + 右腿
+  ctx.strokeStyle = "#e93b3b"; ctx.lineWidth = w;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI / 2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(r, 0); ctx.lineTo(r, -leg); ctx.stroke();
+  // 左半（蓝，S 极）：左半圆弧 + 左腿
+  ctx.strokeStyle = "#2f7fe9";
+  ctx.beginPath(); ctx.arc(0, 0, r, Math.PI / 2, Math.PI); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-r, 0); ctx.lineTo(-r, -leg); ctx.stroke();
+  // 磁极银色帽子
+  ctx.fillStyle = "#d8dee6";
+  roundRect(r - w / 2, -leg - 14, w, 16, 4, true);
+  roundRect(-r - w / 2, -leg - 14, w, 16, 4, true);
+  // N / S 标注
+  ctx.font = "bold 22px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#fff";
+  ctx.fillText("N", r, -leg - 34);
+  ctx.fillText("S", -r, -leg - 34);
+  // 可爱的脸（底部弧带中央）
+  ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.arc(-11, r - 1, 4.5, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(11, r - 1, 4.5, 0, 7); ctx.fill();
+  ctx.fillStyle = "#333";
+  ctx.beginPath(); ctx.arc(-10, r, 2, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(12, r, 2, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.arc(0.5, r + 2, 7, 0.35, Math.PI - 0.35); ctx.stroke();
+  ctx.restore();
+}
+
+function drawItem(it) {
+  let x, y, sc = 1;
+  if (it.state === "stuck") {
+    const idx = stuckItems().indexOf(it);
+    [x, y] = slotPos(idx, stuckItems().length);
+  } else {
+    x = it.x; y = it.y;
+    if (it.state === "fly") sc = 1 + 0.3 * Math.sin(it.flyT * Math.PI);
+    else if (it.iron && it !== drag.item &&
+             Math.hypot(x - magnet.x, y - magnet.y) < SENSE_D) {
+      // 感应抖动
+      x += Math.sin(it.shake) * 3;
+      y += Math.cos(it.shake * 1.3) * 2;
+    }
+  }
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(it.rot * 0.4);
+  ctx.scale(sc, sc);
+  // 白色圆底，物品更醒目
+  ctx.beginPath(); ctx.arc(0, 0, IT_R - 2, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.92)"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.18)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.font = "34px serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(it.emoji, 0, 2);
+  ctx.restore();
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const r = 8 + p.t * 90;
+    const a = 1 - p.t / 0.35;
+    ctx.strokeStyle = `rgba(255,213,74,${a})`;
+    ctx.lineWidth = 3;
+    const px = p.x + Math.cos(p.a) * p.t * 60;
+    const py = p.y + Math.sin(p.a) * p.t * 60;
+    ctx.beginPath();
+    ctx.moveTo(px - 5, py); ctx.lineTo(px + 5, py);
+    ctx.moveTo(px, py - 5); ctx.lineTo(px, py + 5);
+    ctx.stroke();
+  }
+}
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawFieldLines();
+  drawMagnet();
+  for (const it of items) drawItem(it);
+  drawParticles();
+}
+
+/* ================= 主循环 ================= */
+resize();
+scatter();
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+// “啪”吸住声：短促高频方波 + 下落音
+function snapSound() {
+  tone(1600, 0.05, 0.14, "square");
+  setTimeout(() => tone(520, 0.12, 0.12, "triangle"), 40);
+}
+
+/* ================= 提示条 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2000);
+}
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

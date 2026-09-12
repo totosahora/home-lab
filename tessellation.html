@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>密铺小能手</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#233043; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,28,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,28,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  /* 左侧形状盒 */
+  #tools {
+    position:absolute; left:12px; top:50%; transform:translateY(-50%);
+    background:rgba(10,16,28,0.75); border-radius:20px; padding:14px 12px;
+    display:flex; flex-direction:column; gap:12px; z-index:10;
+  }
+  #tools .title { color:#ffd54a; font-size:15px; font-weight:bold; text-align:center; }
+  .tool {
+    width:96px; padding:8px 4px 6px; border-radius:14px;
+    background:rgba(255,255,255,0.08); cursor:grab; touch-action:none;
+    display:flex; flex-direction:column; align-items:center; gap:2px;
+    user-select:none; -webkit-user-select:none;
+  }
+  .tool:active { cursor:grabbing; transform:scale(1.06); }
+  .tool svg { width:56px; height:56px; pointer-events:none; }
+  .tool span { color:#fff; font-size:14px; pointer-events:none; }
+  .tool.done { outline:3px solid #ffd54a; }
+  /* 发现卡 & 徽章面板 */
+  .panel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:18px;
+    background:rgba(0,0,0,0.5);
+  }
+  .card {
+    background:#fff8e8; border-radius:22px; padding:26px 30px;
+    max-width:520px; width:88%; text-align:center; color:#4a3200;
+    box-shadow:0 8px 30px rgba(0,0,0,0.45);
+  }
+  .card h2 { font-size:24px; margin-bottom:10px; color:#d35400; }
+  .card p { font-size:17px; line-height:1.7; margin:4px 0; }
+  .card .big { font-size:21px; font-weight:bold; color:#c0392b; }
+  .panel button {
+    font-size:20px; font-weight:bold; padding:12px 32px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  .panel button:active { transform:scale(1.06); }
+  #badgePanel .msg {
+    font-size:44px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #badgePanel .sub { font-size:20px; color:#fff; text-align:center; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">△ 0/12 · □ 0/12 · ⬡ 0/12 · ⏢ 0/12</div>
+<div id="hint">把左边的形状拖到画布上，试试哪些能不留缝隙地铺满平面！</div>
+<div id="tools">
+  <div class="title">形状盒</div>
+  <div class="tool" data-type="tri">
+    <svg viewBox="-50 -50 100 100"><polygon points="0,-38 33,19 -33,19" fill="#ff9e57" stroke="#fff" stroke-width="3"/></svg>
+    <span>正三角形</span>
+  </div>
+  <div class="tool" data-type="sq">
+    <svg viewBox="-50 -50 100 100"><polygon points="-30,-30 30,-30 30,30 -30,30" fill="#53c2f0" stroke="#fff" stroke-width="3"/></svg>
+    <span>正方形</span>
+  </div>
+  <div class="tool" data-type="hex">
+    <svg viewBox="-50 -50 100 100"><polygon points="40,0 20,34.6 -20,34.6 -40,0 -20,-34.6 20,-34.6" fill="#8fd14f" stroke="#fff" stroke-width="3"/></svg>
+    <span>正六边形</span>
+  </div>
+  <div class="tool" data-type="trap">
+    <svg viewBox="-50 -50 100 100"><polygon points="-40,18 40,18 20,-18 -20,-18" fill="#ffd54a" stroke="#fff" stroke-width="3"/></svg>
+    <span>梯形</span>
+  </div>
+  <div class="tool" data-type="penta">
+    <svg viewBox="-50 -50 100 100"><polygon points="0,-38 36.1,-11.8 22.4,30.9 -22.4,30.9 -36.1,-11.8" fill="#f48fb1" stroke="#fff" stroke-width="3"/></svg>
+    <span>正五边形</span>
+  </div>
+</div>
+
+<div class="panel" id="pentaPanel">
+  <div class="card">
+    <h2>🔍 发现卡</h2>
+    <svg id="pentaSvg" viewBox="0 0 260 230" width="240" height="212"></svg>
+    <p>为什么正五边形不能密铺？</p>
+    <p>正五边形每个内角是 <b>108°</b>。在一个顶点处：</p>
+    <p class="big">108° × 3 = 324° ≠ 360°，差 36°！</p>
+    <p>塞 4 个呢？108° × 4 = 432°，又超出了！</p>
+    <p>所以正五边形永远也铺不满平面～</p>
+  </div>
+  <button id="pentaOk">我知道了</button>
+</div>
+
+<div class="panel" id="badgePanel">
+  <div class="msg">🏆 密铺大师！</div>
+  <div class="sub">正三角形、正方形、正六边形都被你铺满啦！<br>你还发现了正五边形的秘密！</div>
+  <button id="badgeOk">继续玩</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const toolsEl = document.getElementById("tools");
+const pentaPanel = document.getElementById("pentaPanel");
+const badgePanel = document.getElementById("badgePanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 形状与网格 ================= */
+const S = 46;                          // 边长
+const SQRT3 = Math.sqrt(3);
+const TH = S * SQRT3 / 2;              // 三角形高 / 六边形半高
+const TYPES = {
+  tri:   { name:"正三角形", color:"#ff9e57", tile:true,  angles:[60,60,60,60,60,60], eq:"60° × 6 = 360°" },
+  sq:    { name:"正方形",   color:"#53c2f0", tile:true,  angles:[90,90,90,90],       eq:"90° × 4 = 360°" },
+  hex:   { name:"正六边形", color:"#8fd14f", tile:true,  angles:[120,120,120],       eq:"120° × 3 = 360°" },
+  trap:  { name:"梯形",     color:"#ffd54a", tile:true,  angles:[60,120,120,60],     eq:"60° + 120° + 120° + 60° = 360°" },
+  penta: { name:"正五边形", color:"#f48fb1", tile:false, angles:[108,108,108],       eq:"108° × 3 = 324° ≠ 360°" }
+};
+const PENTA_R = S / (2 * Math.sin(Math.PI / 5));   // 正五边形外接圆半径（边长=S）
+
+// 各形状局部顶点（形心在原点，canvas 坐标 y 向下）
+function localVerts(type) {
+  if (type === "tri")  return [[-S/2,-TH/3],[S/2,-TH/3],[0,2*TH/3]];           // 尖朝 +y
+  if (type === "sq")   return [[-S/2,-S/2],[S/2,-S/2],[S/2,S/2],[-S/2,S/2]];
+  if (type === "hex")  return [[S,0],[S/2,TH],[-S/2,TH],[-S,0],[-S/2,-TH],[S/2,-TH]];
+  if (type === "trap") return [[-S,-4*TH/9],[S,-4*TH/9],[S/2,5*TH/9],[-S/2,5*TH/9]]; // 长底朝 -y
+  // penta：一个顶点朝 -y
+  const v = [];
+  for (let k = 0; k < 5; k++) {
+    const a = -Math.PI / 2 + k * 2 * Math.PI / 5;
+    v.push([Math.cos(a) * PENTA_R, Math.sin(a) * PENTA_R]);
+  }
+  return v;
+}
+
+/* ================= 游戏状态 ================= */
+const GOAL = 12;
+const grids = { tri:new Map(), sq:new Map(), hex:new Map(), trap:new Map() }; // key -> {cx,cy,rot}
+const counts = { tri:0, sq:0, hex:0, trap:0 };
+const celebrated = { tri:false, sq:false, hex:false, trap:false };
+let drag = null;          // {type, x, y, snap}
+let flybacks = [];        // {type, x0,y0,x1,y1,t0}
+let celeb = null;         // {type, t0, sector}
+let badgeShown = false;
+
+function updateScore() {
+  const m = t => `${counts[t] >= GOAL ? "✓" : counts[t] + "/" + GOAL}`;
+  scorebar.textContent = `△三角 ${m("tri")} · □正方 ${m("sq")} · ⬡六边 ${m("hex")} · ⏢梯形 ${m("trap")}`;
+  for (const t of ["tri","sq","hex","trap"])
+    document.querySelector(`.tool[data-type="${t}"]`).classList.toggle("done", counts[t] >= GOAL);
+}
+updateScore();
+
+/* ================= 吸附计算 ================= */
+const SNAP_D = S * 0.95;
+const odd = n => ((n % 2) + 2) % 2 === 1;
+
+// 返回 {key, cx, cy, rot, valid}；距离太远返回 null
+function computeSnap(type, x, y) {
+  let best = null;
+  const consider = cand => {
+    const d = Math.hypot(cand.cx - x, cand.cy - y);
+    if (!best || d < best.d) best = Object.assign({ d }, cand);
+  };
+  if (type === "sq") {
+    consider({ key:"", cx: Math.round(x / S) * S, cy: Math.round(y / S) * S, rot:0 });
+    best.key = `${Math.round(x / S)},${Math.round(y / S)}`;
+  } else if (type === "tri") {
+    const j = Math.floor(y / TH);
+    for (let jj = j - 1; jj <= j + 1; jj++) {
+      const off = odd(jj) ? S / 2 : 0;
+      const i0 = Math.round((x - off) / S);
+      for (let ii = i0 - 1; ii <= i0 + 1; ii++) {
+        consider({ key:`U${jj},${ii}`, cx: off + ii * S + S / 2, cy: jj * TH + TH / 3, rot:0 });
+        consider({ key:`D${jj},${ii}`, cx: off + ii * S,         cy: jj * TH + 2 * TH / 3, rot:Math.PI });
+      }
+    }
+  } else if (type === "hex" || type === "trap") {
+    // 平顶正六边形格：列距 1.5S，行距 2·TH，奇列错半行
+    const i0 = Math.round(x / (1.5 * S));
+    for (let i = i0 - 1; i <= i0 + 1; i++) {
+      const yoff = odd(i) ? TH : 0;
+      const j = Math.round((y - yoff) / (2 * TH));
+      consider({ i, j, cx: i * 1.5 * S, cy: j * 2 * TH + yoff, rot:0 });
+    }
+    best.key = `${best.i},${best.j}`;
+    if (type === "trap") {
+      // 梯形 = 半个六边形：按上下半格吸附，上半格自动翻转 180°
+      const low = y >= best.cy;
+      best.key += low ? ",b" : ",t";
+      best.cy += low ? 4 * TH / 9 : -4 * TH / 9;
+      best.rot = low ? 0 : Math.PI;
+      best.d = Math.hypot(best.cx - x, best.cy - y);
+    }
+  }
+  if (!best || best.d > SNAP_D) return null;
+  best.valid = !grids[type].has(best.key);
+  return best;
+}
+
+/* ================= 拖拽交互 ================= */
+document.querySelectorAll(".tool").forEach(el => {
+  el.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    if (celeb) endCelebration();
+    if (pentaPanel.style.display === "flex" || badgePanel.style.display === "flex") return;
+    drag = { type: el.dataset.type, x: e.clientX, y: e.clientY, snap: null };
+    hintEl.style.opacity = "0";
+  });
+});
+window.addEventListener("pointermove", e => {
+  if (!drag) return;
+  drag.x = e.clientX; drag.y = e.clientY;
+  drag.snap = TYPES[drag.type].tile ? computeSnap(drag.type, drag.x, drag.y) : null;
+});
+function endDrag(e) {
+  if (!drag) return;
+  const d = drag; drag = null;
+  const overTools = e.clientX < toolsEl.getBoundingClientRect().right + 12;
+  if (TYPES[d.type].tile) {
+    const snap = TYPES[d.type].tile ? computeSnap(d.type, d.x, d.y) : null;
+    if (snap && snap.valid && !overTools) {
+      grids[d.type].set(snap.key, { cx:snap.cx, cy:snap.cy, rot:snap.rot });
+      counts[d.type]++;
+      updateScore();
+      pop(660); setTimeout(() => pop(990), 70);
+      if (counts[d.type] === GOAL && !celebrated[d.type]) {
+        celebrated[d.type] = true;
+        setTimeout(() => startCelebration(d.type), 350);
+      } else if (counts[d.type] < GOAL) {
+        showHint(`贴上了！${TYPES[d.type].name} ${counts[d.type]} / ${GOAL}`);
+      }
+      return;
+    }
+    if (!overTools && snap && !snap.valid) showHint("这里已经有形状啦，换个空位试试～");
+    flyback(d, e);
+  } else {
+    // 正五边形：永远对不齐，弹回并弹出发现卡
+    if (!overTools) {
+      flyback(d, e);
+      pop(160);
+      setTimeout(() => { pentaPanel.style.display = "flex"; }, 420);
+    }
+  }
+}
+window.addEventListener("pointerup", endDrag);
+window.addEventListener("pointercancel", endDrag);
+
+function flyback(d, e) {
+  const r = document.querySelector(`.tool[data-type="${d.type}"]`).getBoundingClientRect();
+  flybacks.push({ type:d.type, x0:e.clientX, y0:e.clientY, x1:r.left + r.width/2, y1:r.top + r.height/2, t0:performance.now() });
+}
+
+/* ================= 庆祝与徽章 ================= */
+function startCelebration(type) {
+  celeb = { type, t0: performance.now(), sector:-1 };
+  fanfare();
+}
+function endCelebration() {
+  celeb = null;
+  if (!badgeShown && celebrated.tri && celebrated.sq && celebrated.hex) {
+    badgeShown = true;
+    badgePanel.style.display = "flex";
+    fanfare(); setTimeout(fanfare, 600);
+  }
+}
+canvas.addEventListener("pointerdown", () => { if (celeb) endCelebration(); });
+
+/* ================= 绘制 ================= */
+function pathShape(type, cx, cy, rot) {
+  const vs = localVerts(type);
+  const c = Math.cos(rot), s = Math.sin(rot);
+  ctx.beginPath();
+  vs.forEach(([vx, vy], i) => {
+    const px = cx + vx * c - vy * s, py = cy + vx * s + vy * c;
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  });
+  ctx.closePath();
+}
+function fillShape(type, cx, cy, rot, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  pathShape(type, cx, cy, rot);
+  ctx.fillStyle = TYPES[type].color; ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.95)"; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.restore();
+}
+
+// 拖动时显示对应网格
+function drawGrid(type) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,0.14)"; ctx.lineWidth = 1.5;
+  if (type === "sq") {
+    for (let i = Math.floor(-W / S); i * S + S / 2 < W + S; i++) {
+      const x = i * S + S / 2;
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+    }
+    for (let j = Math.floor(-H / S); j * S + S / 2 < H + S; j++) {
+      const y = j * S + S / 2;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+  } else if (type === "tri") {
+    for (let j = -2; j * TH < H + TH; j++) {
+      ctx.beginPath(); ctx.moveTo(0, j * TH); ctx.lineTo(W, j * TH); ctx.stroke();
+    }
+    const kMax = Math.ceil(W / S) + Math.ceil(H / (SQRT3 * S)) + 2;
+    const kMin = -Math.ceil(H / (SQRT3 * S)) - 2;
+    for (let k = kMin; k <= kMax; k++) {
+      ctx.beginPath(); ctx.moveTo(0, -SQRT3 * k * S); ctx.lineTo(W, SQRT3 * (W - k * S)); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, SQRT3 * k * S); ctx.lineTo(W, SQRT3 * (k * S - W)); ctx.stroke();
+    }
+  } else {  // hex / trap：枚举可见六边形
+    for (let i = -1; i * 1.5 * S - S < W + S; i++) {
+      const yoff = odd(i) ? TH : 0;
+      for (let j = -1; j * 2 * TH + yoff - TH < H + TH; j++) {
+        const cx = i * 1.5 * S, cy = j * 2 * TH + yoff;
+        if (cy < -2 * TH) continue;
+        pathShape("hex", cx, cy, 0); ctx.stroke();
+        if (type === "trap") {
+          ctx.beginPath(); ctx.moveTo(cx - S, cy); ctx.lineTo(cx + S, cy); ctx.stroke();
+        }
+      }
+    }
+  }
+  ctx.restore();
+}
+
+function drawDrag() {
+  if (!drag) return;
+  const t = drag.type;
+  if (!TYPES[t].tile) {
+    // 正五边形：红色缝隙警告
+    fillShape(t, drag.x, drag.y, 0, 0.85);
+    ctx.save();
+    pathShape(t, drag.x, drag.y, 0);
+    ctx.setLineDash([8, 6]);
+    ctx.strokeStyle = "#ff3b30"; ctx.lineWidth = 4; ctx.stroke();
+    ctx.setLineDash([]);
+    // 36° 缺口扇形
+    const a0 = -Math.PI / 2, a1 = a0 + Math.PI / 5;   // 36°
+    ctx.beginPath();
+    ctx.moveTo(drag.x, drag.y - PENTA_R - 30);
+    ctx.arc(drag.x, drag.y - PENTA_R - 30, 34, a0 + Math.PI / 2, a1 + Math.PI / 2);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(255,59,48,0.55)"; ctx.fill();
+    ctx.strokeStyle = "#ff3b30"; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.fillStyle = "#ff3b30"; ctx.font = "bold 22px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("差 36°，对不齐！", drag.x, drag.y + PENTA_R + 42);
+    ctx.restore();
+    return;
+  }
+  drawGrid(t);
+  if (drag.snap) {
+    const sn = drag.snap;
+    ctx.save();
+    pathShape(t, sn.cx, sn.cy, sn.rot);
+    ctx.setLineDash([9, 7]);
+    ctx.strokeStyle = sn.valid ? "#7cff6b" : "#ff3b30";
+    ctx.lineWidth = 4; ctx.stroke();
+    ctx.setLineDash([]);
+    if (sn.valid) { ctx.fillStyle = "rgba(124,255,107,0.18)"; ctx.fill(); }
+    ctx.restore();
+  }
+  fillShape(t, drag.x, drag.y, drag.snap ? drag.snap.rot : 0, 0.8);
+}
+
+function drawFlybacks(now) {
+  flybacks = flybacks.filter(f => now - f.t0 < 380);
+  for (const f of flybacks) {
+    let p = (now - f.t0) / 380;
+    p = 1 - (1 - p) * (1 - p);   // easeOut
+    fillShape(f.type, f.x0 + (f.x1 - f.x0) * p, f.y0 + (f.y1 - f.y0) * p, 0, 0.85 * (1 - p * 0.5));
+  }
+}
+
+// 顶点角度 + 360° 验证动画
+function drawCelebration(now) {
+  const info = TYPES[celeb.type];
+  const t = (now - celeb.t0) / 1000;
+  const list = info.angles, n = list.length, SEG = 0.4;
+  // 逐扇区提示音
+  const sec = Math.min(n, Math.floor(t / SEG));
+  if (sec !== celeb.sector) { celeb.sector = sec; if (sec < n) pop(500 + sec * 110); }
+
+  ctx.save();
+  ctx.fillStyle = "rgba(0,0,0,0.42)"; ctx.fillRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2 - 10, R = Math.min(150, H / 4);
+  ctx.fillStyle = "#ffd54a"; ctx.font = "bold 34px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(`${info.name}密铺成功！`, cx, cy - R - 66);
+  ctx.beginPath(); ctx.arc(cx, cy, R + 14, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.08)"; ctx.fill();
+  let a = -Math.PI / 2;
+  for (let i = 0; i < n; i++) {
+    const sweep = list[i] * Math.PI / 180;
+    const p = Math.max(0, Math.min(1, (t - i * SEG) / SEG));
+    if (p <= 0) break;
+    // 扇形
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, R, a, a + sweep * p);
+    ctx.closePath();
+    ctx.fillStyle = info.color; ctx.globalAlpha = 0.55 + 0.45 * p; ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+    // 角度标注
+    if (p >= 1) {
+      const mid = a + sweep / 2;
+      ctx.fillStyle = "#fff"; ctx.font = "bold 26px sans-serif";
+      ctx.fillText(`${list[i]}°`, cx + Math.cos(mid) * R * 0.6, cy + Math.sin(mid) * R * 0.6 + 9);
+    }
+    a += sweep;
+  }
+  if (t > n * SEG) {
+    ctx.fillStyle = "#7cff6b"; ctx.font = "bold 32px sans-serif";
+    ctx.fillText(`${info.eq} ✓`, cx, cy + R + 62);
+    ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.font = "18px sans-serif";
+    ctx.fillText("一个顶点周围正好是 360°，所以能密铺！", cx, cy + R + 94);
+  }
+  ctx.restore();
+  if (t > n * SEG + 2.0) endCelebration();
+}
+
+function draw(now) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#233043";
+  ctx.fillRect(0, 0, W, H);
+  for (const t of ["tri","sq","hex","trap"])
+    for (const p of grids[t].values()) fillShape(t, p.cx, p.cy, p.rot, 1);
+  drawFlybacks(now);
+  drawDrag();
+  if (celeb) drawCelebration(now);
+}
+
+/* ================= 主循环 ================= */
+function loop(now) {
+  draw(now);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 1800);
+}
+document.getElementById("pentaOk").addEventListener("click", () => {
+  pentaPanel.style.display = "none"; pop(880);
+  showHint("试试其它形状，看谁能铺满！");
+});
+document.getElementById("badgeOk").addEventListener("click", () => {
+  badgePanel.style.display = "none"; pop(880);
+});
+
+// 发现卡插图：三个正五边形围一个顶点，留下 36° 缺口
+(function buildPentaSvg() {
+  const svg = document.getElementById("pentaSvg");
+  const R = 52, cx = 130, cy = 130;
+  let parts = "";
+  for (let k = 0; k < 3; k++) {
+    const mid = (-36 + k * 108) * Math.PI / 180;    // 顶点→五边形中心方向
+    const pcx = cx + Math.cos(mid) * R, pcy = cy + Math.sin(mid) * R;
+    const pts = [];
+    for (let m = 0; m < 5; m++) {
+      const a = mid + Math.PI + m * 2 * Math.PI / 5;
+      pts.push((pcx + Math.cos(a) * R).toFixed(1) + "," + (pcy + Math.sin(a) * R).toFixed(1));
+    }
+    parts += `<polygon points="${pts.join(" ")}" fill="#f48fb1" stroke="#fff" stroke-width="2.5"/>`;
+  }
+  // 36° 缺口扇形（234° → 270°）
+  const g0 = 234 * Math.PI / 180, g1 = 270 * Math.PI / 180, L = 62;
+  parts += `<path d="M ${cx} ${cy} L ${(cx + Math.cos(g0) * L).toFixed(1)} ${(cy + Math.sin(g0) * L).toFixed(1)} A ${L} ${L} 0 0 1 ${(cx + Math.cos(g1) * L).toFixed(1)} ${(cy + Math.sin(g1) * L).toFixed(1)} Z"
+    fill="rgba(255,59,48,0.5)" stroke="#e93b3b" stroke-width="2.5" stroke-dasharray="6 4"/>`;
+  parts += `<text x="${cx + Math.cos(252 * Math.PI / 180) * 95}" y="${cy + Math.sin(252 * Math.PI / 180) * 95 + 4}"
+    font-size="19" font-weight="bold" fill="#e93b3b" text-anchor="middle">36°</text>`;
+  parts += `<text x="${cx + Math.cos(216 * Math.PI / 180) * 58}" y="${cy + Math.sin(216 * Math.PI / 180) * 58 + 5}"
+    font-size="16" font-weight="bold" fill="#fff" text-anchor="middle">108°</text>`;
+  svg.innerHTML = parts;
+})();
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

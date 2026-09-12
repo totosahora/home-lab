@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>金属活动性大发现</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#dff0f6; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,70,0.85); color:#7fe3ff; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,70,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10;
+    transition:opacity 0.6s; white-space:nowrap; cursor:pointer;
+  }
+  #resetBtn {
+    position:absolute; top:12px; left:12px; z-index:10;
+    font-size:16px; font-weight:bold; padding:10px 18px;
+    border-radius:24px; border:none; background:#2e7d9c; color:#fff;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.25);
+  }
+  #resetBtn:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🧪 活动性发现：0 / 3</div>
+<button id="resetBtn">🔄 重新开始</button>
+<div id="hint">把下面的金属拖进烧杯里，仔细观察会发生什么！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1, S = 1;   // S = 整体缩放
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  S = Math.min(W / 1280, H / 800);
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 四种液体
+const LIQUIDS = [
+  { name:"硫酸铜", sub:"蓝色溶液", color:[70,130,225], blue:true  },
+  { name:"稀盐酸", sub:"无色",     color:[232,240,246], blue:false },
+  { name:"硫酸锌", sub:"无色溶液", color:[236,244,248], blue:false },
+  { name:"清水",   sub:"对照组",   color:[224,238,246], blue:false },
+];
+// 三种金属
+const METAL_DEFS = [
+  { id:"fe", name:"铁钉", symbol:"Fe" },
+  { id:"cu", name:"铜片", symbol:"Cu" },
+  { id:"zn", name:"锌粒", symbol:"Zn" },
+];
+// 反应规则：reaction(metalId, liquidIdx) -> {type, dur} 或 null
+//   type: "fastGas" 大量气泡 | "slowGas" 缓慢小气泡 | "displace" 置换(表面变色+蓝色变浅)
+function reactionOf(metalId, li) {
+  if (metalId === "zn" && li === 1) return { type:"fastGas",  dur:1.0 };
+  if (metalId === "fe" && li === 1) return { type:"slowGas",  dur:2.2 };
+  if (metalId === "fe" && li === 0) return { type:"displace", dur:2.5, tint:[168,72,48]  };
+  if (metalId === "zn" && li === 0) return { type:"displace", dur:2.5, tint:[74,46,44] };
+  return null;
+}
+
+let beakers = [];   // {x, y, bw, bh, blue(0..1), bubbles:[], metals:[metal]}
+let metals = [];    // {id,name,symbol, x,y, home:{x,y}, beaker:null|idx, prog, specks, quietT, quietShown, drag}
+let board = { x:0, w:260 };
+let discovered = { zn:false, fe:false, cu:false };
+let celebrated = false;
+let confetti = [];
+
+function layout() {
+  const bw = Math.min(170 * S * 1.4, (W - board.w - 60) / 4 - 18);
+  const bh = bw * 1.3;
+  const labW = W - board.w;
+  const gap = (labW - bw * 4) / 5;
+  const by = H * 0.52;   // 烧杯底部
+  beakers = LIQUIDS.map((L, i) => ({
+    x: gap + i * (bw + gap) + bw / 2,
+    y: by, bw, bh, blue: L.blue ? 1 : 0, bubbles: [], metals: beakers[i] ? beakers[i].metals : []
+  }));
+  board.x = W - board.w;
+  // 金属的家（底部工具区），只在新游戏时摆放
+  const my = H * 0.86;
+  if (!metals.length) {
+    metals = METAL_DEFS.map((d, i) => {
+      const hx = labW * (0.22 + i * 0.28);
+      return {
+        id:d.id, name:d.name, symbol:d.symbol,
+        x:hx, y:my, home:{ x:hx, y:my },
+        beaker:null, prog:0, quietT:0, quietShown:false,
+        specks:makeSpecks(), drag:null
+      };
+    });
+  } else {
+    metals.forEach((m, i) => {
+      m.home = { x: labW * (0.22 + i * 0.28), y: my };
+      if (m.beaker === null && !m.drag) { m.x = m.home.x; m.y = m.home.y; }
+    });
+    beakers.forEach((b, bi) => layoutBeakerMetals(bi));
+  }
+}
+// 金属表面斑点的固定伪随机位置（反应时逐个显现）
+function makeSpecks() {
+  const arr = [];
+  let seed = Math.random() * 1000;
+  for (let i = 0; i < 26; i++) {
+    seed = (seed * 9301 + 49297) % 233280;
+    const r1 = seed / 233280;
+    seed = (seed * 9301 + 49297) % 233280;
+    const r2 = seed / 233280;
+    arr.push({ dx:(r1 - 0.5) * 2, dy:(r2 - 0.5) * 2, r:2 + r2 * 3 });
+  }
+  return arr;
+}
+function layoutBeakerMetals(bi) {
+  const b = beakers[bi];
+  b.metals.forEach((m, k) => {
+    m.x = b.x + (k - (b.metals.length - 1) / 2) * b.bw * 0.3;
+    m.y = b.y - b.bh * 0.18;
+  });
+}
+
+function resetGame() {
+  metals.forEach(m => { m.beaker = null; m.prog = 0; m.quietT = 0; m.quietShown = false; m.specks = makeSpecks(); });
+  beakers.forEach(b => { b.metals = []; b.bubbles = []; b.blue = LIQUIDS[beakers.indexOf(b)].blue ? 1 : 0; });
+  discovered = { zn:false, fe:false, cu:false };
+  celebrated = false; confetti = [];
+  layout();
+  updateScore();
+}
+function updateScore() {
+  const n = (discovered.zn ? 1 : 0) + (discovered.fe ? 1 : 0) + (discovered.cu ? 1 : 0);
+  scorebar.textContent = celebrated ? "🎉 全部发现！锌 > 铁 > 铜" : `🧪 活动性发现：${n} / 3`;
+}
+
+/* ================= 化学与粒子 ================= */
+function discover(id, text) {
+  if (discovered[id]) return;
+  discovered[id] = true;
+  showHint(text);
+  fanfare(0.5);
+  updateScore();
+  if (discovered.zn && discovered.fe && discovered.cu && !celebrated) {
+    celebrated = true;
+    setTimeout(() => {
+      showHint("🎉 总结：排前面的金属能抢排后面金属的溶液！");
+      fanfare(1);
+      for (let i = 0; i < 90; i++) {
+        confetti.push({
+          x:Math.random() * W, y:-20 - Math.random() * H * 0.4,
+          vy:60 + Math.random() * 120, vx:(Math.random() - 0.5) * 60,
+          c:"hsl(" + (Math.random() * 360 | 0) + ",90%,60%)",
+          r:4 + Math.random() * 5, rot:Math.random() * 7, vr:(Math.random() - 0.5) * 6
+        });
+      }
+      updateScore();
+    }, 1600);
+  }
+}
+
+function spawnBubble(b, x, y, big) {
+  b.bubbles.push({
+    x:x + (Math.random() - 0.5) * 26 * S,
+    y, vy:(big ? 90 + Math.random() * 90 : 40 + Math.random() * 40) * S * 1.6,
+    r:(big ? 3 + Math.random() * 5 : 1.5 + Math.random() * 2.5) * S * 1.6,
+    life:1
+  });
+}
+
+let fizzT = 0;
+function update(dt) {
+  beakers.forEach((b, bi) => {
+    const liquidTop = b.y - b.bh * 0.72;
+    let displaceProg = 0;
+    b.metals.forEach(m => {
+      const rx = reactionOf(m.id, bi);
+      if (rx) {
+        // 反应推进
+        m.prog = Math.min(1, m.prog + dt / rx.dur);
+        m.quietT = 0;
+        if (rx.type === "displace") {
+          displaceProg = Math.max(displaceProg, m.prog);
+          if (m.id === "fe") discover("fe", "铁钉表面变红了！铁把铜从溶液里抢出来 → 铁比铜活泼");
+          if (m.id === "zn") discover("zn", "锌粒表面变黑红了！锌把铜抢出来了 → 锌比铜活泼");
+        } else {
+          // 冒气泡
+          const rate = rx.type === "fastGas" ? 34 : 7;
+          if (Math.random() < rate * dt) spawnBubble(b, m.x, m.y - 14 * S, rx.type === "fastGas");
+          if (rx.type === "fastGas" && m.prog > 0.25) discover("zn", "锌粒冒好多气泡（氢气）！锌很活泼");
+          if (rx.type === "slowGas" && m.prog > 0.5) discover("fe", "铁钉慢慢冒出小气泡 → 铁活泼，但比锌慢");
+          fizzT += dt;
+        }
+      } else if (bi !== null) {
+        // 无反应：静悄悄
+        m.quietT += dt;
+        if (m.quietT > 1.4 && !m.quietShown) {
+          m.quietShown = true;
+          pop(240);
+          if (m.id === "cu" && (bi === 1 || bi === 2)) {
+            discover("cu", "铜片静悄悄，什么反应也没有 → 铜最不活泼");
+          } else {
+            showHint(bi === 3 ? "清水里静悄悄，金属都不和水反应" : "静悄悄……这一对不反应");
+          }
+        }
+      }
+    });
+    // 硫酸铜蓝色随置换变浅
+    if (LIQUIDS[bi].blue) {
+      const target = 1 - displaceProg * 0.7;
+      b.blue += (target - b.blue) * Math.min(1, dt * 2);
+    }
+    // 气泡上升
+    for (let i = b.bubbles.length - 1; i >= 0; i--) {
+      const p = b.bubbles[i];
+      p.y -= p.vy * dt;
+      p.x += Math.sin(p.y * 0.05) * 0.4;
+      if (p.y < liquidTop + 6) {
+        b.bubbles.splice(i, 1);
+        if (Math.random() < 0.15) pop(900 + Math.random() * 600, 0.02);
+      }
+    }
+  });
+  if (fizzT > 0.18) { fizzT = 0; fizz(); }
+  // 彩带
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.y += c.vy * dt; c.x += c.vx * dt; c.rot += c.vr * dt;
+    if (c.y > H + 30) confetti.splice(i, 1);
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#eaf7fb"); g.addColorStop(1, "#cfe8f2");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 实验桌
+  const tableY = H * 0.52 + 8;
+  ctx.fillStyle = "#b08968";
+  ctx.fillRect(0, tableY, W - board.w, H - tableY);
+  ctx.fillStyle = "rgba(0,0,0,0.12)";
+  ctx.fillRect(0, tableY, W - board.w, 6 * S + 2);
+}
+
+function drawBeaker(b, bi) {
+  const { x, y, bw, bh } = b;
+  const liquidTop = y - bh * 0.72;
+  // 桌面阴影
+  ctx.fillStyle = "rgba(0,0,0,0.15)";
+  ctx.beginPath(); ctx.ellipse(x, y + 6, bw * 0.62, 9 * S + 3, 0, 0, 7); ctx.fill();
+  // 液体
+  const L = LIQUIDS[bi];
+  let c = L.color;
+  if (L.blue) {
+    // 蓝色随反应变浅
+    const t = b.blue;
+    c = [70 + (235 - 70) * (1 - t), 130 + (244 - 130) * (1 - t), 225 + (250 - 225) * (1 - t)];
+  }
+  ctx.save();
+  beakerPath(x, liquidTop, bw, y);
+  ctx.clip();
+  ctx.fillStyle = `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},0.92)`;
+  ctx.fillRect(x - bw / 2, liquidTop, bw, y - liquidTop);
+  // 液面高光
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.fillRect(x - bw / 2, liquidTop, bw, 4 * S + 1);
+  // 气泡
+  for (const p of b.bubbles) {
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7);
+    ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.fill();
+    ctx.strokeStyle = "rgba(140,180,210,0.8)"; ctx.lineWidth = 1; ctx.stroke();
+  }
+  ctx.restore();
+  // 烧杯玻璃
+  ctx.strokeStyle = "rgba(90,120,140,0.85)"; ctx.lineWidth = 3 * S + 1;
+  ctx.fillStyle = "rgba(255,255,255,0.18)";
+  beakerPath(x, y - bh, bw, y); ctx.fill(); ctx.stroke();
+  // 标签
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#1d4e63";
+  ctx.font = `bold ${Math.round(19 * S + 6)}px sans-serif`;
+  ctx.fillText(L.name, x, y - bh - 26 * S - 8);
+  ctx.fillStyle = "#5a7d8c";
+  ctx.font = `${Math.round(13 * S + 4)}px sans-serif`;
+  ctx.fillText(L.sub, x, y - bh - 8 * S - 4);
+  // 氢气标记（大量气泡时液面上方画 H₂↑）
+  if (b.bubbles.length > 6) {
+    ctx.fillStyle = "rgba(60,110,150,0.9)";
+    ctx.font = `bold ${Math.round(15 * S + 5)}px sans-serif`;
+    ctx.fillText("H₂↑", x + bw * 0.42, liquidTop - 10 - Math.sin(performance.now() / 300) * 4);
+  }
+}
+function beakerPath(x, top, bw, bottom) {
+  ctx.beginPath();
+  ctx.moveTo(x - bw / 2, top);
+  ctx.lineTo(x - bw / 2, bottom - 12);
+  ctx.quadraticCurveTo(x - bw / 2, bottom, x - bw / 2 + 12, bottom);
+  ctx.lineTo(x + bw / 2 - 12, bottom);
+  ctx.quadraticCurveTo(x + bw / 2, bottom, x + bw / 2, bottom - 12);
+  ctx.lineTo(x + bw / 2, top);
+}
+
+// 金属外形：统一以 (x,y) 为中心
+function drawMetal(m) {
+  ctx.save();
+  ctx.translate(m.x, m.y);
+  if (m.id === "fe") drawNail(m);
+  else if (m.id === "cu") drawCopper(m);
+  else drawZinc(m);
+  ctx.restore();
+  // 拖拽中或工具区显示名字
+  if (m.beaker === null) {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#2b5468";
+    ctx.font = `bold ${Math.round(15 * S + 5)}px sans-serif`;
+    ctx.fillText(m.name, m.x, m.y + 44 * S + 14);
+  }
+  // 静悄悄标记
+  if (m.quietShown && m.beaker !== null && !reactionOf(m.id, m.beaker)) {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "rgba(90,110,130,0.95)";
+    ctx.font = `${Math.round(14 * S + 4)}px sans-serif`;
+    ctx.fillText("静悄悄 💤", m.x, m.y - 52 * S - 12);
+  }
+}
+function speckColor(m) {
+  if (m.id === "fe") return `rgba(190,80,50,`;      // 析出红色铜
+  if (m.id === "zn") return `rgba(70,40,38,`;       // 变黑红
+  return `rgba(120,60,40,`;
+}
+function drawSpecks(m, w, h) {
+  const n = Math.floor(m.prog * m.specks.length);
+  ctx.fillStyle = speckColor(m) + "0.75)";
+  for (let i = 0; i < n; i++) {
+    const sp = m.specks[i];
+    ctx.beginPath();
+    ctx.arc(sp.dx * w / 2, sp.dy * h / 2, sp.r * S, 0, 7);
+    ctx.fill();
+  }
+}
+function drawNail(m) {
+  const len = 84 * S * 1.4, wd = 13 * S * 1.4;
+  ctx.rotate(-0.5);
+  const t = m.prog;
+  const g = ctx.createLinearGradient(0, -wd, 0, wd);
+  g.addColorStop(0, "#b9c2c9"); g.addColorStop(0.5, "#8d979e"); g.addColorStop(1, "#6b747b");
+  ctx.fillStyle = g;
+  // 钉身
+  ctx.beginPath();
+  ctx.moveTo(-len / 2, -wd / 2);
+  ctx.lineTo(len / 2 - wd, -wd / 2);
+  ctx.lineTo(len / 2, 0);
+  ctx.lineTo(len / 2 - wd, wd / 2);
+  ctx.lineTo(-len / 2, wd / 2);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "rgba(40,50,60,0.5)"; ctx.lineWidth = 1.5; ctx.stroke();
+  // 钉头
+  ctx.fillStyle = "#9aa4ab";
+  roundRect(-len / 2 - 7 * S * 1.4, -wd, 8 * S * 1.4, wd * 2, 3, true);
+  ctx.strokeRect(-len / 2 - 7 * S * 1.4, -wd, 8 * S * 1.4, wd * 2);
+  if (t > 0) drawSpecks(m, len * 0.9, wd * 1.6);
+}
+function drawCopper(m) {
+  const w = 66 * S * 1.4, h = 24 * S * 1.4;
+  const g = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+  g.addColorStop(0, "#e89a5b"); g.addColorStop(0.5, "#cd7433"); g.addColorStop(1, "#a85a24");
+  ctx.fillStyle = g;
+  roundRect(-w / 2, -h / 2, w, h, 6 * S, true);
+  ctx.strokeStyle = "rgba(90,40,10,0.5)"; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  roundRect(-w / 2 + 5, -h / 2 + 3, w - 10, h * 0.28, 4, true);
+}
+function drawZinc(m) {
+  const R = 11 * S * 1.4;
+  const offs = [[-R, 0], [R * 0.9, -R * 0.5], [R * 0.4, R * 0.8], [-R * 0.6, -R * 0.9]];
+  for (const [ox, oy] of offs) {
+    const g = ctx.createRadialGradient(ox - R * 0.3, oy - R * 0.3, 1, ox, oy, R);
+    g.addColorStop(0, "#c3d2dd"); g.addColorStop(1, "#7e93a5");
+    ctx.beginPath(); ctx.arc(ox, oy, R, 0, 7);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = "rgba(50,70,85,0.5)"; ctx.lineWidth = 1.2; ctx.stroke();
+  }
+  if (m.prog > 0) drawSpecks(m, R * 3.4, R * 3.2);
+}
+
+function drawBoard() {
+  // 右侧面板
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.fillRect(board.x + 8, 8, board.w - 16, H - 16);
+  ctx.strokeStyle = "rgba(46,125,156,0.5)"; ctx.lineWidth = 2;
+  ctx.strokeRect(board.x + 8, 8, board.w - 16, H - 16);
+  const cx = board.x + board.w / 2;
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#1d4e63";
+  ctx.font = `bold ${Math.round(20 * S + 6)}px sans-serif`;
+  ctx.fillText("活动性榜单", cx, 52);
+  ctx.fillStyle = "#5a7d8c";
+  ctx.font = `${Math.round(13 * S + 4)}px sans-serif`;
+  ctx.fillText("做实验，把榜单点亮！", cx, 76);
+
+  const rows = [
+    { id:"zn", name:"锌 Zn", emoji:"⚡", tip:"最活泼" },
+    { id:"fe", name:"铁 Fe", emoji:"🔩", tip:"中间" },
+    { id:"cu", name:"铜 Cu", emoji:"🛡️", tip:"最不活泼" },
+  ];
+  const cardW = board.w - 70, cardH = 92;
+  let y = 110;
+  rows.forEach((r, i) => {
+    const lit = discovered[r.id];
+    const x0 = cx - cardW / 2;
+    ctx.fillStyle = lit ? (i === 0 ? "#ffe9a8" : i === 1 ? "#e3ecff" : "#ffe3d3") : "#e8ecef";
+    roundRect(x0, y, cardW, cardH, 14, true);
+    ctx.strokeStyle = lit ? "#e0a020" : "#c3ccd2"; ctx.lineWidth = lit ? 3 : 2;
+    roundRect(x0, y, cardW, cardH, 14, false); ctx.stroke();
+    ctx.fillStyle = lit ? "#5a3d00" : "#9aa6ad";
+    ctx.font = `bold ${Math.round(22 * S + 6)}px sans-serif`;
+    ctx.fillText(lit ? `${r.emoji} ${r.name}` : `❓ ? ?`, cx, y + 42);
+    ctx.font = `${Math.round(13 * S + 3)}px sans-serif`;
+    ctx.fillText(lit ? r.tip : "还没发现", cx, y + 68);
+    if (i < 2) {
+      ctx.fillStyle = discovered[rows[i].id] && discovered[rows[i + 1].id] ? "#e0a020" : "#b9c3ca";
+      ctx.font = `bold ${Math.round(24 * S + 8)}px sans-serif`;
+      ctx.fillText(">", cx, y + cardH + 24);
+    }
+    y += cardH + 42;
+  });
+  // 总结
+  if (celebrated) {
+    ctx.fillStyle = "#e0a020";
+    ctx.font = `bold ${Math.round(16 * S + 5)}px sans-serif`;
+    const lines = ["排前面的金属", "能抢排后面金属的溶液！"];
+    lines.forEach((t, i) => ctx.fillText(t, cx, y + 16 + i * 26));
+  } else {
+    ctx.fillStyle = "#8fa3ad";
+    ctx.font = `${Math.round(12 * S + 3)}px sans-serif`;
+    ctx.fillText("提示：盐酸能分出谁更活泼", cx, y + 16);
+    ctx.fillText("硫酸铜能试出谁会抢", cx, y + 40);
+  }
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.c;
+    ctx.fillRect(-c.r, -c.r / 2, c.r * 2, c.r);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  beakers.forEach((b, i) => drawBeaker(b, i));
+  // 烧杯里的金属先画（在液体上层），拖拽中的最后画
+  const dragM = metals.find(m => m.drag);
+  metals.forEach(m => { if (m.beaker !== null && m !== dragM) drawMetal(m); });
+  metals.forEach(m => { if (m.beaker === null && m !== dragM) drawMetal(m); });
+  if (dragM) drawMetal(dragM);
+  drawBoard();
+  drawConfetti();
+}
+
+/* ================= 交互 ================= */
+function hitMetal(x, y) {
+  for (let i = metals.length - 1; i >= 0; i--) {
+    const m = metals[i];
+    if (Math.hypot(x - m.x, y - m.y) < 56 * S + 22) return m;
+  }
+  return null;
+}
+function beakerAt(x, y) {
+  for (let i = 0; i < beakers.length; i++) {
+    const b = beakers[i];
+    if (x > b.x - b.bw / 2 - 10 && x < b.x + b.bw / 2 + 10 &&
+        y > b.y - b.bh - 10 && y < b.y + 10) return i;
+  }
+  return -1;
+}
+function dropMetal(m, bi) {
+  if (m.beaker !== null) {
+    const old = beakers[m.beaker];
+    old.metals.splice(old.metals.indexOf(m), 1);
+    layoutBeakerMetals(m.beaker);
+    m.beaker = null;
+  }
+  if (bi >= 0) {
+    m.beaker = bi;
+    m.quietT = 0; m.quietShown = false;
+    beakers[bi].metals.push(m);
+    layoutBeakerMetals(bi);
+    pop(660);
+    const L = LIQUIDS[bi];
+    showHint(`${m.name} 放进了${L.name}，仔细看！`);
+  } else {
+    m.x = m.home.x; m.y = m.home.y;
+    pop(440);
+  }
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const m = hitMetal(e.clientX, e.clientY);
+  if (!m) return;
+  m.drag = { dx:m.x - e.clientX, dy:m.y - e.clientY };
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+  pop(520);
+});
+canvas.addEventListener("pointermove", e => {
+  const m = metals.find(m => m.drag);
+  if (!m) return;
+  m.x = e.clientX + m.drag.dx;
+  m.y = e.clientY + m.drag.dy;
+});
+window.addEventListener("pointerup", e => {
+  const m = metals.find(m => m.drag);
+  if (!m) return;
+  m.drag = null;
+  dropMetal(m, beakerAt(e.clientX, e.clientY));
+});
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+document.getElementById("resetBtn").addEventListener("click", () => { resetGame(); pop(880); showHint("重新开始！把金属拖进烧杯试试"); });
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = (f, v) => tone(f, 0.12, v || 0.12);
+const fizz = () => tone(1800 + Math.random() * 1400, 0.05, 0.025, "square");
+function fanfare(k) {
+  [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.18, 0.12 * (k || 1)), i * 120));
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3200);
+}
+resize();
+resetGame();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

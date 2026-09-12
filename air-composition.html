@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>空气的秘密：蜡烛钟罩实验</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#20303f; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,32,44,0.88); color:#fff; padding:10px 22px;
+    border-radius:24px; font-size:16px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="hint">👆 拖动大玻璃钟罩，罩住燃烧的蜡烛！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 布局 ================= */
+// 左侧实验场景 + 右侧空气成分面板，全部随窗口重算
+const L = {};
+function layout() {
+  L.panelW = Math.max(250, Math.min(360, W * 0.30));
+  L.panelX = W - L.panelW - 14;
+  L.sceneR = L.panelX - 14;
+  // 水槽
+  L.troughX = 26; L.troughW = L.sceneR - 52;
+  L.troughY = H - 175; L.troughH = 130;
+  L.waterY = L.troughY + 34;               // 槽内水面
+  // 蜡烛
+  L.cx = L.troughX + L.troughW * 0.5;
+  L.platY = L.waterY - 56;                 // 烛台顶面
+  L.candleH = 62;
+  L.wickY = L.platY - L.candleH;           // 火焰根部
+  // 钟罩
+  L.jarW = 190; L.jarH = Math.min(300, Math.max(220, H * 0.42));
+  L.jarPlacedX = L.cx - L.jarW / 2;
+  L.jarPlacedY = L.waterY - L.jarH + 34;   // 罩口插入水下 34px 密封
+  L.jarHomeX = L.troughX + 36;
+  L.jarHomeY = L.troughY - L.jarH;         // 放在水槽左边沿上
+  L.innerH = L.jarH - 34 - 10;             // 罩内水面上方的气柱高度
+  L.riseMax = L.innerH / 5;                // 水只升 1/5！
+  // 氧气条
+  L.o2BarX = L.sceneR - 58; L.o2BarY = L.jarPlacedY + 6;
+  L.o2BarW = 26; L.o2BarH = Math.min(190, L.jarH - 40);
+  // 饼图与面板
+  L.pieX = L.panelX + L.panelW / 2; L.pieY = 176;
+  L.pieR = Math.min(86, L.panelW * 0.32);
+  L.btnW = L.panelW - 48; L.btnH = 42;
+  L.btn1 = { x: L.panelX + 24, y: 366, w: L.btnW, h: L.btnH };
+  L.btn2 = { x: L.panelX + 24, y: 418, w: L.btnW, h: L.btnH };
+  L.answerY = 482;
+  // 钟罩位置校正
+  if (jar) {
+    if (jar.sealed) { jar.x = L.jarPlacedX; jar.y = L.jarPlacedY; }
+    else {
+      jar.x = Math.max(6, Math.min(L.sceneR - L.jarW - 6, jar.x));
+      jar.y = Math.max(6, Math.min(H - L.jarH - 6, jar.y));
+    }
+  }
+}
+
+/* ================= 场景数据 ================= */
+const jar = { x: 0, y: 0, sealed: false, dragging: false, dx: 0, dy: 0 };
+let o2 = 100;              // 罩内氧气 %
+let wLevel = 0;            // 罩内进水 0..1（1 = 升到 1/5）
+let flame = 1;             // 火焰大小 0..1
+let extinguished = false;
+let riseDelay = 0;         // 熄灭后稍等再进水
+let done = false;          // 水升到 1/5，进入提问阶段
+let quizShown = false, answered1 = false, answered2 = false;
+let suckPlayed = false;
+let smoke = [], bubbles = [], sparks = [];
+
+// 罩内气体分子（相对罩内坐标，2 个氧分子 + 8 个氮分子）
+const mols = [];
+(function () {
+  let seed = 7;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let i = 0; i < 10; i++)
+    mols.push({ rx: 0.12 + rnd() * 0.76, ry: 0.10 + rnd() * 0.72, o2: i < 2, ph: rnd() * 6.28 });
+})();
+
+resize();
+jar.x = L.jarHomeX; jar.y = L.jarHomeY;
+
+/* ================= 状态推进（物理） ================= */
+function update(dt, now) {
+  if (jar.sealed) {
+    // 氧气被蜡烛慢慢烧掉（约 7 秒）
+    if (o2 > 0) o2 = Math.max(0, o2 - (100 / 7) * dt);
+    if (o2 <= 0 && !extinguished) {
+      extinguished = true;
+      riseDelay = 0.8;
+      spawnSmoke();
+      puff();
+      showHint("氧气烧完了，蜡烛熄灭了！看水面……");
+    }
+    if (extinguished) {
+      if (riseDelay > 0) {
+        riseDelay -= dt;
+        if (riseDelay <= 0 && !suckPlayed) { suckPlayed = true; suck(); }
+      } else if (wLevel < 1) {
+        wLevel = Math.min(1, wLevel + dt / 3.5);   // 水被大气压压进钟罩
+        spawnBubble();
+        if (Math.random() < dt * 5) pop(380 + Math.random() * 320, 0.05);
+        if (wLevel >= 1 && !done) {
+          done = true; quizShown = true;
+          fanfare(); spawnSparks();
+          showHint("水面停在 1/5！右边两个问题，点一点想一想 🤔");
+        }
+      }
+    }
+  } else {
+    // 打开钟罩：空气回来、水退掉、蜡烛重新点燃
+    if (o2 < 100) o2 = Math.min(100, o2 + 130 * dt);
+    if (wLevel > 0) wLevel = Math.max(0, wLevel - dt * 1.5);
+    if (extinguished && o2 > 15) { extinguished = false; pop(900, 0.12); }
+    if (quizShown && o2 > 60) { quizShown = false; answered1 = answered2 = false; }
+    done = false; suckPlayed = false;
+  }
+  const target = jar.sealed ? (extinguished ? 0 : 0.25 + 0.75 * o2 / 100) : 1;
+  flame += (target - flame) * Math.min(1, dt * 4);
+  // 粒子
+  for (const p of smoke) { p.x += p.vx * dt; p.y += p.vy * dt; p.r += 14 * dt; p.a -= dt * 0.5; }
+  smoke = smoke.filter(p => p.a > 0);
+  for (const b of bubbles) { b.y -= b.vy * dt; b.x += Math.sin(now / 90 + b.ph) * 0.4; }
+  const surfaceY = L.waterY + wLevel * 5;   // 浮到槽内水面就消失
+  bubbles = bubbles.filter(b => b.y > surfaceY + 2);
+  for (const s of sparks) { s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 240 * dt; s.a -= dt * 0.9; }
+  sparks = sparks.filter(s => s.a > 0);
+}
+
+function spawnSmoke() {
+  for (let i = 0; i < 14; i++)
+    smoke.push({ x: L.cx + (Math.random() - 0.5) * 14, y: L.wickY - 6,
+      vx: (Math.random() - 0.5) * 16, vy: -26 - Math.random() * 22,
+      r: 4 + Math.random() * 5, a: 0.55 + Math.random() * 0.3 });
+}
+function spawnBubble() {
+  if (bubbles.length > 26) return;
+  const side = Math.random() < 0.5 ? -1 : 1;
+  bubbles.push({ x: L.cx + side * (L.jarW / 2 - 8) + (Math.random() - 0.5) * 10,
+    y: L.waterY + 22 + Math.random() * 30, vy: 26 + Math.random() * 26,
+    r: 2 + Math.random() * 2.5, ph: Math.random() * 6.28 });
+}
+function spawnSparks() {
+  for (let i = 0; i < 26; i++) {
+    const a = Math.random() * 6.28, sp = 90 + Math.random() * 160;
+    sparks.push({ x: L.pieX, y: L.pieY, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 60,
+      a: 1, c: ["#ffd54a", "#ff7a45", "#4da3ff", "#7ee08a"][i % 4] });
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#bfe3f2"); g.addColorStop(0.72, "#d8eef7"); g.addColorStop(0.72, "#c9a06a"); g.addColorStop(1, "#b08550");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, L.sceneR + 14, H);
+  // 场景标题
+  ctx.fillStyle = "rgba(30,50,70,0.85)";
+  ctx.font = "bold 22px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillText("🕯️ 蜡烛钟罩实验", 24, 18);
+  ctx.font = "14px sans-serif";
+  ctx.fillStyle = "rgba(30,50,70,0.55)";
+  ctx.fillText("空气里到底有什么？动手试试看！", 24, 48);
+}
+
+function drawTrough(now) {
+  // 玻璃水槽
+  ctx.fillStyle = "rgba(220,240,250,0.45)";
+  ctx.fillRect(L.troughX, L.troughY, L.troughW, L.troughH);
+  // 水（水面随进水微微下降：水跑进了钟罩）
+  const wy = L.waterY + wLevel * 5;
+  const wg = ctx.createLinearGradient(0, wy, 0, L.troughY + L.troughH);
+  wg.addColorStop(0, "rgba(110,190,235,0.75)"); wg.addColorStop(1, "rgba(60,140,205,0.85)");
+  ctx.fillStyle = wg;
+  ctx.beginPath();
+  ctx.moveTo(L.troughX + 4, wy);
+  for (let x = 0; x <= L.troughW - 8; x += 14)
+    ctx.lineTo(L.troughX + 4 + x, wy + Math.sin(now / 420 + x / 40) * 2);
+  ctx.lineTo(L.troughX + L.troughW - 4, L.troughY + L.troughH - 4);
+  ctx.lineTo(L.troughX + 4, L.troughY + L.troughH - 4);
+  ctx.closePath(); ctx.fill();
+  // 槽壁
+  ctx.strokeStyle = "rgba(90,120,140,0.8)"; ctx.lineWidth = 4;
+  ctx.strokeRect(L.troughX, L.troughY, L.troughW, L.troughH);
+  // 气泡
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  for (const b of bubbles) { ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill(); }
+}
+
+function drawCandle(now) {
+  // 烛台底座（从水底伸出来）
+  ctx.fillStyle = "#8d9aa5";
+  ctx.fillRect(L.cx - 22, L.platY, 44, L.troughY + L.troughH - L.platY - 6);
+  ctx.fillStyle = "#aab6bf";
+  ctx.fillRect(L.cx - 30, L.platY - 8, 60, 10);
+  // 蜡烛
+  const cg = ctx.createLinearGradient(L.cx - 11, 0, L.cx + 11, 0);
+  cg.addColorStop(0, "#f6e3b8"); cg.addColorStop(0.5, "#fff3d6"); cg.addColorStop(1, "#e8cf9c");
+  ctx.fillStyle = cg;
+  roundRect(L.cx - 11, L.wickY, 22, L.candleH, 5); ctx.fill();
+  ctx.fillStyle = "#e63946";                     // 红色腰线
+  ctx.fillRect(L.cx - 11, L.wickY + 16, 22, 5);
+  // 烛芯
+  ctx.strokeStyle = "#4a3520"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(L.cx, L.wickY + 2); ctx.lineTo(L.cx, L.wickY - 6); ctx.stroke();
+  // 火焰
+  if (flame > 0.02) {
+    const fl = 1 + 0.12 * Math.sin(now / 90) + 0.07 * Math.sin(now / 37 + 2);
+    const fh = 44 * flame * fl, fw = 15 * Math.sqrt(flame);
+    const fy = L.wickY - 6;
+    // 光晕
+    const glow = ctx.createRadialGradient(L.cx, fy - fh * 0.4, 2, L.cx, fy - fh * 0.4, fh * 1.7);
+    glow.addColorStop(0, `rgba(255,190,80,${0.35 * flame})`); glow.addColorStop(1, "rgba(255,190,80,0)");
+    ctx.fillStyle = glow;
+    ctx.beginPath(); ctx.arc(L.cx, fy - fh * 0.4, fh * 1.7, 0, 7); ctx.fill();
+    // 外焰
+    ctx.beginPath();
+    ctx.moveTo(L.cx, fy);
+    ctx.quadraticCurveTo(L.cx - fw, fy - fh * 0.35, L.cx - fw * 0.25, fy - fh * 0.72);
+    ctx.quadraticCurveTo(L.cx, fy - fh, L.cx + fw * 0.25, fy - fh * 0.72);
+    ctx.quadraticCurveTo(L.cx + fw, fy - fh * 0.35, L.cx, fy);
+    ctx.fillStyle = "rgba(255,138,42,0.92)"; ctx.fill();
+    // 内焰
+    ctx.beginPath();
+    ctx.moveTo(L.cx, fy);
+    ctx.quadraticCurveTo(L.cx - fw * 0.55, fy - fh * 0.25, L.cx, fy - fh * 0.58);
+    ctx.quadraticCurveTo(L.cx + fw * 0.55, fy - fh * 0.25, L.cx, fy);
+    ctx.fillStyle = "rgba(255,224,120,0.95)"; ctx.fill();
+  }
+  // 烟
+  for (const p of smoke) {
+    ctx.fillStyle = `rgba(120,120,125,${p.a})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  }
+}
+
+function jarPath(x, y) {
+  const w = L.jarW, h = L.jarH, r = 26;
+  ctx.beginPath();
+  ctx.moveTo(x, y + h);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h);
+  ctx.closePath();
+}
+
+function drawJarContents(now) {
+  // 只有罩在蜡烛上（或刚拿起水还没退完）时才画罩内水与分子
+  if (!jar.sealed && wLevel <= 0) return;
+  const x = L.jarPlacedX, y = L.jarPlacedY;
+  ctx.save();
+  jarPath(x + 5, y + 5);
+  ctx.clip();
+  // 罩内上升的水
+  if (wLevel > 0) {
+    const lvl = L.waterY - wLevel * L.riseMax;
+    const wg = ctx.createLinearGradient(0, lvl, 0, y + L.jarH);
+    wg.addColorStop(0, "rgba(120,200,240,0.85)"); wg.addColorStop(1, "rgba(70,150,210,0.9)");
+    ctx.fillStyle = wg;
+    ctx.beginPath();
+    ctx.moveTo(x, lvl);
+    for (let px = 0; px <= L.jarW; px += 12)
+      ctx.lineTo(x + px, lvl + Math.sin(now / 300 + px / 26) * 2.5 * (1 - wLevel * 0.6));
+    ctx.lineTo(x + L.jarW, y + L.jarH); ctx.lineTo(x, y + L.jarH);
+    ctx.closePath(); ctx.fill();
+  }
+  // 气体分子：氧分子（橙）被烧掉，氮分子（蓝）留下来
+  const innerTop = y + 12, innerBot = L.waterY - wLevel * L.riseMax - 6;
+  for (const m of mols) {
+    const mx = x + m.rx * L.jarW + Math.sin(now / 500 + m.ph) * 4;
+    const my = innerTop + m.ry * (innerBot - innerTop) + Math.cos(now / 430 + m.ph) * 4;
+    const alpha = m.o2 ? Math.max(0, o2 / 100) : 1;
+    if (alpha <= 0.02) continue;
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = m.o2 ? "#e06428" : "#2f7fd0"; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(mx - 6, my); ctx.lineTo(mx + 6, my); ctx.stroke();
+    ctx.fillStyle = m.o2 ? "#ff7a45" : "#4da3ff";
+    ctx.beginPath(); ctx.arc(mx - 6, my, 6, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(mx + 6, my, 6, 0, 7); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+function drawJar(now) {
+  const x = jar.x, y = jar.y;
+  // 玻璃罩体
+  jarPath(x, y);
+  ctx.fillStyle = "rgba(235,248,255,0.28)"; ctx.fill();
+  ctx.strokeStyle = "rgba(120,160,185,0.95)"; ctx.lineWidth = 5; ctx.stroke();
+  // 高光
+  ctx.strokeStyle = "rgba(255,255,255,0.65)"; ctx.lineWidth = 6;
+  ctx.beginPath();
+  ctx.moveTo(x + 18, y + L.jarH - 24);
+  ctx.lineTo(x + 18, y + 46);
+  ctx.quadraticCurveTo(x + 18, y + 20, x + 42, y + 14);
+  ctx.stroke();
+  // 顶部小把手
+  ctx.fillStyle = "rgba(120,160,185,0.95)";
+  roundRect(x + L.jarW / 2 - 16, y - 12, 32, 14, 6); ctx.fill();
+  // 1/5 刻度线（罩住时显示）
+  if (jar.sealed) {
+    const tickY = L.waterY - L.riseMax;
+    ctx.setLineDash([8, 7]);
+    ctx.strokeStyle = "rgba(230,57,70,0.85)"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(x + 4, tickY); ctx.lineTo(x + L.jarW - 4, tickY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#e63946";
+    ctx.font = "bold 15px sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+    ctx.fillText("1/5", x + 8, tickY - 3);
+  }
+  // 拖拽投影
+  if (jar.dragging) {
+    ctx.fillStyle = "rgba(0,0,0,0.12)";
+    ctx.beginPath(); ctx.ellipse(x + L.jarW / 2 + 8, L.troughY + L.troughH - 8, L.jarW * 0.45, 10, 0, 0, 7); ctx.fill();
+  }
+}
+
+function drawDropZone() {
+  if (!jar.dragging || jar.sealed) return;
+  const near = Math.abs(jar.x + L.jarW / 2 - L.cx) < 80;
+  ctx.setLineDash([10, 8]);
+  ctx.strokeStyle = near ? "rgba(46,180,80,0.95)" : "rgba(255,255,255,0.55)";
+  ctx.lineWidth = 4;
+  jarPath(L.jarPlacedX, L.jarPlacedY); ctx.stroke();
+  ctx.setLineDash([]);
+  if (near) {
+    ctx.fillStyle = "rgba(46,140,60,0.9)";
+    ctx.font = "bold 18px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.fillText("松手罩住蜡烛！", L.cx, L.jarPlacedY - 20);
+  }
+}
+
+function drawOxygenBar() {
+  const x = L.o2BarX, y = L.o2BarY, w = L.o2BarW, h = L.o2BarH;
+  ctx.fillStyle = "rgba(20,40,60,0.75)";
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+  ctx.fillText("罩内氧气", x + w / 2, y - 8);
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  roundRect(x, y, w, h, 10); ctx.fill();
+  const frac = o2 / 100;
+  if (frac > 0.005) {
+    const fg = ctx.createLinearGradient(0, y + h, 0, y);
+    fg.addColorStop(0, "#ffb84d"); fg.addColorStop(1, "#ff7a45");
+    ctx.fillStyle = fg;
+    roundRect(x + 3, y + 3 + (h - 6) * (1 - frac), w - 6, (h - 6) * frac, 8); ctx.fill();
+  }
+  ctx.strokeStyle = "rgba(90,120,140,0.9)"; ctx.lineWidth = 3;
+  roundRect(x, y, w, h, 10); ctx.stroke();
+  ctx.fillStyle = o2 > 25 ? "#2a4a5f" : "#e63946";
+  ctx.font = "bold 16px sans-serif"; ctx.textBaseline = "top";
+  ctx.fillText(Math.round(o2) + "%", x + w / 2, y + h + 6);
+}
+
+/* ---------- 右侧面板：空气成分 ---------- */
+const O2_FRAC = 0.21, OTHER_FRAC = 0.01;   // 氮气 ≈ 78%
+function drawPanel(now) {
+  // 底板
+  ctx.fillStyle = "rgba(24,40,56,0.92)";
+  roundRect(L.panelX, 12, L.panelW, H - 24, 18); ctx.fill();
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 21px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+  ctx.fillText("空气成分饼图", L.panelX + L.panelW / 2, 30);
+  // 饼图
+  const t0 = -Math.PI / 2;
+  const o2a = t0 + O2_FRAC * Math.PI * 2;
+  const othA = o2a + (1 - O2_FRAC - OTHER_FRAC) * Math.PI * 2;
+  const burned = extinguished;               // 氧气被烧掉后变淡
+  // 氮气（大块）
+  ctx.beginPath(); ctx.moveTo(L.pieX, L.pieY);
+  ctx.arc(L.pieX, L.pieY, L.pieR, o2a, othA); ctx.closePath();
+  ctx.fillStyle = "#4da3ff"; ctx.fill();
+  if (answered1) {                            // 答对后氮气发光
+    ctx.strokeStyle = `rgba(255,213,74,${0.6 + 0.4 * Math.sin(now / 200)})`;
+    ctx.lineWidth = 6; ctx.stroke();
+  }
+  // 其他气体
+  ctx.beginPath(); ctx.moveTo(L.pieX, L.pieY);
+  ctx.arc(L.pieX, L.pieY, L.pieR, othA, t0 + Math.PI * 2); ctx.closePath();
+  ctx.fillStyle = "#b9c4cc"; ctx.fill();
+  // 氧气
+  ctx.beginPath(); ctx.moveTo(L.pieX, L.pieY);
+  ctx.arc(L.pieX, L.pieY, L.pieR, t0, o2a); ctx.closePath();
+  ctx.fillStyle = burned ? "rgba(160,150,145,0.55)" : "#ff7a45"; ctx.fill();
+  if (burned) {
+    // 斜线阴影：这块氧气被烧掉了
+    ctx.save();
+    ctx.beginPath(); ctx.moveTo(L.pieX, L.pieY);
+    ctx.arc(L.pieX, L.pieY, L.pieR, t0, o2a); ctx.closePath(); ctx.clip();
+    ctx.strokeStyle = "rgba(60,50,48,0.6)"; ctx.lineWidth = 3;
+    for (let hx = -L.pieR; hx < L.pieR; hx += 10) {
+      ctx.beginPath();
+      ctx.moveTo(L.pieX + hx - L.pieR, L.pieY - L.pieR);
+      ctx.lineTo(L.pieX + hx + L.pieR, L.pieY + L.pieR);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(L.pieX, L.pieY, L.pieR, 0, 7); ctx.stroke();
+  if (burned) {
+    ctx.fillStyle = "#ffb08a";
+    ctx.font = "bold 13px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    const mid = (t0 + o2a) / 2;
+    ctx.fillText("烧掉了", L.pieX + Math.cos(mid) * L.pieR * 1.42, L.pieY + Math.sin(mid) * L.pieR * 1.42);
+  }
+  // 图例
+  const lx = L.panelX + 30;
+  let ly = L.pieY + L.pieR + 18;
+  ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.font = "15px sans-serif";
+  const items = [
+    ["#ff7a45", "氧气：约 1/5（能助燃）"],
+    ["#4da3ff", answered1 ? "氮气：约 4/5 ✓" : "氮气：约 4/5（不助燃）"],
+    ["#b9c4cc", "其他气体：很少很少"],
+  ];
+  for (const [c, txt] of items) {
+    ctx.fillStyle = c; ctx.beginPath(); ctx.arc(lx + 7, ly, 7, 0, 7); ctx.fill();
+    ctx.fillStyle = "#e8f0f6"; ctx.fillText(txt, lx + 22, ly);
+    ly += 26;
+  }
+  // 问题按钮
+  if (quizShown) {
+    drawButton(L.btn1, answered1 ? "✓ 是氮气！不助燃，留下来了" : "🤔 剩下的 4/5 是什么气？", answered1);
+    drawButton(L.btn2, answered2 ? "✓ 因为氧气只有约 1/5" : "💡 为什么水只升到 1/5？", answered2);
+    // 答案区
+    ctx.textAlign = "left"; ctx.textBaseline = "top";
+    if (answered1) {
+      ctx.fillStyle = "#9fd0ff"; ctx.font = "14px sans-serif";
+      wrapText("剩下的大部分是氮气。它约占空气的 4/5，不支持燃烧，所以蜡烛熄灭后它还在罩子里。", L.btn1.x, L.answerY, L.btnW, 20);
+    }
+    if (answered2) {
+      ctx.fillStyle = "#ffe9a8"; ctx.font = "14px sans-serif";
+      wrapText("蜡烛只烧掉了氧气。氧气约占 1/5，烧完后罩内气压变小，外面的大气压把水压进钟罩，正好填满氧气留下的 1/5 空间，所以水面只升到 1/5！", L.btn1.x, answered1 ? L.answerY + 66 : L.answerY, L.btnW, 20);
+    }
+  }
+  // 庆祝星星
+  for (const s of sparks) {
+    ctx.globalAlpha = Math.max(0, s.a);
+    ctx.fillStyle = s.c;
+    ctx.beginPath(); ctx.arc(s.x, s.y, 4, 0, 7); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawButton(b, label, active) {
+  ctx.fillStyle = active ? "rgba(46,140,80,0.9)" : "rgba(255,213,74,0.95)";
+  roundRect(b.x, b.y, b.w, b.h, 21); ctx.fill();
+  ctx.fillStyle = active ? "#eafff0" : "#4a3600";
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2);
+}
+
+function wrapText(text, x, y, maxW, lh) {
+  let line = "", yy = y;
+  for (const ch of text) {
+    if (ctx.measureText(line + ch).width > maxW) { ctx.fillText(line, x, yy); line = ch; yy += lh; }
+    else line += ch;
+  }
+  if (line) ctx.fillText(line, x, yy);
+}
+
+function draw(now) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  drawBackground();
+  drawDropZone();
+  drawTrough(now);
+  drawCandle(now);
+  drawJarContents(now);
+  drawJar(now);
+  drawOxygenBar();
+  drawPanel(now);
+}
+
+/* ================= 交互 ================= */
+function hitJar(px, py) {
+  return px > jar.x - 12 && px < jar.x + L.jarW + 12 && py > jar.y - 16 && py < jar.y + L.jarH + 12;
+}
+function hitBtn(b, px, py) { return px > b.x && px < b.x + b.w && py > b.y && py < b.y + b.h; }
+
+canvas.addEventListener("pointerdown", e => {
+  const px = e.clientX, py = e.clientY;
+  // 问题按钮
+  if (quizShown) {
+    if (hitBtn(L.btn1, px, py)) {
+      if (!answered1) { answered1 = true; fanfare(); showHint("对！剩下的大部分是氮气 🎉"); }
+      return;
+    }
+    if (hitBtn(L.btn2, px, py)) {
+      if (!answered2) { answered2 = true; pop(700, 0.12); showHint("因为烧掉的氧气只占约 1/5 呀！"); }
+      return;
+    }
+  }
+  // 抓起钟罩
+  if (hitJar(px, py)) {
+    jar.dragging = true;
+    jar.dx = px - jar.x; jar.dy = py - jar.y;
+    if (jar.sealed) {                       // 拿起 = 重做实验
+      jar.sealed = false;
+      whooshAir();
+      showHint("空气回来了！再罩一次试试 🔁");
+    }
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!jar.dragging) return;
+  jar.x = Math.max(6, Math.min(L.sceneR - L.jarW - 6, e.clientX - jar.dx));
+  jar.y = Math.max(6, Math.min(H - L.jarH - 6, e.clientY - jar.dy));
+});
+window.addEventListener("pointerup", () => {
+  if (!jar.dragging) return;
+  jar.dragging = false;
+  // 靠近蜡烛上方 → 吸附罩住
+  if (Math.abs(jar.x + L.jarW / 2 - L.cx) < 80 && Math.abs(jar.y - L.jarPlacedY) < 90) {
+    jar.x = L.jarPlacedX; jar.y = L.jarPlacedY;
+    jar.sealed = true;
+    thunk();
+    showHint("罩住了！蜡烛在慢慢消耗罩内的氧气……");
+  }
+});
+
+/* ================= 音效 ================= */
+let actx = null;
+function ac() {
+  try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  return actx;
+}
+function tone(freq, dur, vol, type) {
+  const a = ac(); if (!a) return;
+  try {
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(); o.stop(a.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+function noise(dur, vol, f0, f1) {
+  const a = ac(); if (!a) return;
+  try {
+    const n = Math.floor(a.sampleRate * dur);
+    const buf = a.createBuffer(1, n, a.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    const src = a.createBufferSource(); src.buffer = buf;
+    const bp = a.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 1.2;
+    bp.frequency.setValueAtTime(f0, a.currentTime);
+    bp.frequency.exponentialRampToValueAtTime(f1, a.currentTime + dur);
+    const g = a.createGain();
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    src.connect(bp); bp.connect(g); g.connect(a.destination);
+    src.start();
+  } catch (e) {}
+}
+const pop = (f, v) => tone(f, 0.15, v || 0.14);
+const thunk = () => { tone(95, 0.22, 0.22, "triangle"); noise(0.08, 0.10, 500, 200); };
+const puff = () => noise(0.35, 0.20, 900, 250);            // 熄火“噗”
+const suck = () => noise(1.6, 0.16, 1400, 300);            // 吸气声
+const whooshAir = () => noise(0.4, 0.12, 300, 1400);       // 空气回流
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 主循环与提示 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  update(dt, now);
+  draw(now);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

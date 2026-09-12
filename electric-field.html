@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>电场线与等势面</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#0b1220; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(8,14,28,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; border:1px solid rgba(255,213,74,0.25);
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(8,14,28,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  #toolbox {
+    position:absolute; left:0; top:0; bottom:0; width:132px; z-index:10;
+    background:rgba(10,16,30,0.92); border-right:1px solid rgba(255,255,255,0.08);
+    display:flex; flex-direction:column; align-items:center; padding:14px 8px; gap:10px;
+    transition:box-shadow 0.2s;
+  }
+  #toolbox.deleting { box-shadow:inset 0 0 0 3px #ff5252; }
+  .tb-title { color:#ffd54a; font-size:16px; font-weight:bold; margin-bottom:2px; }
+  .chip {
+    width:56px; height:56px; border-radius:50%; touch-action:none; cursor:grab;
+    display:flex; align-items:center; justify-content:center;
+    font-size:20px; font-weight:bold; color:#fff; user-select:none; -webkit-user-select:none;
+    box-shadow:0 3px 8px rgba(0,0,0,0.5);
+  }
+  .chip:active { cursor:grabbing; transform:scale(1.08); }
+  .chip.pos { background:radial-gradient(circle at 35% 30%, #ff8a75, #e53935 70%); }
+  .chip.neg { background:radial-gradient(circle at 35% 30%, #7db6ff, #1e63d0 70%); }
+  .tb-sep { width:80%; height:1px; background:rgba(255,255,255,0.15); margin:2px 0; }
+  .preset {
+    width:108px; padding:8px 0; border:none; border-radius:16px; cursor:pointer;
+    background:rgba(255,255,255,0.1); color:#e8eefc; font-size:14px; font-weight:bold;
+  }
+  .preset:active { background:rgba(255,213,74,0.35); transform:scale(1.04); }
+  .tb-tip { color:rgba(255,255,255,0.45); font-size:12px; text-align:center; line-height:1.5; margin-top:auto; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="toolbox">
+  <div class="tb-title">⚡ 工具箱</div>
+  <div class="chip pos" data-q="1">+1</div>
+  <div class="chip pos" data-q="2">+2</div>
+  <div class="chip neg" data-q="-1">−1</div>
+  <div class="chip neg" data-q="-2">−2</div>
+  <div class="tb-sep"></div>
+  <button class="preset" data-p="single">点电荷</button>
+  <button class="preset" data-p="dipole">电偶极子</button>
+  <button class="preset" data-p="plate">平行板</button>
+  <button class="preset" data-p="clear">清空</button>
+  <div class="tb-tip">把电荷拖回<br>这里可删除</div>
+</div>
+<div id="scorebar">🎯 任务：用 4 个电荷造出匀强电场区域</div>
+<div id="hint">从左边把电荷拖到画布上，拖动黄色测试点看场强！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const tbEl = document.getElementById("toolbox");
+let W = 0, H = 0, DPR = 1;
+const TB_W = 132;              // 左侧工具箱宽度
+const K = 90000;               // 库仑常数（像素单位制）
+const CHARGE_R = 17;           // 电荷图标半径
+const MAX_CHARGES = 12;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  markDirty();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+let charges = [];              // {x, y, q}  q ∈ {±1, ±2}
+const probe = { x: 0, y: 0 };  // 测试点（可拖动）
+
+function fieldAt(x, y) {
+  let ex = 0, ey = 0;
+  for (const c of charges) {
+    const dx = x - c.x, dy = y - c.y;
+    let r2 = dx * dx + dy * dy;
+    if (r2 < 36) r2 = 36;      // 防止除零
+    const inv = K * c.q / (r2 * Math.sqrt(r2));
+    ex += inv * dx; ey += inv * dy;
+  }
+  return [ex, ey];
+}
+function potentialAt(x, y) {
+  let v = 0;
+  for (const c of charges) {
+    const d = Math.hypot(x - c.x, y - c.y);
+    v += K * c.q / Math.max(d, 12);
+  }
+  return v;
+}
+
+/* ================= 经典布局 ================= */
+function placePreset(name) {
+  const cx = (TB_W + W) / 2, cy = H / 2;
+  if (name === "clear") {
+    charges = [];
+  } else if (name === "single") {
+    charges = [{ x: cx, y: cy, q: 1 }];
+  } else if (name === "dipole") {
+    charges = [{ x: cx - 120, y: cy, q: 1 }, { x: cx + 120, y: cy, q: -1 }];
+  } else if (name === "plate") {
+    charges = [];
+    for (let i = 0; i < 4; i++) {
+      charges.push({ x: cx - 135 + i * 90, y: cy - 150, q: 1 });
+      charges.push({ x: cx - 135 + i * 90, y: cy + 150, q: -1 });
+    }
+  }
+  markDirty();
+  pop(700);
+}
+document.querySelectorAll(".preset").forEach(btn => {
+  btn.addEventListener("click", () => placePreset(btn.dataset.p));
+});
+
+/* ================= 场渲染缓存 ================= */
+// 电荷一变动就标脏，下一帧重算：等势背景、等势线、电场线、任务检测
+let dirty = true;
+function markDirty() { dirty = true; }
+
+const GRID = 7;                // 等势背景采样格（CSS 像素）
+const VSCALE = K / 90;         // 电势颜色归一化
+const potCanvas = document.createElement("canvas");
+let potCols = 0, potRows = 0;
+let contourSegs = [];          // {level>0?, segs:[x1,y1,x2,y2,...]}
+let fieldLines = [];           // [[x,y],...] 方向一律为正→负
+
+function recomputePotentials() {
+  potCols = Math.ceil(W / GRID) + 1;
+  potRows = Math.ceil(H / GRID) + 1;
+  potCanvas.width = potCols; potCanvas.height = potRows;
+  const grid = new Float32Array(potCols * potRows);
+  const img = ctx.createImageData(potCols, potRows);
+  const d = img.data;
+  for (let j = 0; j < potRows; j++) {
+    for (let i = 0; i < potCols; i++) {
+      const v = potentialAt(i * GRID, j * GRID);
+      grid[j * potCols + i] = v;
+      const t = Math.tanh(v / VSCALE);       // -1 .. 1
+      let r, g, b;
+      if (t >= 0) { r = 18 + 232 * t; g = 26 + 52 * t; b = 44 - 12 * t; }
+      else { const s = -t; r = 18 + 16 * s; g = 28 + 92 * s; b = 48 + 200 * s; }
+      const p = (j * potCols + i) * 4;
+      d[p] = r; d[p + 1] = g; d[p + 2] = b; d[p + 3] = 255;
+    }
+  }
+  potCanvas.getContext("2d").putImageData(img, 0, 0);
+  recomputeContours(grid);
+}
+
+// 行进方块法提取等势线
+function recomputeContours(grid) {
+  contourSegs = [];
+  const levels = [0.004, 0.008, 0.013, 0.02, 0.03];   // × K，正/负各一套
+  for (const c of levels) {
+    for (const sgn of [1, -1]) {
+      const L = sgn * c * K;
+      const segs = [];
+      for (let j = 0; j < potRows - 1; j++) {
+        for (let i = 0; i < potCols - 1; i++) {
+          const v0 = grid[j * potCols + i], v1 = grid[j * potCols + i + 1];
+          const v2 = grid[(j + 1) * potCols + i + 1], v3 = grid[(j + 1) * potCols + i];
+          let idx = 0;
+          if (v0 > L) idx |= 1;
+          if (v1 > L) idx |= 2;
+          if (v2 > L) idx |= 4;
+          if (v3 > L) idx |= 8;
+          if (idx === 0 || idx === 15) continue;
+          const x = i * GRID, y = j * GRID;
+          const top    = edgePt(x, y, x + GRID, y, v0, v1, L);
+          const right  = edgePt(x + GRID, y, x + GRID, y + GRID, v1, v2, L);
+          const bottom = edgePt(x, y + GRID, x + GRID, y + GRID, v3, v2, L);
+          const left   = edgePt(x, y, x, y + GRID, v0, v3, L);
+          switch (idx) {
+            case 1: case 14: segs.push(left, top); break;
+            case 2: case 13: segs.push(top, right); break;
+            case 3: case 12: segs.push(left, right); break;
+            case 4: case 11: segs.push(right, bottom); break;
+            case 6: case 9:  segs.push(top, bottom); break;
+            case 7: case 8:  segs.push(left, bottom); break;
+            case 5:  segs.push(left, top, right, bottom); break;
+            case 10: segs.push(top, right, left, bottom); break;
+          }
+        }
+      }
+      contourSegs.push({ pos: sgn > 0, segs });
+    }
+  }
+}
+function edgePt(x1, y1, x2, y2, v1, v2, L) {
+  const t = (L - v1) / ((v2 - v1) || 1e-9);
+  return [x1 + (x2 - x1) * t, y1 + (y2 - y1) * t];
+}
+
+/* ================= 电场线 ================= */
+// 从每个电荷周围撒种子：正电荷沿 E 积分，负电荷逆 E 积分（再翻转点序）
+function recomputeFieldLines() {
+  fieldLines = [];
+  for (const c of charges) {
+    const n = Math.min(16, 8 * Math.abs(c.q));
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2 + 0.13;
+      const sx = c.x + Math.cos(a) * (CHARGE_R + 3);
+      const sy = c.y + Math.sin(a) * (CHARGE_R + 3);
+      const pts = traceLine(sx, sy, c.q > 0 ? 1 : -1);
+      if (pts.length > 4) fieldLines.push(c.q > 0 ? pts : pts.reverse());
+    }
+  }
+}
+function traceLine(sx, sy, dirSign) {
+  const pts = [[sx, sy]];
+  let x = sx, y = sy;
+  for (let i = 0; i < 520; i++) {
+    let [ex, ey] = fieldAt(x, y);
+    ex *= dirSign; ey *= dirSign;
+    const m = Math.hypot(ex, ey);
+    if (m < 1e-4) break;
+    // RK2 中点法
+    const ds = 5;
+    const mx = x + ex / m * ds / 2, my = y + ey / m * ds / 2;
+    let [ex2, ey2] = fieldAt(mx, my);
+    ex2 *= dirSign; ey2 *= dirSign;
+    const m2 = Math.hypot(ex2, ey2);
+    if (m2 < 1e-4) break;
+    x += ex2 / m2 * ds; y += ey2 / m2 * ds;
+    pts.push([x, y]);
+    let hit = false;
+    for (const c of charges) {
+      if (Math.hypot(x - c.x, y - c.y) < CHARGE_R + 2) { hit = true; break; }
+    }
+    if (hit) break;
+    if (x < -80 || x > W + 80 || y < -80 || y > H + 80) break;
+  }
+  return pts;
+}
+
+/* ================= 任务检测：匀强电场区域 ================= */
+// 在采样网格上滑动候选矩形：区域内各点 E 的方向/大小都与平均值接近 → 匀强
+const ANG_TOL = 16 * Math.PI / 180;
+const MAG_TOL = 0.18;
+const MIN_E = 1.0;             // 平均场强下限，防止空旷远场蒙混过关
+const MIN_AREA = 30000;        // 成功所需的最小区域面积（px²），防止小窗混过
+let bestUniform = null;        // {x, y, w, h, passFrac, meanMag, metric}
+let won = false;
+
+function computeUniformity() {
+  bestUniform = null;
+  if (charges.length === 0) { updateScore(0); return; }
+  const step = 26;
+  const x0 = TB_W + 30, y0 = 24, x1 = W - 24, y1 = H - 24;
+  const nx = Math.max(1, Math.floor((x1 - x0) / step));
+  const ny = Math.max(1, Math.floor((y1 - y0) / step));
+  if (nx < 6 || ny < 5) { updateScore(0); return; }
+  const exs = new Float32Array(nx * ny), eys = new Float32Array(nx * ny);
+  for (let j = 0; j < ny; j++)
+    for (let i = 0; i < nx; i++) {
+      const [ex, ey] = fieldAt(x0 + i * step, y0 + j * step);
+      exs[j * nx + i] = ex; eys[j * nx + i] = ey;
+    }
+  const sizes = [[6, 5], [8, 6], [10, 8], [13, 10]];   // 候选窗口（格）
+  let best = null;
+  for (const [cw, ch] of sizes) {
+    if (cw > nx || ch > ny) continue;
+    for (let wy = 0; wy + ch <= ny; wy++) {
+      for (let wx = 0; wx + cw <= nx; wx++) {
+        let sx = 0, sy = 0, sm = 0;
+        for (let j = 0; j < ch; j++)
+          for (let i = 0; i < cw; i++) {
+            const ex = exs[(wy + j) * nx + wx + i], ey = eys[(wy + j) * nx + wx + i];
+            sx += ex; sy += ey; sm += Math.hypot(ex, ey);
+          }
+        const n = cw * ch;
+        const meanMag = sm / n;
+        if (meanMag < MIN_E) continue;
+        const mxv = sx / n, myv = sy / n;
+        const mLen = Math.hypot(mxv, myv) || 1e-9;
+        let pass = 0;
+        for (let j = 0; j < ch; j++)
+          for (let i = 0; i < cw; i++) {
+            const ex = exs[(wy + j) * nx + wx + i], ey = eys[(wy + j) * nx + wx + i];
+            const m = Math.hypot(ex, ey);
+            if (m < 1e-9) continue;
+            const cosA = (ex * mxv + ey * myv) / (m * mLen);
+            if (cosA < Math.cos(ANG_TOL)) continue;
+            if (Math.abs(m - meanMag) / meanMag > MAG_TOL) continue;
+            pass++;
+          }
+        const passFrac = pass / n;
+        const areaPx = cw * step * ch * step;
+        const metric = passFrac * Math.min(1, areaPx / 20000);
+        if (!best || metric > best.metric) {
+          best = { x: x0 + wx * step, y: y0 + wy * step,
+                   w: cw * step, h: ch * step,
+                   passFrac, meanMag, areaPx, metric };
+        }
+      }
+    }
+  }
+  bestUniform = best;
+  updateScore(best ? best.metric : 0);
+  // 任务判定：恰好 4 个电荷 + 足够大的区域足够均匀
+  const success = best && charges.length === 4 &&
+                  best.passFrac >= 0.93 && best.areaPx >= MIN_AREA;
+  if (success && !won) {
+    won = true;
+    fanfare();
+    showHint("🎉 成功！金框区域就是匀强电场——像平行板之间一样！", 4200);
+  } else if (!success) {
+    won = false;
+  }
+}
+
+function updateScore(metric) {
+  const pct = Math.round(metric * 100);
+  scorebar.textContent = won
+    ? `✅ 任务完成！匀强电场区域get ✔`
+    : `🎯 4个电荷造匀强电场 ｜ 电荷 ${charges.length}/4 ｜ 均匀度 ${pct}%`;
+}
+
+/* ================= 绘制 ================= */
+function drawBackground() {
+  if (charges.length > 0) {
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(potCanvas, 0, 0, W + GRID, H + GRID);
+  } else {
+    ctx.fillStyle = "#101a2c";
+    ctx.fillRect(0, 0, W, H);
+  }
+  // 等势线
+  ctx.lineWidth = 1.2;
+  for (const c of contourSegs) {
+    ctx.strokeStyle = c.pos ? "rgba(255,205,160,0.35)" : "rgba(155,205,255,0.35)";
+    ctx.beginPath();
+    for (const s of c.segs) {
+      ctx.moveTo(s[0][0], s[0][1]);
+      ctx.lineTo(s[1][0], s[1][1]);
+    }
+    ctx.stroke();
+  }
+}
+
+function drawFieldLines() {
+  ctx.lineWidth = 1.6;
+  ctx.strokeStyle = "rgba(255,236,170,0.8)";
+  ctx.fillStyle = "rgba(255,236,170,0.9)";
+  for (const pts of fieldLines) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.stroke();
+    // 沿线每 ~85px 画一个箭头
+    let acc = 0;
+    for (let i = 1; i < pts.length; i++) {
+      const dx = pts[i][0] - pts[i - 1][0], dy = pts[i][1] - pts[i - 1][1];
+      const seg = Math.hypot(dx, dy);
+      acc += seg;
+      if (acc >= 85) {
+        acc = 0;
+        const a = Math.atan2(dy, dx);
+        ctx.save();
+        ctx.translate(pts[i][0], pts[i][1]);
+        ctx.rotate(a);
+        ctx.beginPath();
+        ctx.moveTo(7, 0); ctx.lineTo(-4, -4.5); ctx.lineTo(-4, 4.5);
+        ctx.closePath(); ctx.fill();
+        ctx.restore();
+      }
+    }
+  }
+}
+
+function drawUniformRect() {
+  if (!bestUniform || bestUniform.metric < 0.45) return;
+  const b = bestUniform;
+  ctx.save();
+  ctx.setLineDash([10, 8]);
+  ctx.strokeStyle = won ? "#ffd54a" : "rgba(255,213,74,0.45)";
+  ctx.lineWidth = won ? 3.5 : 2;
+  ctx.strokeRect(b.x, b.y, b.w, b.h);
+  ctx.setLineDash([]);
+  if (won) {
+    ctx.fillStyle = "#ffd54a";
+    ctx.font = "bold 15px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("匀强电场区域", b.x + b.w / 2, b.y - 8);
+  }
+  ctx.restore();
+}
+
+function drawCharge(c) {
+  ctx.save();
+  ctx.shadowColor = c.q > 0 ? "rgba(255,90,60,0.8)" : "rgba(80,150,255,0.8)";
+  ctx.shadowBlur = 14;
+  ctx.beginPath(); ctx.arc(c.x, c.y, CHARGE_R, 0, 7);
+  const g = ctx.createRadialGradient(c.x - 5, c.y - 6, 2, c.x, c.y, CHARGE_R);
+  if (c.q > 0) { g.addColorStop(0, "#ff9a80"); g.addColorStop(1, "#d32f2f"); }
+  else { g.addColorStop(0, "#8abcff"); g.addColorStop(1, "#1756b8"); }
+  ctx.fillStyle = g; ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText((c.q > 0 ? "+" : "−") + (Math.abs(c.q) > 1 ? Math.abs(c.q) : ""), c.x, c.y + 1);
+  ctx.restore();
+}
+
+function drawProbe() {
+  const [ex, ey] = fieldAt(probe.x, probe.y);
+  const m = Math.hypot(ex, ey);
+  // 场强矢量箭头（长度随大小增长并封顶）
+  if (m > 1e-6) {
+    const len = Math.min(110, 26 + 75 * (1 - Math.exp(-m / 6)));
+    const ux = ex / m, uy = ey / m;
+    const tx = probe.x + ux * len, ty = probe.y + uy * len;
+    ctx.save();
+    ctx.strokeStyle = "#ffd54a"; ctx.fillStyle = "#ffd54a";
+    ctx.lineWidth = 4; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(probe.x, probe.y); ctx.lineTo(tx, ty); ctx.stroke();
+    const a = Math.atan2(uy, ux);
+    ctx.translate(tx, ty); ctx.rotate(a);
+    ctx.beginPath(); ctx.moveTo(13, 0); ctx.lineTo(-5, -7); ctx.lineTo(-5, 7);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  // 测试点（十字准星）
+  ctx.save();
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(probe.x, probe.y, 10, 0, 7); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(probe.x - 15, probe.y); ctx.lineTo(probe.x - 5, probe.y);
+  ctx.moveTo(probe.x + 5, probe.y); ctx.lineTo(probe.x + 15, probe.y);
+  ctx.moveTo(probe.x, probe.y - 15); ctx.lineTo(probe.x, probe.y - 5);
+  ctx.moveTo(probe.x, probe.y + 5); ctx.lineTo(probe.x, probe.y + 15);
+  ctx.stroke();
+  ctx.restore();
+  // 读数框
+  const v = potentialAt(probe.x, probe.y);
+  const deg = m > 1e-6 ? Math.round(Math.atan2(-ey, ex) * 180 / Math.PI) : 0;
+  const lines = [`E = ${m.toFixed(1)}（相对单位）`,
+                 `方向 θ = ${deg}°`,
+                 `电势 φ = ${(v / 100).toFixed(1)}`];
+  ctx.save();
+  ctx.font = "13px sans-serif";
+  let bw = 0;
+  for (const s of lines) bw = Math.max(bw, ctx.measureText(s).width);
+  bw += 20;
+  const bh = lines.length * 19 + 12;
+  let bx = probe.x + 20, by = probe.y - bh - 14;
+  if (bx + bw > W - 8) bx = probe.x - bw - 20;
+  if (by < 8) by = probe.y + 18;
+  ctx.fillStyle = "rgba(8,14,28,0.85)";
+  ctx.strokeStyle = "rgba(255,213,74,0.4)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 8); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "#ffe9a8"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+  lines.forEach((s, i) => ctx.fillText(s, bx + 10, by + 7 + i * 19));
+  ctx.restore();
+}
+
+function draw() {
+  if (dirty) {
+    dirty = false;
+    recomputePotentials();
+    recomputeFieldLines();
+    computeUniformity();
+  }
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawFieldLines();
+  drawUniformRect();
+  for (const c of charges) drawCharge(c);
+  drawProbe();
+}
+
+/* ================= 交互 ================= */
+let drag = null;   // {type:"charge"|"probe", c}
+
+function overToolbox(x, y) {
+  const r = tbEl.getBoundingClientRect();
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+
+// 从工具箱拖出新电荷
+document.querySelectorAll(".chip").forEach(chip => {
+  chip.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    if (charges.length >= MAX_CHARGES) { showHint("电荷太多啦，先拖几个回工具箱删除"); pop(200); return; }
+    const q = parseInt(chip.dataset.q, 10);
+    const c = { x: Math.max(e.clientX, TB_W + 50), y: e.clientY, q };
+    charges.push(c);
+    drag = { type: "charge", c };
+    markDirty();
+    pop(q > 0 ? 660 : 440);
+    hintEl.style.opacity = "0";
+  });
+});
+
+canvas.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  // 优先抓住测试点
+  if (Math.hypot(x - probe.x, y - probe.y) < 30) {
+    drag = { type: "probe" };
+    pop(750);
+    return;
+  }
+  // 抓住电荷
+  for (let i = charges.length - 1; i >= 0; i--) {
+    const c = charges[i];
+    if (Math.hypot(x - c.x, y - c.y) < CHARGE_R + 10) {
+      drag = { type: "charge", c };
+      pop(560);
+      return;
+    }
+  }
+  // 点空白处：把测试点移过来
+  probe.x = x; probe.y = y;
+  pop(820);
+  hintEl.style.opacity = "0";
+});
+
+window.addEventListener("pointermove", e => {
+  if (!drag) return;
+  if (drag.type === "probe") {
+    probe.x = e.clientX; probe.y = e.clientY;
+  } else {
+    drag.c.x = Math.max(CHARGE_R, Math.min(W - CHARGE_R, e.clientX));
+    drag.c.y = Math.max(CHARGE_R, Math.min(H - CHARGE_R, e.clientY));
+    tbEl.classList.toggle("deleting", overToolbox(e.clientX, e.clientY));
+    markDirty();
+  }
+});
+
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  if (drag.type === "charge" && overToolbox(e.clientX, e.clientY)) {
+    charges = charges.filter(c => c !== drag.c);
+    pop(240);
+    showHint("已删除电荷");
+  }
+  tbEl.classList.remove("deleting");
+  drag = null;
+  markDirty();
+});
+
+/* ================= 主循环 ================= */
+function loop() {
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 2200);
+}
+
+// 初始化
+resize();
+placePreset("dipole");                 // 先摆个电偶极子做演示
+probe.x = (TB_W + W) / 2;              // 测试点放在偶极子中点
+probe.y = H / 2 - 110;
+requestAnimationFrame(loop);
+
+// 测试钩子（无头验证用）
+window.__ef = {
+  charges: () => charges,
+  probe,
+  fieldAt, potentialAt, placePreset, markDirty,
+  uniform: () => bestUniform,
+  won: () => won,
+  step: () => { draw(); }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

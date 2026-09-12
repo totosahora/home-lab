@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>声音与振动</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#16222e; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #toolbar {
+    position:absolute; top:12px; left:12px; z-index:10; display:flex; gap:10px;
+  }
+  .modeBtn {
+    font-size:19px; font-weight:bold; padding:12px 20px;
+    border-radius:26px; border:3px solid rgba(255,255,255,0.25);
+    background:rgba(20,32,44,0.85); color:#cfe3f5; cursor:pointer;
+  }
+  .modeBtn.active { background:#ffd54a; color:#4a3200; border-color:#ffd54a; }
+  .modeBtn:active { transform:scale(1.05); }
+  #controls {
+    position:absolute; bottom:138px; left:50%; transform:translateX(-50%);
+    z-index:10; display:flex; align-items:center; gap:18px; flex-wrap:wrap; justify-content:center;
+    background:rgba(14,24,34,0.85); padding:12px 22px; border-radius:22px;
+    max-width:94vw;
+  }
+  #controls.hidden { display:none; }
+  #playBtn {
+    font-size:22px; font-weight:bold; padding:12px 26px;
+    border-radius:26px; border:none; background:#2fbf4a; color:#fff; cursor:pointer;
+    box-shadow:0 4px 10px rgba(0,0,0,0.4); min-width:128px;
+  }
+  #playBtn.playing { background:#e93b3b; }
+  #playBtn:active { transform:scale(1.06); }
+  .sliderRow { display:flex; align-items:center; gap:8px; color:#fff; font-size:17px; font-weight:bold; }
+  .sliderRow input[type=range] { width:150px; height:34px; accent-color:#ffd54a; cursor:pointer; }
+  .sliderVal { color:#ffd54a; min-width:76px; display:inline-block; }
+  #hint {
+    position:absolute; top:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,18,26,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw; overflow:hidden; text-overflow:ellipsis;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="toolbar">
+  <button class="modeBtn active" id="btnSpeaker">🔊 扬声器撒盐</button>
+  <button class="modeBtn" id="btnStrings">🎸 琴弦</button>
+</div>
+<div id="controls">
+  <button id="playBtn">▶ 播放</button>
+  <div class="sliderRow">频率
+    <input type="range" id="freqSlider" min="100" max="800" value="300" step="1">
+    <span class="sliderVal" id="freqVal">300 Hz</span>
+  </div>
+  <div class="sliderRow">音量
+    <input type="range" id="volSlider" min="10" max="100" value="60" step="1">
+    <span class="sliderVal" id="volVal">60%</span>
+  </div>
+</div>
+<div id="hint">点「播放」让扬声器唱歌，看盐粒跳舞！拖动滑杆改变音调</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+const controlsEl = document.getElementById("controls");
+const playBtn = document.getElementById("playBtn");
+const freqSlider = document.getElementById("freqSlider");
+const volSlider = document.getElementById("volSlider");
+const freqVal = document.getElementById("freqVal");
+const volVal = document.getElementById("volVal");
+let W = 0, H = 0, DPR = 1;
+
+const WAVE_H = 120;              // 底部波形图高度
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layoutScene();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+let mode = "speaker";            // speaker | strings
+
+// --- 扬声器与盐粒 ---
+const speaker = { cx:0, cy:0, R:100 };
+let freq = 300;                  // 音调频率 100-800 Hz
+let vol = 0.6;                   // 音量 0-1
+let playing = false;
+let vibPhase = 0;                // 膜片可视振动相位（放慢后用于绘制）
+const GRAIN_N = 64;
+let grains = [];                 // {fx, fy(单位圆内静止位置), dy, vy, dx, vx, seed}
+
+function makeGrains() {
+  grains = [];
+  for (let i = 0; i < GRAIN_N; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const r = Math.sqrt(Math.random()) * 0.72;
+    grains.push({ fx: Math.cos(a) * r, fy: Math.sin(a) * r, dy: 0, vy: 0, dx: 0, vx: 0, seed: Math.random() * 7 });
+  }
+}
+makeGrains();
+
+// --- 琴弦 ---
+// 五声音阶 do re mi sol la：弦越短，频率越高，音调越高
+const STRING_DEFS = [
+  { name:"do",  freq:261.63, color:"#e93b3b" },
+  { name:"re",  freq:293.66, color:"#ff8a1a" },
+  { name:"mi",  freq:329.63, color:"#ffd54a" },
+  { name:"sol", freq:392.00, color:"#2fbf4a" },
+  { name:"la",  freq:440.00, color:"#3f9df0" }
+];
+let strings = [];                // {x, y0, L, freq, name, color, amp, phase, lastPluck}
+let pluckedTimes = [];           // 最近拨弦时刻（检测琶音）
+
+function layoutScene() {
+  // 扬声器居中于可用区域（顶部留给工具条，底部留给控制条与波形图）
+  const areaTop = 84, areaBottom = H - WAVE_H - 150;
+  speaker.cx = W / 2;
+  speaker.cy = (areaTop + areaBottom) / 2;
+  speaker.R = Math.max(70, Math.min(W * 0.34, (areaBottom - areaTop) / 2 / 1.35 - 4));
+  // 琴弦一排：长度 ∝ 1/频率
+  const n = STRING_DEFS.length;
+  const topY = 96;
+  const maxL = Math.max(180, (H - WAVE_H - topY) * 0.78);
+  const fmin = STRING_DEFS[0].freq;
+  const margin = Math.min(120, W * 0.12);
+  strings = STRING_DEFS.map((d, i) => ({
+    x: n === 1 ? W / 2 : margin + (W - margin * 2) * i / (n - 1),
+    y0: topY,
+    L: maxL * fmin / d.freq,
+    freq: d.freq, name: d.name, color: d.color,
+    amp: 0, phase: 0, lastPluck: -9
+  }));
+}
+
+/* ================= 波形显示状态 ================= */
+let dispFreq = 300;              // 波形图当前显示的频率
+let dispAmp = 0;                 // 波形图当前幅度（平滑过渡）
+let wavePhase = 0;
+
+/* ================= 物理 / 动画 ================= */
+function excitation() {
+  // 振动强度：音量越大、频率越高，盐粒跳得越欢
+  return playing ? vol * (0.35 + 0.65 * (freq - 100) / 700) : 0;
+}
+
+function physics(dt, now) {
+  // 盐粒跳动
+  const exc = excitation();
+  const R = speaker.R;
+  for (const g of grains) {
+    if (exc > 0 && Math.random() < exc * dt * 7) {
+      g.vy -= (60 + Math.random() * 190) * exc;      // 向上踢一脚
+      g.vx += (Math.random() - 0.5) * 60 * exc;
+    }
+    g.vy += 640 * dt;                                 // 重力
+    g.dy += g.vy * dt;
+    g.dx += g.vx * dt;
+    g.vx *= Math.max(0, 1 - 3 * dt);
+    if (g.dy > 0) {                                   // 落回膜片
+      g.dy = 0;
+      g.vy = -g.vy * 0.3;
+      if (Math.abs(g.vy) < 14) g.vy = 0;
+    }
+    // 别跳出膜片边缘
+    const px = g.fx * R * 1.0 + g.dx, py = g.fy * R + g.dy;
+    const lim = R * 0.94;
+    const d = Math.hypot(px, py);
+    if (d > lim) {
+      const k = lim / d;
+      g.dx = px * k - g.fx * R;
+      g.dy = py * k - g.fy * R;
+      g.vx *= -0.3; g.vy *= -0.3;
+    }
+  }
+  // 膜片可视振动（真实频率放慢约 30 倍，便于眼睛观察）
+  vibPhase += dt * 2 * Math.PI * (playing ? freq * 0.03 : 0);
+
+  // 琴弦振动衰减
+  for (const s of strings) {
+    if (s.amp > 0.4) {
+      s.amp *= Math.exp(-dt * 1.6);
+      s.phase += dt * 2 * Math.PI * s.freq * 0.02;    // 可视振动同样放慢
+    } else {
+      s.amp = 0;
+    }
+  }
+
+  // 波形图跟随当前声源
+  let targetF = dispFreq, targetA = 0;
+  if (mode === "speaker") {
+    targetF = freq;
+    targetA = playing ? 0.35 + 0.65 * vol : 0;
+  } else {
+    let best = null;
+    for (const s of strings) if (s.amp > 0.4 && (!best || s.lastPluck > best.lastPluck)) best = s;
+    if (best) { targetF = best.freq; targetA = Math.min(1, best.amp / 16); }
+    else targetA = 0;
+  }
+  dispFreq += (targetF - dispFreq) * Math.min(1, dt * 6);
+  dispAmp += (targetA - dispAmp) * Math.min(1, dt * 5);
+  wavePhase += dt * 2 * Math.PI * (0.4 + dispFreq / 500);
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawSpeaker() {
+  const { cx, cy, R } = speaker;
+  const vib = playing ? Math.sin(vibPhase) * vol * 5 : 0;
+  // 音箱箱体
+  ctx.fillStyle = "#243646";
+  roundRect(cx - R * 1.25, cy - R * 1.35, R * 2.5, R * 2.7, 26, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.12)"; ctx.lineWidth = 3;
+  roundRect(cx - R * 1.25, cy - R * 1.35, R * 2.5, R * 2.7, 26, false); ctx.stroke();
+  // 上面的小高音单元装饰
+  ctx.beginPath(); ctx.arc(cx, cy - R * 1.02, R * 0.16, 0, 7);
+  ctx.fillStyle = "#0e1822"; ctx.fill();
+  ctx.beginPath(); ctx.arc(cx, cy - R * 1.02, R * 0.07, 0, 7);
+  ctx.fillStyle = "#3d5a74"; ctx.fill();
+  // 外圈折环
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, 7);
+  ctx.fillStyle = "#0d151d"; ctx.fill();
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.94, 0, 7);
+  ctx.fillStyle = "#1a2836"; ctx.fill();
+  // 振动中的锥盆（整体随相位轻微鼓起）
+  const cr = R * 0.8 + vib;
+  const g = ctx.createRadialGradient(cx, cy, cr * 0.15, cx, cy, cr);
+  g.addColorStop(0, "#54708c"); g.addColorStop(0.75, "#33506a"); g.addColorStop(1, "#22384c");
+  ctx.beginPath(); ctx.arc(cx, cy, cr, 0, 7);
+  ctx.fillStyle = g; ctx.fill();
+  // 中央防尘帽
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.3 + vib * 0.6, 0, 7);
+  ctx.fillStyle = "#6c8aa8"; ctx.fill();
+  ctx.beginPath(); ctx.arc(cx - R * 0.08, cy - R * 0.08 - vib * 0.3, R * 0.1, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.35)"; ctx.fill();
+  // 盐粒（白色小点）
+  for (const gr of grains) {
+    const gx = cx + gr.fx * R + gr.dx;
+    const gy = cy + gr.fy * R + gr.dy;
+    ctx.beginPath(); ctx.arc(gx, gy, 3, 0, 7);
+    ctx.fillStyle = "#ffffff"; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 1; ctx.stroke();
+  }
+  // 频率大字（画在箱体内部底边，避免被控制条遮挡）
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.font = "bold 26px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(`${Math.round(freq)} Hz`, cx, cy + R * 1.35 - 44);
+  ctx.font = "16px sans-serif";
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.fillText(playing ? "正在振动发声…" : "按「播放」开始振动", cx, cy + R * 1.35 - 18);
+}
+
+function drawStrings(now) {
+  // 顶部木梁
+  const x0 = strings[0].x - 56, x1 = strings[strings.length - 1].x + 56;
+  const lg = ctx.createLinearGradient(0, strings[0].y0 - 44, 0, strings[0].y0);
+  lg.addColorStop(0, "#8a5a2e"); lg.addColorStop(1, "#6b4423");
+  ctx.fillStyle = lg;
+  roundRect(x0, strings[0].y0 - 44, x1 - x0, 44, 12, true);
+  ctx.fillStyle = "rgba(255,238,205,0.9)";
+  ctx.font = "bold 20px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("🎵 琴弦：短弦振动快，音调高", (x0 + x1) / 2, strings[0].y0 - 15);
+
+  for (const s of strings) {
+    const segs = 26;
+    const hot = s.amp > 0.4;
+    // 弦（正弦振动：中间摆幅最大，两端固定不动）
+    ctx.beginPath();
+    for (let i = 0; i <= segs; i++) {
+      const t = i / segs;
+      const y = s.y0 + t * s.L;
+      const x = s.x + s.amp * Math.sin(Math.PI * t) * Math.sin(s.phase);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = hot ? 5 : 4;
+    ctx.shadowColor = s.color; ctx.shadowBlur = hot ? 14 : 0;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    // 弦轴（顶部）与底端固定点
+    ctx.beginPath(); ctx.arc(s.x, s.y0 - 4, 7, 0, 7);
+    ctx.fillStyle = "#d8d0c8"; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(s.x, s.y0 + s.L, 6, 0, 7);
+    ctx.fillStyle = "#d8d0c8"; ctx.fill(); ctx.stroke();
+    // 音名与频率标签
+    ctx.fillStyle = hot ? s.color : "rgba(255,255,255,0.85)";
+    ctx.font = "bold 22px sans-serif";
+    ctx.fillText(s.name, s.x, s.y0 + s.L + 34);
+    ctx.font = "15px sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.fillText(`${Math.round(s.freq)} Hz`, s.x, s.y0 + s.L + 56);
+    // 拨动时显示一圈涟漪（age 可能因时钟差为负，需钳制）
+    const age = now / 1000 - s.lastPluck;
+    if (age >= 0 && age < 0.5) {
+      ctx.beginPath();
+      ctx.arc(s.x, s.y0 + s.L / 2, Math.max(0, 20 + age * 160), 0, 7);
+      ctx.strokeStyle = s.color;
+      ctx.globalAlpha = Math.max(0, 1 - age * 2);
+      ctx.lineWidth = 4; ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+function drawWavePanel() {
+  const y0 = H - WAVE_H;
+  ctx.fillStyle = "#0c141d";
+  ctx.fillRect(0, y0, W, WAVE_H);
+  ctx.strokeStyle = "rgba(255,255,255,0.15)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, y0); ctx.lineTo(W, y0); ctx.stroke();
+  // 标题
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 19px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("振动快慢 = 音调高低", W / 2, y0 + 26);
+  // 波形：频率越高波浪越密
+  const midY = y0 + WAVE_H * 0.62;
+  const ampPx = dispAmp * 34;
+  const lambda = Math.max(50, 320 - (dispFreq - 100) / 700 * 260);
+  ctx.beginPath();
+  for (let x = 0; x <= W; x += 4) {
+    const y = midY - Math.sin(wavePhase + x / lambda * 2 * Math.PI) * ampPx;
+    if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = "#4dd0a6"; ctx.lineWidth = 3.5; ctx.stroke();
+  // 中线
+  ctx.strokeStyle = "rgba(255,255,255,0.12)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, midY); ctx.lineTo(W, midY); ctx.stroke();
+  // 左「慢·低沉」右「快·尖锐」标注
+  ctx.font = "15px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  ctx.fillText("〰 振动慢 → 声音低", 16, y0 + 28);
+  ctx.textAlign = "right";
+  ctx.fillText("振动快 → 声音高 〰", W - 16, y0 + 28);
+  // 当前频率
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#4dd0a6";
+  ctx.font = "bold 17px sans-serif";
+  ctx.fillText(`${Math.round(dispFreq)} Hz`, 16, H - 14);
+}
+
+function draw(now) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#16222e";
+  ctx.fillRect(0, 0, W, H);
+  if (mode === "speaker") drawSpeaker();
+  else drawStrings(now);
+  drawWavePanel();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt, now);
+  draw(now);
+  requestAnimationFrame(loop);
+}
+
+/* ================= 交互 ================= */
+// 扬声器上：上下拖动 = 调频率；快速点按 = 拍一下，盐粒蹦起来
+let spkDrag = null;   // {startY, startFreq, moved}
+canvas.addEventListener("pointerdown", e => {
+  if (mode === "speaker") {
+    const { cx, cy, R } = speaker;
+    if (Math.hypot(e.clientX - cx, e.clientY - cy) < R * 1.05) {
+      spkDrag = { startY: e.clientY, startFreq: freq, moved: false };
+      canvas.setPointerCapture(e.pointerId);
+    }
+  } else {
+    strumAt(e.clientX, e.clientY);
+    canvas.setPointerCapture(e.pointerId);
+  }
+  hintEl.style.opacity = "0";
+});
+canvas.addEventListener("pointermove", e => {
+  if (mode === "speaker" && spkDrag) {
+    const dy = spkDrag.startY - e.clientY;          // 向上拖 = 频率升高
+    if (Math.abs(dy) > 8) spkDrag.moved = true;
+    if (spkDrag.moved) setFreq(spkDrag.startFreq + dy * 1.5);
+  } else if (mode === "strings" && e.buttons) {
+    strumAt(e.clientX, e.clientY);
+  }
+});
+window.addEventListener("pointerup", e => {
+  if (spkDrag) {
+    if (!spkDrag.moved) {
+      // 拍一下扬声器：盐粒全部蹦起
+      for (const g of grains) {
+        g.vy -= 120 + Math.random() * 220;
+        g.vx += (Math.random() - 0.5) * 90;
+      }
+      pop(160);
+      showHint("砰！一拍下去盐粒全跳起来了");
+    }
+    spkDrag = null;
+  }
+});
+
+function strumAt(px, py) {
+  const now = performance.now() / 1000;
+  for (const s of strings) {
+    if (Math.abs(px - s.x) < 34 && py > s.y0 - 20 && py < s.y0 + s.L + 26) {
+      pluckString(s);
+    }
+  }
+}
+function pluckString(s) {
+  const now = performance.now() / 1000;
+  if (now - s.lastPluck < 0.15) return;             // 同一根弦的连拨冷却
+  s.lastPluck = now;
+  s.amp = 14 + Math.random() * 4;
+  s.phase = 0;
+  pluckSound(s.freq);
+  pluckedTimes.push(now);
+  pluckedTimes = pluckedTimes.filter(t => now - t < 2);
+  if (pluckedTimes.length >= strings.length) {      // 2 秒内拨遍所有弦 = 琶音庆祝
+    fanfare();
+    showHint("🌈 一段 do-re-mi-sol-la 琶音！太好听了！");
+    pluckedTimes = [];
+  } else {
+    showHint(`${s.name} —— 弦长 ${Math.round(s.L)}，振动 ${Math.round(s.freq)} 次/秒`);
+  }
+}
+
+/* ================= 控件 ================= */
+function setFreq(f) {
+  freq = Math.max(100, Math.min(800, Math.round(f)));
+  freqSlider.value = freq;
+  freqVal.textContent = `${freq} Hz`;
+  updateTone();
+}
+function setVol(v) {
+  vol = Math.max(0.1, Math.min(1, v));
+  volSlider.value = Math.round(vol * 100);
+  volVal.textContent = `${Math.round(vol * 100)}%`;
+  updateTone();
+}
+freqSlider.addEventListener("input", () => { setFreq(+freqSlider.value); pop(660); });
+volSlider.addEventListener("input", () => setVol(+volSlider.value / 100));
+playBtn.addEventListener("click", () => {
+  playing = !playing;
+  if (playing) startTone(); else stopTone();
+  playBtn.textContent = playing ? "⏸ 停止" : "▶ 播放";
+  playBtn.classList.toggle("playing", playing);
+  pop(playing ? 880 : 440);
+  showHint(playing ? "听！盐粒跟着声音跳起舞来了" : "声音停了，盐粒也休息了");
+});
+
+const btnSpeaker = document.getElementById("btnSpeaker");
+const btnStrings = document.getElementById("btnStrings");
+function setMode(m) {
+  if (mode === m) return;
+  mode = m;
+  btnSpeaker.classList.toggle("active", m === "speaker");
+  btnStrings.classList.toggle("active", m === "strings");
+  controlsEl.classList.toggle("hidden", m !== "speaker");
+  if (m !== "speaker" && playing) {
+    playing = false; stopTone();
+    playBtn.textContent = "▶ 播放"; playBtn.classList.remove("playing");
+  }
+  pop(700);
+  showHint(m === "speaker"
+    ? "点「播放」让扬声器唱歌，拖动滑杆或在扬声器上上下拖动改变音调"
+    : "点击或滑过琴弦拨动它！短弦振动快、音调高，长弦振动慢、音调低");
+}
+btnSpeaker.addEventListener("click", () => setMode("speaker"));
+btnStrings.addEventListener("click", () => setMode("strings"));
+
+/* ================= 音效 ================= */
+let actx = null, osc = null, oscGain = null;
+function ensureAudio() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === "suspended") actx.resume();
+  } catch (e) {}
+}
+// 扬声器真实发声：持续正弦波
+function startTone() {
+  ensureAudio();
+  if (!actx) return;
+  stopTone();
+  try {
+    osc = actx.createOscillator();
+    oscGain = actx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    oscGain.gain.setValueAtTime(0.0001, actx.currentTime);
+    oscGain.gain.exponentialRampToValueAtTime(vol * 0.25, actx.currentTime + 0.08);
+    osc.connect(oscGain); oscGain.connect(actx.destination);
+    osc.start();
+  } catch (e) {}
+}
+function updateTone() {
+  if (osc && actx) {
+    try {
+      osc.frequency.setTargetAtTime(freq, actx.currentTime, 0.02);
+      oscGain.gain.setTargetAtTime(vol * 0.25, actx.currentTime, 0.05);
+    } catch (e) {}
+  }
+}
+function stopTone() {
+  if (osc) {
+    try { osc.stop(); osc.disconnect(); oscGain.disconnect(); } catch (e) {}
+    osc = null; oscGain = null;
+  }
+}
+function tone(freq_, dur, vol_, type) {
+  try {
+    ensureAudio();
+    if (!actx) return;
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq_;
+    g.gain.setValueAtTime(vol_, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+// 拨弦：三角波更像琴弦
+const pluckSound = f => { tone(f, 1.4, 0.22, "triangle"); tone(f * 2, 0.5, 0.06, "sine"); };
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+
+resize();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

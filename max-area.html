@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>围出最大菜地</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#6fae4e; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,15,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,15,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.45);
+  }
+  #winPanel .msg {
+    font-size:38px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🎯 目标：面积 ≥ 25 m² · 当前最大：24 m²</div>
+<div id="hint">🐔 点住橙色手柄拖动，用 20 米篱笆帮小鸡农夫围菜地！</div>
+<div id="winPanel">
+  <div class="msg">🎉 25 m²！<br>同样 20 米篱笆，正方形面积最大！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 方格地与布局 ================= */
+// 方格地：每格 1 米 × 1 米。篱笆 20 米 ⇒ 长+宽 ≤ 10，面积最大 = 5×5 = 25 m²
+const GRID_W = 12, GRID_H = 10;
+const MAX_HALF = 10;            // 长 + 宽 上限（周长 20 米的一半）
+let cell = 40, gridX = 0, gridY = 0;      // 方格地在屏幕上的位置
+let panelX = 0, panelW = 300;             // 右侧信息面板
+
+function layout() {
+  panelW = Math.min(340, Math.max(260, W * 0.28));
+  const availW = W - panelW - 40, availH = H - 180;
+  cell = Math.max(22, Math.min(availW / GRID_W, availH / GRID_H));
+  gridX = ((W - panelW) - GRID_W * cell) / 2;
+  gridY = (H - GRID_H * cell) / 2 + 14;
+  panelX = W - panelW;
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+let rw = 6, rh = 4;              // 菜地长、宽（米），初始 6×4 正好用完 20 米篱笆
+let best = 24;                   // 历史最大面积
+let history = [];                // 尝试记录 [{w, h, area}]
+let dragging = false, dragChanged = false;
+let celebrated = false;
+let confetti = [];
+let emptyTapped = false;
+
+function peri() { return 2 * (rw + rh); }
+function area() { return rw * rh; }
+
+function resetGame() {
+  rw = 6; rh = 4; best = 24;
+  history = [{ w:6, h:4, area:24 }];
+  dragging = false; dragChanged = false;
+  celebrated = false; confetti = [];
+  emptyTapped = false;
+  winPanel.style.display = "none";
+  updateScore();
+}
+function updateScore() {
+  scorebar.textContent = `🎯 目标：面积 ≥ 25 m² · 当前最大：${best} m²`;
+}
+resetGame();
+
+/* ================= 交互：拖角手柄 ================= */
+function handlePos() { return [gridX + rw * cell, gridY + rh * cell]; }
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const [hx, hy] = handlePos();
+  if (Math.hypot(e.clientX - hx, e.clientY - hy) < Math.max(44, cell * 0.8)) {
+    dragging = true; dragChanged = false;
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(520);
+  } else if (!emptyTapped) {
+    emptyTapped = true;
+    showHint("🐔 点住菜地右下角的橙色手柄拖动哦！");
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  const gx = (e.clientX - gridX) / cell;
+  const gy = (e.clientY - gridY) / cell;
+  applyDrag(gx, gy);
+});
+window.addEventListener("pointerup", () => {
+  if (!dragging) return;
+  dragging = false;
+  finishDrag();
+});
+
+function applyDrag(gx, gy) {
+  let nw = Math.max(1, Math.min(GRID_W, Math.round(gx)));
+  let nh = Math.max(1, Math.min(GRID_H, Math.round(gy)));
+  // 篱笆只有 20 米：长 + 宽 不能超过 10，超过就把长的一边往回缩
+  while (nw + nh > MAX_HALF) {
+    if (nw >= nh && nw > 1) nw--; else nh--;
+  }
+  if (nw !== rw || nh !== rh) {
+    rw = nw; rh = nh; dragChanged = true;
+    tick();
+  }
+}
+
+function finishDrag() {
+  if (!dragChanged) return;
+  const a = area();
+  history.push({ w: rw, h: rh, area: a });
+  if (a >= 25 && !celebrated) { winGame(); return; }
+  if (a > best) {
+    best = a; updateScore();
+    showHint(`不错！面积 ${a} m²，还能围得更大吗？`);
+    pop(880);
+  } else if (a === 24) {
+    showHint("就差 1 平方米啦！🐔");
+    pop(660);
+  } else if (history.length >= 4 && best < 25) {
+    showHint("🐔 试试把长和宽围成一样长！");
+    chirp();
+  } else {
+    showHint("试试围得更大一点！");
+    pop(500);
+  }
+}
+
+function winGame() {
+  celebrated = true;
+  best = 25; updateScore();
+  spawnConfetti();
+  fanfare();
+  showHint("🎉 正方形面积最大！");
+  setTimeout(() => { winPanel.style.display = "flex"; }, 800);
+}
+
+/* ================= 庆祝彩带 ================= */
+const CONF_COLORS = ["#ffd54a", "#ff5252", "#2fbf4a", "#2f7fe9", "#ff7a1a", "#e040fb"];
+function spawnConfetti() {
+  const [cx, cy] = handlePos();
+  for (let i = 0; i < 140; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 380;
+    confetti.push({
+      x: cx, y: cy,
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 240,
+      rot: Math.random() * 7, vr: (Math.random() - 0.5) * 12,
+      size: 6 + Math.random() * 7,
+      color: CONF_COLORS[i % CONF_COLORS.length],
+      life: 3 + Math.random()
+    });
+  }
+}
+function updateConfetti(dt) {
+  for (const c of confetti) {
+    c.vy += 620 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += c.vr * dt; c.life -= dt;
+  }
+  confetti = confetti.filter(c => c.life > 0 && c.y < H + 30);
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#8ec96b"); g.addColorStop(1, "#5f9c3e");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawGrid() {
+  // 方格草地
+  for (let r = 0; r < GRID_H; r++)
+    for (let c = 0; c < GRID_W; c++) {
+      ctx.fillStyle = (r + c) % 2 ? "#b9dd96" : "#c6e5a6";
+      ctx.fillRect(gridX + c * cell, gridY + r * cell, cell, cell);
+    }
+  ctx.strokeStyle = "rgba(60,90,40,0.35)"; ctx.lineWidth = 1.5;
+  for (let c = 0; c <= GRID_W; c++) {
+    ctx.beginPath(); ctx.moveTo(gridX + c * cell, gridY); ctx.lineTo(gridX + c * cell, gridY + GRID_H * cell); ctx.stroke();
+  }
+  for (let r = 0; r <= GRID_H; r++) {
+    ctx.beginPath(); ctx.moveTo(gridX, gridY + r * cell); ctx.lineTo(gridX + GRID_W * cell, gridY + r * cell); ctx.stroke();
+  }
+  // 米尺数字（每格 = 1 米）
+  ctx.fillStyle = "rgba(30,60,20,0.65)";
+  ctx.font = `${Math.max(11, cell * 0.22)}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (let c = 1; c <= GRID_W; c++)
+    ctx.fillText(c, gridX + (c - 0.5) * cell, gridY - cell * 0.28);
+  for (let r = 1; r <= GRID_H; r++)
+    ctx.fillText(r, gridX - cell * 0.3, gridY + (r - 0.5) * cell);
+}
+
+function drawGarden() {
+  const x0 = gridX, y0 = gridY, gw = rw * cell, gh = rh * cell;
+  // 菜地土壤
+  ctx.fillStyle = "#c98d54";
+  ctx.fillRect(x0, y0, gw, gh);
+  ctx.fillStyle = "rgba(120,70,30,0.25)";
+  for (let r = 0; r < rh; r++)
+    ctx.fillRect(x0, y0 + (r + 0.82) * cell, gw, cell * 0.08);
+  // 小菜苗（每格一棵）
+  ctx.font = `${cell * 0.5}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (let r = 0; r < rh; r++)
+    for (let c = 0; c < rw; c++)
+      ctx.fillText("🌱", x0 + (c + 0.5) * cell, y0 + (r + 0.48) * cell);
+  // 篱笆：木栏杆 + 木桩
+  ctx.strokeStyle = "#7a4a20"; ctx.lineWidth = Math.max(4, cell * 0.09);
+  ctx.strokeRect(x0, y0, gw, gh);
+  ctx.strokeStyle = "#a4682f"; ctx.lineWidth = Math.max(2, cell * 0.04);
+  ctx.strokeRect(x0, y0, gw, gh);
+  ctx.fillStyle = "#5f3a16";
+  for (let c = 0; c <= rw; c++)
+    for (const yy of [y0, y0 + gh]) {
+      ctx.beginPath(); ctx.arc(x0 + c * cell, yy, Math.max(3.5, cell * 0.09), 0, 7); ctx.fill();
+    }
+  for (let r = 1; r < rh; r++)
+    for (const xx of [x0, x0 + gw]) {
+      ctx.beginPath(); ctx.arc(xx, y0 + r * cell, Math.max(3.5, cell * 0.09), 0, 7); ctx.fill();
+    }
+  // 拖拽手柄（右下角，呼吸动画）
+  const [hx, hy] = handlePos();
+  const pr = Math.max(20, cell * 0.42) + Math.sin(performance.now() / 260) * 3;
+  ctx.beginPath(); ctx.arc(hx, hy, pr + 6, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.55)"; ctx.fill();
+  ctx.beginPath(); ctx.arc(hx, hy, pr, 0, 7);
+  ctx.fillStyle = dragging ? "#ff7a1a" : "#ff9500"; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.font = `bold ${pr * 0.95}px sans-serif`;
+  ctx.fillText("⇲", hx, hy + pr * 0.06);
+  // 长宽标注
+  ctx.fillStyle = "rgba(20,50,15,0.9)";
+  ctx.font = `bold ${Math.max(14, cell * 0.3)}px sans-serif`;
+  ctx.fillText(`${rw} 米`, x0 + gw / 2, y0 + gh + Math.max(16, cell * 0.32));
+  ctx.save();
+  ctx.translate(x0 + gw + Math.max(16, cell * 0.32), y0 + gh / 2);
+  ctx.rotate(Math.PI / 2);
+  ctx.fillText(`${rh} 米`, 0, 0);
+  ctx.restore();
+}
+
+function drawChicken() {
+  const cx = gridX + cell * 0.8, cy = gridY + GRID_H * cell + 34;
+  if (cy > H - 24) return;
+  ctx.font = "42px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("🐔", cx, cy);
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.font = "bold 14px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("小鸡农夫：围得越大，菜越多！", cx + 30, cy);
+}
+
+function drawPanel() {
+  const px = panelX + 8, pw = panelW - 16;
+  const py = 56, ph = H - 72;
+  ctx.fillStyle = "rgba(255,250,238,0.95)";
+  roundRect(px, py, pw, ph, 18, true);
+  ctx.strokeStyle = "rgba(120,80,30,0.25)"; ctx.lineWidth = 2;
+  roundRect(px, py, pw, ph, 18); ctx.stroke();
+
+  ctx.fillStyle = "#5a3d00";
+  ctx.font = "bold 18px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("📏 菜地数字牌", px + 16, py + 26);
+
+  // 四个数字牌：长 / 宽 / 周长 / 面积
+  const cw = (pw - 42) / 2, ch = 62;
+  const len = Math.max(rw, rh), wid = Math.min(rw, rh);
+  const cards = [
+    ["长", `${len} 米`, false],
+    ["宽", `${wid} 米`, false],
+    ["周长", `${peri()} 米`, false],
+    ["面积", `${area()} m²`, true]
+  ];
+  cards.forEach((cd, i) => {
+    const cx0 = px + 16 + (i % 2) * (cw + 10);
+    const cy0 = py + 44 + Math.floor(i / 2) * (ch + 10);
+    ctx.fillStyle = cd[2] ? (area() >= 25 ? "#e8f7e4" : "#fff3d6") : "#ffffff";
+    roundRect(cx0, cy0, cw, ch, 12, true);
+    ctx.strokeStyle = cd[2] ? "#e0a92e" : "rgba(0,0,0,0.12)";
+    ctx.lineWidth = cd[2] ? 2.5 : 1.5;
+    roundRect(cx0, cy0, cw, ch, 12); ctx.stroke();
+    ctx.fillStyle = "#8a7a55"; ctx.font = "13px sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(cd[0], cx0 + 12, cy0 + 16);
+    ctx.fillStyle = cd[2] ? "#c07800" : "#3a2a10";
+    ctx.font = "bold 22px sans-serif";
+    ctx.fillText(cd[1], cx0 + 12, cy0 + 42);
+  });
+
+  // 篱笆用量条：20 段，用掉的涂木色
+  const fy = py + 44 + ch * 2 + 24;
+  const used = peri(), left = 20 - used;
+  ctx.fillStyle = "#5a3d00"; ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText(`🪵 篱笆：已用 ${used} 米 · 还剩 ${left} 米`, px + 16, fy + 10);
+  const bw = pw - 32, seg = (bw - 19 * 2) / 20;
+  for (let i = 0; i < 20; i++) {
+    ctx.fillStyle = i < used ? "#a4682f" : "#e6ddc8";
+    roundRect(px + 16 + i * (seg + 2), fy + 24, seg, 14, 3, true);
+  }
+
+  // 尝试记录
+  const hy = fy + 56;
+  ctx.fillStyle = "#5a3d00"; ctx.font = "bold 15px sans-serif";
+  ctx.fillText("📜 尝试记录", px + 16, hy + 8);
+  const rows = history.slice(-9).reverse();
+  rows.forEach((rec, i) => {
+    const ry = hy + 18 + i * 27;
+    if (ry + 24 > py + ph - 8) return;
+    const isBest = rec.area === best;
+    if (isBest) {
+      ctx.fillStyle = "rgba(255,213,74,0.35)";
+      roundRect(px + 12, ry, pw - 24, 24, 8, true);
+    }
+    ctx.fillStyle = "#4a3a20"; ctx.font = "14px sans-serif";
+    ctx.textAlign = "left";
+    const n = history.length - i;
+    const sq = rec.w === rec.h ? "（正方形）" : "";
+    ctx.fillText(`第${n}次  ${rec.w} × ${rec.h} ＝ ${rec.area} m²${sq}`, px + 20, ry + 13);
+    if (isBest) {
+      ctx.textAlign = "right";
+      ctx.fillText("⭐", px + pw - 22, ry + 13);
+      ctx.textAlign = "left";
+    }
+  });
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.rot);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.size / 2, -c.size / 4, c.size, c.size / 2);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawGrid();
+  drawGarden();
+  drawChicken();
+  drawPanel();
+  drawConfetti();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  updateConfetti(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.12);
+const tick = () => tone(660 + area() * 8, 0.04, 0.05, "triangle");
+const chirp = () => { tone(900, 0.08, 0.1, "square"); setTimeout(() => tone(1200, 0.1, 0.1, "square"), 90); };
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

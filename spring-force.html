@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>弹簧与弹力</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#1d2a3a; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,20,35,0.85); color:#7fd4ff; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,20,35,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #repairBtn {
+    position:absolute; top:70px; left:50%; transform:translateX(-50%);
+    display:none; z-index:15;
+    font-size:20px; font-weight:bold; padding:12px 30px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #repairBtn:active { transform:translateX(-50%) scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🧪 数据点：0 / 3</div>
+<div id="hint">把下面的砝码拖到弹簧钩子上，看看弹簧会伸长多少！</div>
+<button id="repairBtn">🔧 修复弹簧</button>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const repairBtn = document.getElementById("repairBtn");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 场景与视图 ================= */
+// 世界坐标 1280 x 800，整体缩放居中
+const WORLD_W = 1280, WORLD_H = 800;
+const SPRING_X = 420;          // 弹簧中线
+const TOP_Y = 90;              // 天花板悬挂点
+const NAT_LEN = 150;           // 弹簧原长（px）
+const REST_Y = TOP_Y + NAT_LEN; // 弹簧自然底端 y = 240
+const PX_PER_CM = 14;          // 尺子上 1cm = 14px
+const CM_PER_KG = 2;           // 胡克定律：每 kg 伸长 2cm
+const LIMIT_KG = 8;            // 弹性限度：超过 8kg 拉坏
+const RULER_X = 570;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / WORLD_W, H / WORLD_H);
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+const TRAY = [                 // 砝码托盘（无限供应）
+  { mass:1, x:150, y:712 },
+  { mass:2, x:320, y:712 },
+  { mass:3, x:490, y:712 },
+  { mass:5, x:660, y:712 }
+];
+const MASS_COLORS = { 1:"#4fc3f7", 2:"#81c784", 3:"#ffb74d", 5:"#e57373" };
+let hung = [];          // 挂着的砝码 [{mass}]
+let falling = [];       // 拉坏后掉落的砝码 [{mass,x,y,vy}]
+let drag = null;        // 拖拽中的砝码 {mass,x,y}
+let extCur = 0, extVel = 0;   // 当前伸长(px) 与速度（弹簧动画）
+let broken = false;
+let dataPoints = [];    // 已记录 [{mass, ext}]
+let lineFound = false;  // 3 组数据后连线
+let settleTimer = 0;    // 稳定计时，稳定后才记录数据
+
+function totalMass() { return hung.reduce((s, w) => s + w.mass, 0); }
+function targetExt() { return broken ? 0 : totalMass() * CM_PER_KG * PX_PER_CM; }
+function hookY() { return REST_Y + extCur; }
+
+function hangWeight(mass) {
+  hung.push({ mass });
+  boing();
+  hintEl.style.opacity = "0";
+}
+function removeWeight(idx) {
+  hung.splice(idx, 1);
+  pop(500);
+}
+function repair() {
+  broken = false;
+  falling = [];
+  repairBtn.style.display = "none";
+  showHint("弹簧修好啦！这次别挂太重哦～");
+  pop(880);
+}
+repairBtn.addEventListener("click", repair);
+
+/* ================= 物理 ================= */
+function stepPhysics(dt) {
+  // 弹簧伸长量：朝目标值做阻尼振动（Q 弹手感）
+  const k = 90, damp = 9;
+  const acc = (targetExt() - extCur) * k - extVel * damp;
+  extVel += acc * dt;
+  extCur += extVel * dt;
+  // 掉落砝码
+  for (const f of falling) { f.vy += 2400 * dt; f.y += f.vy * dt; }
+  falling = falling.filter(f => f.y < WORLD_H + 80);
+  // 稳定后记录数据
+  const m = totalMass();
+  if (!broken && m > 0 && Math.abs(targetExt() - extCur) < 0.6 && Math.abs(extVel) < 2) {
+    settleTimer += dt;
+    if (settleTimer > 0.4) recordData(m);
+  } else {
+    settleTimer = 0;
+  }
+}
+
+function recordData(m) {
+  if (dataPoints.some(p => p.mass === m)) return;
+  dataPoints.push({ mass:m, ext:m * CM_PER_KG });
+  dataPoints.sort((a, b) => a.mass - b.mass);
+  pop(1047); setTimeout(() => pop(1319), 90);
+  updateScore();
+  if (!lineFound && dataPoints.length >= 3) {
+    lineFound = true;
+    showHint("把数据点连起来……哇，是一条直线！这就是胡克定律！");
+    fanfare();
+    updateScore();
+  } else if (!lineFound) {
+    showHint(`记下第 ${dataPoints.length} 组数据！再换几个砝码试试`);
+  }
+}
+function updateScore() {
+  scorebar.textContent = lineFound
+    ? `🎉 是一条直线！质量 × ${CM_PER_KG} = 伸长（胡克定律）`
+    : `🧪 数据点：${dataPoints.length} / 3`;
+}
+
+/* ================= 拉坏判定 ================= */
+function checkBreak() {
+  if (!broken && totalMass() > LIMIT_KG) {
+    broken = true;
+    let y = hookY();
+    for (const w of hung) {
+      falling.push({ mass:w.mass, x:SPRING_X, y:y + 20, vy:60 });
+      y += 60;
+    }
+    hung = [];
+    repairBtn.style.display = "block";
+    showHint("哎呀，超过弹性限度，弹簧被拉坏了！点上面按钮修复");
+    breakSound();
+  }
+}
+
+/* ================= 交互 ================= */
+function weightSize(mass) { return { w: 44 + mass * 8, h: 30 + mass * 5 }; }
+// 挂着砝码的堆叠位置（返回每块的中心 y 与尺寸）
+function hungLayout() {
+  let y = hookY() + 16;
+  const out = [];
+  for (let i = 0; i < hung.length; i++) {
+    const s = weightSize(hung[i].mass);
+    out.push({ cy: y + s.h / 2, w: s.w, h: s.h });
+    y += s.h + 6;
+  }
+  return out;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  // 1. 点挂着的砝码上的 ✕ 手柄 → 取下
+  const layout = hungLayout();
+  for (let i = 0; i < layout.length; i++) {
+    const hx = SPRING_X + layout[i].w / 2 + 24, hy = layout[i].cy;
+    if (Math.hypot(wx - hx, wy - hy) < 18) {
+      removeWeight(i);
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
+  }
+  // 2. 点托盘砝码 → 开始拖拽
+  for (const t of TRAY) {
+    const s = weightSize(t.mass);
+    if (Math.abs(wx - t.x) < s.w / 2 + 10 && Math.abs(wy - t.y) < s.h / 2 + 14) {
+      drag = { mass:t.mass, x:wx, y:wy };
+      canvas.setPointerCapture(e.pointerId);
+      pop(660);
+      return;
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  drag.x = wx; drag.y = wy;
+});
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  // 靠近钩子 → 挂上去
+  if (!broken && Math.hypot(wx - SPRING_X, wy - (hookY() + 40)) < 95) {
+    hangWeight(drag.mass);
+    checkBreak();
+  } else if (broken && Math.hypot(wx - SPRING_X, wy - (hookY() + 40)) < 95) {
+    showHint("弹簧坏了，先点上面的修复按钮吧！");
+    pop(220);
+  } else {
+    pop(300);
+  }
+  drag = null;
+});
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+  g.addColorStop(0, "#2b3f58"); g.addColorStop(1, "#1d2a3a");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+  // 天花板
+  ctx.fillStyle = "#43597a";
+  ctx.fillRect(0, 0, WORLD_W, 34);
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  ctx.fillRect(0, 34, WORLD_W, 4);
+  // 标题
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.font = "bold 26px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("🔬 弹簧与弹力 · 胡克定律", 24, 66);
+}
+
+function drawSpring() {
+  const x = SPRING_X, top = TOP_Y, bot = hookY();
+  // 挂杆
+  ctx.strokeStyle = "#8fa8c8"; ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.moveTo(x, 34); ctx.lineTo(x, top); ctx.stroke();
+  if (broken) {
+    // 拉坏的弹簧：松垮的波浪线
+    ctx.strokeStyle = "#b0665a"; ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(x, top);
+    const len = 230;
+    for (let i = 1; i <= 60; i++) {
+      const t = i / 60;
+      const wob = Math.sin(t * 9.5) * (14 + 26 * t) + Math.sin(t * 23) * 5;
+      ctx.lineTo(x + wob, top + t * len);
+    }
+    ctx.stroke();
+    // 断口斜丝
+    ctx.strokeStyle = "#8a4a40"; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(x + Math.sin(9.5) * 40, top + len);
+    ctx.lineTo(x + 30, top + len + 26);
+    ctx.stroke();
+    ctx.fillStyle = "#ff9a8a";
+    ctx.font = "bold 20px sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("拉坏啦！", x + 46, top + len - 10);
+    return;
+  }
+  // 正常弹簧：螺线圈，随伸长线性拉长
+  const coils = 9, amp = 24;
+  ctx.strokeStyle = "#d8c04a"; ctx.lineWidth = 5;
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(x, top);
+  const n = coils * 2;
+  for (let i = 1; i <= n; i++) {
+    const t = i / n;
+    ctx.lineTo(x + (i % 2 ? amp : -amp) * Math.min(1, t * 4, (1 - t) * 4), top + t * (bot - top));
+  }
+  ctx.lineTo(x, bot);
+  ctx.stroke();
+  // 底部钩子
+  ctx.beginPath(); ctx.arc(x, bot + 9, 9, 0, 7);
+  ctx.strokeStyle = "#8fa8c8"; ctx.lineWidth = 5; ctx.stroke();
+  // 拖拽靠近时高亮钩子
+  if (drag) {
+    const near = Math.hypot(drag.x - x, drag.y - (bot + 40)) < 95;
+    if (near) {
+      ctx.beginPath(); ctx.arc(x, bot + 40, 40, 0, 7);
+      ctx.fillStyle = "rgba(127,212,255,0.25)"; ctx.fill();
+      ctx.setLineDash([8, 6]);
+      ctx.strokeStyle = "#7fd4ff"; ctx.lineWidth = 3; ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+}
+
+function drawRuler() {
+  const x = RULER_X, y0 = REST_Y;
+  const maxCm = LIMIT_KG * CM_PER_KG;   // 16cm
+  const y1 = y0 + maxCm * PX_PER_CM;
+  // 尺身
+  ctx.fillStyle = "#f5e6b8";
+  roundRect(x - 16, y0 - 12, 32, (y1 - y0) + 24, 6, true);
+  ctx.strokeStyle = "#a8884a"; ctx.lineWidth = 2;
+  roundRect(x - 16, y0 - 12, 32, (y1 - y0) + 24, 6, false);
+  ctx.stroke();
+  // 刻度
+  ctx.textAlign = "left";
+  for (let c = 0; c <= maxCm; c++) {
+    const y = y0 + c * PX_PER_CM;
+    const big = c % 4 === 0;
+    ctx.strokeStyle = "#6a5020"; ctx.lineWidth = big ? 2.5 : 1.5;
+    ctx.beginPath(); ctx.moveTo(x + 16, y); ctx.lineTo(x + (big ? 34 : 26), y); ctx.stroke();
+    if (big) {
+      ctx.fillStyle = "#4a3810";
+      ctx.font = "bold 15px sans-serif";
+      ctx.fillText(c + "", x + 38, y + 5);
+    }
+  }
+  ctx.fillStyle = "#4a3810";
+  ctx.font = "13px sans-serif";
+  ctx.fillText("cm", x + 38, y0 - 16);
+  // 弹性限度红线
+  const ly = y0 + maxCm * PX_PER_CM;
+  ctx.setLineDash([8, 6]);
+  ctx.strokeStyle = "#ff5252"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(x - 60, ly); ctx.lineTo(x + 90, ly); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#ff5252";
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillText("弹性限度", x + 92, ly + 5);
+  // 当前伸长指针
+  if (!broken) {
+    const ey = y0 + extCur;
+    ctx.fillStyle = "#2fbf4a";
+    ctx.beginPath();
+    ctx.moveTo(x - 18, ey); ctx.lineTo(x - 36, ey - 9); ctx.lineTo(x - 36, ey + 9);
+    ctx.closePath(); ctx.fill();
+    ctx.font = "bold 17px sans-serif";
+    ctx.textAlign = "right";
+    ctx.fillText(`伸长 ${(extCur / PX_PER_CM).toFixed(1)} cm`, x - 44, ey - 16);
+    ctx.textAlign = "left";
+  }
+}
+
+function drawWeight(cx, cy, mass, alpha) {
+  const s = weightSize(mass);
+  ctx.save();
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+  // 提手
+  ctx.strokeStyle = "rgba(0,0,0,0.45)"; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.arc(cx, cy - s.h / 2 - 6, 8, Math.PI, 0); ctx.stroke();
+  // 身体
+  const col = MASS_COLORS[mass] || "#bbb";
+  const g = ctx.createLinearGradient(cx - s.w / 2, 0, cx + s.w / 2, 0);
+  g.addColorStop(0, col); g.addColorStop(0.5, "#ffffff"); g.addColorStop(1, col);
+  ctx.globalAlpha = (alpha == null ? 1 : alpha) * 0.95;
+  ctx.fillStyle = g;
+  roundRect(cx - s.w / 2, cy - s.h / 2, s.w, s.h, 8, true);
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+  ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 2;
+  roundRect(cx - s.w / 2, cy - s.h / 2, s.w, s.h, 8, false);
+  ctx.stroke();
+  // 标签
+  ctx.fillStyle = "#223";
+  ctx.font = `bold ${mass >= 5 ? 18 : 17}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.fillText(mass + "kg", cx, cy + 6);
+  ctx.textAlign = "left";
+  ctx.restore();
+}
+
+function drawHung() {
+  const layout = hungLayout();
+  let prevY = hookY() + 9;
+  for (let i = 0; i < hung.length; i++) {
+    // 连接绳
+    ctx.strokeStyle = "#8fa8c8"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(SPRING_X, prevY);
+    ctx.lineTo(SPRING_X, layout[i].cy - layout[i].h / 2 - 12); ctx.stroke();
+    drawWeight(SPRING_X, layout[i].cy, hung[i].mass);
+    // ✕ 删除手柄
+    const hx = SPRING_X + layout[i].w / 2 + 24, hy = layout[i].cy;
+    ctx.beginPath(); ctx.arc(hx, hy, 14, 0, 7);
+    ctx.fillStyle = "#e53935"; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(hx - 5, hy - 5); ctx.lineTo(hx + 5, hy + 5);
+    ctx.moveTo(hx + 5, hy - 5); ctx.lineTo(hx - 5, hy + 5);
+    ctx.stroke();
+    prevY = layout[i].cy + layout[i].h / 2;
+  }
+  // 把看不见的力画出来：重力（红，向下）与弹力（蓝，向上）
+  const m = totalMass();
+  if (m > 0 && !broken && layout.length) {
+    const top = layout[0].cy - layout[0].h / 2;
+    const len = 26 + m * 9;
+    drawArrow(SPRING_X - layout[0].w / 2 - 60, top, 0, len, "#ff5252", `重力 ${m * 10}N`);
+    drawArrow(SPRING_X - layout[0].w / 2 - 60, top, 0, -len, "#4fc3f7", `弹力 ${m * 10}N`);
+  }
+}
+function drawArrow(x, y, dx, dy, color, label) {
+  const ex = x + dx, ey = y + dy;
+  ctx.strokeStyle = color; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(ex, ey); ctx.stroke();
+  const a = Math.atan2(dy, dx);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(ex, ey);
+  ctx.lineTo(ex - 12 * Math.cos(a - 0.45), ey - 12 * Math.sin(a - 0.45));
+  ctx.lineTo(ex - 12 * Math.cos(a + 0.45), ey - 12 * Math.sin(a + 0.45));
+  ctx.closePath(); ctx.fill();
+  ctx.font = "bold 14px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(label, x, y + (dy > 0 ? dy + 20 : dy - 12));
+  ctx.textAlign = "left";
+}
+
+function drawFalling() {
+  for (const f of falling) drawWeight(f.x, f.y, f.mass, 0.9);
+}
+
+function drawTray() {
+  // 托盘
+  ctx.fillStyle = "rgba(0,0,0,0.3)";
+  roundRect(90, 748, 640, 16, 8, true);
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  ctx.font = "15px sans-serif";
+  ctx.fillText("砝码托盘（拖到钩子上）", 90, 742);
+  for (const t of TRAY) drawWeight(t.x, t.y, t.mass, drag && drag.mass === t.mass ? 0.45 : 1);
+  if (drag) drawWeight(drag.x, drag.y, drag.mass);
+}
+
+/* ---------- 右侧：数据表 + 图 ---------- */
+const PANEL = { x: 760, y: 80, w: 480, h: 660 };
+const GRAPH = { x: 830, y: 400, w: 380, h: 280 };  // x:0-10kg, y:0-20cm
+function gx(m) { return GRAPH.x + (m / 10) * GRAPH.w; }
+function gy(e) { return GRAPH.y + GRAPH.h - (e / 20) * GRAPH.h; }
+
+function drawPanel() {
+  ctx.fillStyle = "rgba(10,22,40,0.78)";
+  roundRect(PANEL.x, PANEL.y, PANEL.w, PANEL.h, 18, true);
+  ctx.strokeStyle = "rgba(127,212,255,0.4)"; ctx.lineWidth = 2;
+  roundRect(PANEL.x, PANEL.y, PANEL.w, PANEL.h, 18, false);
+  ctx.stroke();
+  // 表格
+  ctx.fillStyle = "#7fd4ff";
+  ctx.font = "bold 20px sans-serif";
+  ctx.fillText("📋 质量 — 伸长 记录", PANEL.x + 22, PANEL.y + 36);
+  ctx.font = "bold 16px sans-serif";
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.fillText("质量 (kg)", PANEL.x + 40, PANEL.y + 72);
+  ctx.fillText("伸长 (cm)", PANEL.x + 200, PANEL.y + 72);
+  ctx.fillText("每kg伸长", PANEL.x + 350, PANEL.y + 72);
+  ctx.strokeStyle = "rgba(127,212,255,0.35)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(PANEL.x + 22, PANEL.y + 82); ctx.lineTo(PANEL.x + PANEL.w - 22, PANEL.y + 82); ctx.stroke();
+  ctx.font = "16px sans-serif";
+  if (!dataPoints.length) {
+    ctx.fillStyle = "rgba(255,255,255,0.45)";
+    ctx.fillText("挂上砝码后自动记录……", PANEL.x + 40, PANEL.y + 112);
+  }
+  dataPoints.slice(0, 8).forEach((p, i) => {
+    const y = PANEL.y + 110 + i * 26;
+    ctx.fillStyle = "#fff";
+    ctx.fillText(p.mass + "", PANEL.x + 62, y);
+    ctx.fillText(p.ext.toFixed(1), PANEL.x + 222, y);
+    ctx.fillStyle = "#ffd54a";
+    ctx.fillText(CM_PER_KG.toFixed(1) + " cm", PANEL.x + 362, y);
+  });
+  // 图
+  ctx.fillStyle = "#7fd4ff";
+  ctx.font = "bold 18px sans-serif";
+  ctx.fillText("📈 数据点图", PANEL.x + 22, GRAPH.y - 26);
+  // 网格与坐标
+  ctx.strokeStyle = "rgba(255,255,255,0.14)"; ctx.lineWidth = 1;
+  ctx.font = "13px sans-serif"; ctx.fillStyle = "rgba(255,255,255,0.6)";
+  for (let m = 0; m <= 10; m += 2) {
+    ctx.beginPath(); ctx.moveTo(gx(m), GRAPH.y); ctx.lineTo(gx(m), GRAPH.y + GRAPH.h); ctx.stroke();
+    ctx.textAlign = "center"; ctx.fillText(m + "", gx(m), GRAPH.y + GRAPH.h + 18); ctx.textAlign = "left";
+  }
+  for (let e = 0; e <= 20; e += 5) {
+    ctx.beginPath(); ctx.moveTo(GRAPH.x, gy(e)); ctx.lineTo(GRAPH.x + GRAPH.w, gy(e)); ctx.stroke();
+    ctx.textAlign = "right"; ctx.fillText(e + "", GRAPH.x - 8, gy(e) + 4); ctx.textAlign = "left";
+  }
+  ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(GRAPH.x, GRAPH.y); ctx.lineTo(GRAPH.x, GRAPH.y + GRAPH.h); ctx.lineTo(GRAPH.x + GRAPH.w, GRAPH.y + GRAPH.h);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  ctx.font = "14px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("质量 (kg)", GRAPH.x + GRAPH.w / 2, GRAPH.y + GRAPH.h + 40);
+  ctx.save();
+  ctx.translate(GRAPH.x - 40, GRAPH.y + GRAPH.h / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText("伸长 (cm)", 0, 0);
+  ctx.restore();
+  ctx.textAlign = "left";
+  // 连线（3 组数据后出现）
+  if (lineFound) {
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3.5;
+    ctx.beginPath();
+    dataPoints.forEach((p, i) => { i ? ctx.lineTo(gx(p.mass), gy(p.ext)) : ctx.moveTo(gx(p.mass), gy(p.ext)); });
+    ctx.stroke();
+    // 延长虚线回原点：直线过原点！
+    ctx.setLineDash([7, 6]);
+    ctx.strokeStyle = "rgba(255,213,74,0.6)";
+    ctx.beginPath();
+    ctx.moveTo(gx(dataPoints[0].mass), gy(dataPoints[0].ext));
+    ctx.lineTo(gx(0), gy(0)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // 数据点
+  for (const p of dataPoints) {
+    ctx.beginPath(); ctx.arc(gx(p.mass), gy(p.ext), 7, 0, 7);
+    ctx.fillStyle = "#ff7043"; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+  }
+  if (lineFound) {
+    ctx.fillStyle = "#ffd54a";
+    ctx.font = "bold 18px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("是一条直线！", GRAPH.x + GRAPH.w / 2, GRAPH.y - 4);
+    ctx.textAlign = "left";
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#1d2a3a";
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  drawBackground();
+  drawSpring();
+  drawRuler();
+  drawHung();
+  drawFalling();
+  drawTray();
+  drawPanel();
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  stepPhysics(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function boing() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = "triangle";
+    o.frequency.setValueAtTime(320, actx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(90, actx.currentTime + 0.22);
+    g.gain.setValueAtTime(0.16, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.25);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + 0.3);
+  } catch (e) {}
+}
+function breakSound() {
+  tone(180, 0.3, 0.2, "square");
+  setTimeout(() => tone(90, 0.4, 0.18, "sawtooth"), 120);
+}
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>化学方程式配平</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#101820; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,18,26,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:130px; left:50%; transform:translateX(-50%);
+    background:rgba(10,18,26,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">⚖️ 第 1 / 5 关</div>
+<div id="hint">拖动下面的分子卡片到方程式里，让左右两边每种原子一样多！</div>
+<div id="winPanel">
+  <div class="msg">⚖️ 配平成功！</div>
+  <button id="nextBtn">下一关 ▶</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const nextBtn = document.getElementById("nextBtn");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  if (terms.length) layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 化学数据 ================= */
+// 原子外观：颜色 + 球半径
+const ATOM = {
+  H:  { color:"#f2f2f2", r:7 },
+  O:  { color:"#e93b3b", r:10 },
+  C:  { color:"#5a616e", r:10 },
+  Fe: { color:"#aab6c2", r:12 },
+  Al: { color:"#d4dce6", r:11 },
+  Cl: { color:"#3ec94a", r:11 },
+  Ca: { color:"#e8c07a", r:11 }
+};
+// 物质：原子组成 + 球棍模型几何（坐标单位 px，scale=1 时）+ 化学键
+const SPECIES = {
+  H2:    { atoms:{H:2},          geo:[["H",-11,0],["H",11,0]], bonds:[[0,1]] },
+  O2:    { atoms:{O:2},          geo:[["O",-11,0],["O",11,0]], bonds:[[0,1]] },
+  H2O:   { atoms:{H:2,O:1},      geo:[["O",0,-5],["H",-13,8],["H",13,8]], bonds:[[0,1],[0,2]] },
+  CH4:   { atoms:{C:1,H:4},      geo:[["C",0,0],["H",-13,-11],["H",13,-11],["H",-11,12],["H",11,12]], bonds:[[0,1],[0,2],[0,3],[0,4]] },
+  CO2:   { atoms:{C:1,O:2},      geo:[["C",0,0],["O",-15,0],["O",15,0]], bonds:[[0,1],[0,2]] },
+  Fe:    { atoms:{Fe:1},         geo:[["Fe",0,0]], bonds:[] },
+  Fe3O4: { atoms:{Fe:3,O:4},     geo:[["Fe",-14,-8],["Fe",14,-8],["Fe",0,14],["O",-24,6],["O",24,6],["O",-10,-22],["O",10,-22]],
+           bonds:[[0,3],[1,4],[0,5],[1,6]] },
+  Al:    { atoms:{Al:1},         geo:[["Al",0,0]], bonds:[] },
+  HCl:   { atoms:{H:1,Cl:1},     geo:[["H",-11,0],["Cl",12,0]], bonds:[[0,1]] },
+  AlCl3: { atoms:{Al:1,Cl:3},    geo:[["Al",0,2],["Cl",-16,10],["Cl",16,10],["Cl",0,-15]], bonds:[[0,1],[0,2],[0,3]] },
+  CaCO3: { atoms:{Ca:1,C:1,O:3}, geo:[["C",0,0],["O",0,-15],["O",-13,8],["O",13,8],["Ca",21,-11]], bonds:[[0,1],[0,2],[0,3],[1,4]] },
+  CaCl2: { atoms:{Ca:1,Cl:2},    geo:[["Cl",-18,0],["Ca",0,0],["Cl",18,0]], bonds:[[0,1],[1,2]] }
+};
+// 5 关：左右两边的物质（初始系数都是 1，待配平）
+const LEVELS = [
+  { left:["H2","O2"],       right:["H2O"] },                 // 2,1 → 2
+  { left:["CH4","O2"],      right:["CO2","H2O"] },           // 1,2 → 1,2
+  { left:["Fe","O2"],       right:["Fe3O4"] },               // 3,2 → 1
+  { left:["Al","HCl"],      right:["AlCl3","H2"] },          // 2,6 → 2,3
+  { left:["CaCO3","HCl"],   right:["CaCl2","H2O","CO2"] }    // 1,2 → 1,1,1
+];
+const MAX_COEF = 8;
+const MS = 0.62;                       // 方程式里分子的绘制缩放
+
+/* ================= 游戏状态 ================= */
+let levelIdx = 0;
+let terms = [];        // {side:0左|1右, key, coef, flash, cx, rect, minusBtn, plusBtn}
+let cards = [];        // 底部分子卡片 {key, x, y, w, h}
+let elements = [];     // 本关涉及的元素（柱状图顺序）
+let state = "play";    // play | react | success
+let drag = null;       // {key, x, y} 正在拖动的卡片
+let prevEqual = {};    // 各元素上一次是否已相等（用于叮声）
+let eqY = 240, arrowX = 0, leftLabelX = 0, rightLabelX = 0;
+// 反应演示
+let reactT = 0;
+let rAtoms = [];       // {el, sx, sy, dx, dy, sdx, sdy, seed, side}
+let rBonds = [];       // [i, j, side]
+let confetti = [];
+
+function loadLevel(i) {
+  levelIdx = i;
+  state = "play";
+  terms = [];
+  LEVELS[i].left.forEach(k => terms.push({ side:0, key:k, coef:1, flash:0 }));
+  LEVELS[i].right.forEach(k => terms.push({ side:1, key:k, coef:1, flash:0 }));
+  drag = null; confetti = []; rAtoms = []; rBonds = [];
+  winPanel.style.display = "none";
+  layout();
+  prevEqual = {};
+  const c = counts();
+  for (const el in c) prevEqual[el] = c[el][0] === c[el][1];
+  updateScore();
+}
+function updateScore() { scorebar.textContent = `⚖️ 第 ${levelIdx + 1} / ${LEVELS.length} 关`; }
+
+/* ================= 布局 ================= */
+function layout() {
+  const nL = LEVELS[levelIdx].left.length, nR = LEVELS[levelIdx].right.length;
+  eqY = Math.round(H * 0.30);
+  const slotW = Math.min(170, (W - 160) / (nL + nR));
+  const arrowW = 90;
+  const totalW = (nL + nR) * slotW + arrowW;
+  const x0 = W / 2 - totalW / 2;
+  let li = 0, ri = 0;
+  for (const t of terms) {
+    if (t.side === 0) { t.cx = x0 + slotW * (li + 0.5); li++; }
+    else { t.cx = x0 + nL * slotW + arrowW + slotW * (ri + 0.5); ri++; }
+    t.rect = { x:t.cx - slotW / 2, y:eqY - 125, w:slotW, h:255 };
+    t.minusBtn = { x:t.cx - 34, y:eqY + 98 };
+    t.plusBtn  = { x:t.cx + 34, y:eqY + 98 };
+  }
+  arrowX = x0 + nL * slotW + arrowW / 2;
+  leftLabelX = x0 + nL * slotW / 2;
+  rightLabelX = x0 + nL * slotW + arrowW + nR * slotW / 2;
+  // 底部卡片
+  const keys = [...LEVELS[levelIdx].left, ...LEVELS[levelIdx].right];
+  const cw = 88, ch = 100, gap = 14;
+  const tw = keys.length * cw + (keys.length - 1) * gap;
+  const cx0 = W / 2 - tw / 2;
+  cards = keys.map((k, i) => ({ key:k, x:cx0 + i * (cw + gap), y:H - ch - 18, w:cw, h:ch }));
+  // 柱状图元素顺序
+  elements = Object.keys(counts());
+}
+// 第 k 个分子在某项里的格子位置
+function molPos(t, k) {
+  const cols = Math.min(2, t.coef), rows = Math.ceil(t.coef / cols);
+  return [t.cx + (k % cols - (cols - 1) / 2) * 50, eqY + (Math.floor(k / cols) - (rows - 1) / 2) * 44];
+}
+
+/* ================= 配平判定 ================= */
+function counts() {
+  const c = {};
+  for (const t of terms) {
+    for (const el in SPECIES[t.key].atoms) {
+      if (!c[el]) c[el] = [0, 0];
+      c[el][t.side] += SPECIES[t.key].atoms[el] * t.coef;
+    }
+  }
+  return c;
+}
+function isBalanced() {
+  const c = counts();
+  return Object.keys(c).every(el => c[el][0] === c[el][1]);
+}
+function afterChange() {
+  const c = counts();
+  for (const el in c) {
+    const eq = c[el][0] === c[el][1];
+    if (eq && !prevEqual[el]) ding();
+    prevEqual[el] = eq;
+  }
+  if (isBalanced()) startReaction();
+}
+function changeCoef(t, d) {
+  if (d < 0 && t.coef <= 1) { showHint("每种物质至少要留 1 个哦"); pop(200); return; }
+  if (d > 0 && t.coef >= MAX_COEF) { showHint("系数最大是 8，已经很多啦"); pop(200); return; }
+  t.coef += d;
+  t.flash = 1;
+  pop(d > 0 ? 880 : 440);
+  afterChange();
+}
+
+/* ================= 反应演示 ================= */
+function startReaction() {
+  state = "react";
+  reactT = 0;
+  rAtoms = []; rBonds = [];
+  for (const t of terms) {
+    const sp = SPECIES[t.key];
+    for (let k = 0; k < t.coef; k++) {
+      const [mx, my] = molPos(t, k);
+      const base = rAtoms.length;
+      for (const [el, gx, gy] of sp.geo) {
+        const a = Math.random() * Math.PI * 2;
+        rAtoms.push({
+          el, side:t.side,
+          sx:mx + gx * MS, sy:my + gy * MS, dx:0, dy:0,
+          sdx:Math.cos(a), sdy:Math.sin(a), seed:Math.random() * 7
+        });
+      }
+      for (const [i, j] of sp.bonds) rBonds.push([base + i, base + j, t.side]);
+    }
+  }
+  // 左边反应物的原子 → 配对到右边同种原子的目标位置
+  const byEl = {};
+  for (const a of rAtoms) if (a.side === 1) (byEl[a.el] = byEl[a.el] || []).push(a);
+  for (const a of rAtoms) if (a.side === 0) {
+    const tgt = byEl[a.el].pop();
+    a.dx = tgt.sx; a.dy = tgt.sy;
+  }
+  for (const a of rAtoms) if (a.side === 1) { a.dx = a.sx; a.dy = a.sy; }
+}
+const easeOut = p => 1 - (1 - p) * (1 - p);
+const easeInOut = p => p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+function atomPos(a, t) {
+  if (t < 0.4)   // 抖动
+    return [a.sx + Math.sin(t * 45 + a.seed) * 2.5, a.sy + Math.cos(t * 40 + a.seed) * 2.5];
+  if (t < 0.9) { // 拆散：化学键断裂，原子散开
+    const p = easeOut((t - 0.4) / 0.5);
+    return [a.sx + a.sdx * 36 * p, a.sy + a.sdy * 36 * p];
+  }
+  if (t < 1.8) { // 飞向新位置，重新组合
+    const p = easeInOut((t - 0.9) / 0.9);
+    const bx = a.sx + a.sdx * 36, by = a.sy + a.sdy * 36;
+    return [bx + (a.dx - bx) * p, by + (a.dy - by) * p - Math.sin(p * Math.PI) * 40];
+  }
+  return [a.dx, a.dy];
+}
+function finishReaction() {
+  state = "success";
+  fanfare();
+  boom();
+  const eq = terms.filter(t => t.side === 0).map(fmtTerm).join(" + ") +
+    " → " + terms.filter(t => t.side === 1).map(fmtTerm).join(" + ");
+  const last = levelIdx >= LEVELS.length - 1;
+  winPanel.querySelector(".msg").innerHTML =
+    (last ? "🎉 全部通关！你是配平大师！" : "⚖️ 配平成功！") +
+    `<br><span style="font-size:26px;color:#fff">${eq}</span>`;
+  nextBtn.textContent = last ? "再玩一次" : "下一关 ▶";
+  winPanel.style.display = "flex";
+}
+function fmtTerm(t) { return (t.coef > 1 ? t.coef : "") + t.key.replace(/\d/g, "<sub>$&</sub>"); }
+function boom() {
+  const colors = ["#ffd54a", "#e93b3b", "#2fbf4a", "#3f8cff", "#ff7ad9"];
+  for (let i = 0; i < 80; i++) {
+    confetti.push({
+      x:W / 2 + (Math.random() - 0.5) * 300, y:H * 0.28,
+      vx:(Math.random() - 0.5) * 420, vy:-Math.random() * 480 - 120,
+      vr:(Math.random() - 0.5) * 12, rot:Math.random() * 7,
+      c:colors[i % colors.length], size:4 + Math.random() * 5, life:1.5 + Math.random()
+    });
+  }
+}
+
+/* ================= 交互 ================= */
+canvas.addEventListener("pointerdown", e => {
+  if (state !== "play") return;
+  const x = e.clientX, y = e.clientY;
+  // +/- 按钮
+  for (const t of terms) {
+    if (Math.hypot(x - t.minusBtn.x, y - t.minusBtn.y) < 26) { changeCoef(t, -1); hintEl.style.opacity = "0"; return; }
+    if (Math.hypot(x - t.plusBtn.x, y - t.plusBtn.y) < 26) { changeCoef(t, 1); hintEl.style.opacity = "0"; return; }
+  }
+  // 分子卡片
+  for (const c of cards) {
+    if (x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h) {
+      drag = { key:c.key, x, y };
+      canvas.setPointerCapture(e.pointerId);
+      pop(660);
+      return;
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  drag.x = e.clientX; drag.y = e.clientY;
+});
+function endDrag(e) {
+  if (!drag) return;
+  const x = e.clientX, y = e.clientY;
+  let hitAny = false;
+  for (const t of terms) {
+    const r = t.rect;
+    if (x >= r.x - 8 && x <= r.x + r.w + 8 && y >= r.y - 8 && y <= r.y + r.h + 8) {
+      hitAny = true;
+      if (t.key === drag.key) {
+        hintEl.style.opacity = "0";
+        changeCoef(t, 1);
+      } else {
+        showHint(t.side === 0 ? "这个分子是生成物，要放在右边哦" : "这个分子是反应物，要放在左边哦");
+        pop(200);
+      }
+      break;
+    }
+  }
+  if (!hitAny) pop(300);
+  drag = null;
+}
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", () => { drag = null; });
+
+/* ================= 绘制 ================= */
+const BLUE = "#3f8cff", GOLD = "#ffb800", GREEN = "#2fbf4a";
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+function drawAtom(el, x, y, r) {
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+  ctx.fillStyle = ATOM[el].color; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.beginPath(); ctx.arc(x - r * 0.3, y - r * 0.35, r * 0.3, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.55)"; ctx.fill();
+}
+// 球棍模型
+function drawMolecule(key, x, y, s) {
+  const sp = SPECIES[key];
+  ctx.strokeStyle = "rgba(215,222,232,0.9)";
+  ctx.lineWidth = 4 * s; ctx.lineCap = "round";
+  for (const [i, j] of sp.bonds) {
+    ctx.beginPath();
+    ctx.moveTo(x + sp.geo[i][1] * s, y + sp.geo[i][2] * s);
+    ctx.lineTo(x + sp.geo[j][1] * s, y + sp.geo[j][2] * s);
+    ctx.stroke();
+  }
+  for (const [el, gx, gy] of sp.geo) drawAtom(el, x + gx * s, y + gy * s, ATOM[el].r * s);
+}
+// 带下标的化学式（居中）
+function drawFormula(key, cx, cy, size, color) {
+  ctx.textBaseline = "middle";
+  let total = 0;
+  for (const ch of key) {
+    ctx.font = `bold ${/\d/.test(ch) ? Math.round(size * 0.62) : size}px sans-serif`;
+    total += ctx.measureText(ch).width;
+  }
+  let x = cx - total / 2;
+  ctx.textAlign = "left";
+  for (const ch of key) {
+    const sub = /\d/.test(ch);
+    ctx.font = `bold ${sub ? Math.round(size * 0.62) : size}px sans-serif`;
+    ctx.fillStyle = color;
+    ctx.fillText(ch, x, cy + (sub ? size * 0.26 : 0));
+    x += ctx.measureText(ch).width;
+  }
+}
+// 顶部实时方程式（含当前系数）
+function drawRichFormula(cx, y, size) {
+  const toks = [];
+  for (let side = 0; side < 2; side++) {
+    const ts = terms.filter(t => t.side === side);
+    ts.forEach((t, i) => {
+      if (i > 0) toks.push({ t:" + ", s:0, c:"rgba(255,255,255,0.6)" });
+      if (t.coef > 1) toks.push({ t:String(t.coef), s:0, c:GOLD });
+      for (const ch of t.key) toks.push({ t:ch, s:/\d/.test(ch) ? 1 : 0, c:"#ffffff" });
+    });
+    if (side === 0) toks.push({ t:"  →  ", s:0, c:"rgba(255,255,255,0.8)" });
+  }
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  let total = 0;
+  for (const tk of toks) {
+    ctx.font = `bold ${tk.s ? Math.round(size * 0.62) : size}px sans-serif`;
+    tk.w = ctx.measureText(tk.t).width;
+    total += tk.w;
+  }
+  let x = cx - total / 2;
+  for (const tk of toks) {
+    ctx.font = `bold ${tk.s ? Math.round(size * 0.62) : size}px sans-serif`;
+    ctx.fillStyle = tk.c;
+    ctx.fillText(tk.t, x, y + (tk.s ? size * 0.26 : 0));
+    x += tk.w;
+  }
+}
+
+function drawTerm(t) {
+  const r = t.rect;
+  // 拖拽悬停高亮
+  const hover = drag && drag.key === t.key &&
+    drag.x >= r.x - 8 && drag.x <= r.x + r.w + 8 && drag.y >= r.y - 8 && drag.y <= r.y + r.h + 8;
+  ctx.fillStyle = hover ? "rgba(255,213,74,0.14)" : "rgba(255,255,255,0.05)";
+  roundRect(r.x, r.y, r.w, r.h, 14, true);
+  if (hover) {
+    ctx.strokeStyle = GOLD; ctx.lineWidth = 3;
+    roundRect(r.x, r.y, r.w, r.h, 14, false); ctx.stroke();
+  }
+  // 系数徽章
+  const by = eqY - 92;
+  ctx.beginPath(); ctx.arc(t.cx, by, 19, 0, 7);
+  ctx.fillStyle = t.coef > 1 ? GOLD : "rgba(255,255,255,0.16)"; ctx.fill();
+  ctx.fillStyle = t.coef > 1 ? "#5a3d00" : "#fff";
+  ctx.font = "bold 20px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(String(t.coef), t.cx, by + 1);
+  // 分子（数量 = 系数）
+  if (state === "play") {
+    for (let k = 0; k < t.coef; k++) {
+      const [mx, my] = molPos(t, k);
+      const s = MS * (1 + 0.25 * t.flash);
+      drawMolecule(t.key, mx, my, s);
+    }
+  }
+  // +/- 按钮
+  if (state === "play") {
+    drawRoundBtn(t.minusBtn.x, t.minusBtn.y, "−", t.coef <= 1);
+    drawRoundBtn(t.plusBtn.x, t.plusBtn.y, "＋", t.coef >= MAX_COEF);
+  }
+}
+function drawRoundBtn(x, y, label, dim) {
+  ctx.beginPath(); ctx.arc(x, y, 21, 0, 7);
+  ctx.fillStyle = dim ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.16)"; ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = dim ? "rgba(255,255,255,0.3)" : "#fff";
+  ctx.font = "bold 22px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(label, x, y + 1);
+}
+
+function drawChart() {
+  const c = counts();
+  const groupW = 104;
+  const pw = elements.length * groupW + 48, ph = 196;
+  const px = W / 2 - pw / 2, py = Math.round(H * 0.52);
+  const baseline = py + 150, barMax = 86;
+  const maxV = Math.max(8, ...elements.map(el => Math.max(c[el][0], c[el][1])));
+  ctx.fillStyle = "rgba(255,255,255,0.06)";
+  roundRect(px, py, pw, ph, 16, true);
+  // 标题 + 图例
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("原子数量对比", W / 2, py + 20);
+  ctx.font = "13px sans-serif"; ctx.textAlign = "left";
+  let lx = W / 2 - 78;
+  ctx.fillStyle = BLUE; ctx.fillRect(lx, py + 36, 12, 12);
+  ctx.fillStyle = "#fff"; ctx.fillText("反应物", lx + 18, py + 48);
+  lx += 82;
+  ctx.fillStyle = GOLD; ctx.fillRect(lx, py + 36, 12, 12);
+  ctx.fillStyle = "#fff"; ctx.fillText("生成物", lx + 18, py + 48);
+  // 基线
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(px + 16, baseline); ctx.lineTo(px + pw - 16, baseline); ctx.stroke();
+  // 每种原子一对柱子
+  elements.forEach((el, i) => {
+    const gx = px + 24 + groupW * (i + 0.5);
+    const eq = c[el][0] === c[el][1];
+    const hL = c[el][0] / maxV * barMax, hR = c[el][1] / maxV * barMax;
+    ctx.fillStyle = eq ? GREEN : BLUE;
+    ctx.fillRect(gx - 38, baseline - hL, 32, hL);
+    ctx.fillStyle = eq ? GREEN : GOLD;
+    ctx.fillRect(gx + 6, baseline - hR, 32, hR);
+    // 数字
+    ctx.fillStyle = "#fff"; ctx.font = "bold 13px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(String(c[el][0]), gx - 22, baseline - hL - 9);
+    ctx.fillText(String(c[el][1]), gx + 22, baseline - hR - 9);
+    // 元素符号 + 原子色圆点
+    drawAtom(el, gx - 14, baseline + 24, 7);
+    ctx.fillStyle = "#fff"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "left";
+    ctx.fillText(el, gx - 4, baseline + 25);
+  });
+}
+
+function drawCard(c, ghost) {
+  ctx.save();
+  if (ghost) ctx.globalAlpha = 0.9;
+  ctx.fillStyle = ghost ? "rgba(60,80,110,0.95)" : "rgba(255,255,255,0.1)";
+  roundRect(c.x, c.y, c.w, c.h, 12, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.28)"; ctx.lineWidth = 2;
+  roundRect(c.x, c.y, c.w, c.h, 12, false); ctx.stroke();
+  drawMolecule(c.key, c.x + c.w / 2, c.y + 40, 0.66);
+  drawFormula(c.key, c.x + c.w / 2, c.y + c.h - 20, 16, "#fff");
+  ctx.restore();
+}
+
+function drawReact() {
+  // 化学键：反应物的键渐隐，生成物的键渐现
+  for (const [i, j, side] of rBonds) {
+    let alpha = 0;
+    if (side === 0) alpha = reactT < 0.4 ? 1 : reactT < 0.9 ? 1 - (reactT - 0.4) / 0.5 : 0;
+    else alpha = reactT > 1.8 ? Math.min(1, (reactT - 1.8) / 0.5) : 0;
+    if (alpha <= 0.01) continue;
+    const [x1, y1] = atomPos(rAtoms[i], reactT);
+    const [x2, y2] = atomPos(rAtoms[j], reactT);
+    ctx.strokeStyle = `rgba(215,222,232,${0.9 * alpha})`;
+    ctx.lineWidth = 4 * MS; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+  for (const a of rAtoms) {
+    // 生成物原子等左侧原子飞到位后再显现（它们只是目标位置占位）
+    if (a.side === 1 && reactT < 1.5) continue;
+    const [x, y] = atomPos(a, reactT);
+    if (a.side === 1 && reactT < 1.8) {
+      ctx.save();
+      ctx.globalAlpha = (reactT - 1.5) / 0.3;
+      drawAtom(a.el, x, y, ATOM[a.el].r * MS);
+      ctx.restore();
+    } else {
+      drawAtom(a.el, x, y, ATOM[a.el].r * MS);
+    }
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#1b2a3a"); g.addColorStop(1, "#101820");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 顶部实时方程式
+  drawRichFormula(W / 2, 78, 26);
+  // 左右标签
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = BLUE; ctx.fillText("反应物", leftLabelX, eqY - 138);
+  ctx.fillStyle = GOLD; ctx.fillText("生成物", rightLabelX, eqY - 138);
+  // 箭头 与 加号
+  ctx.font = "bold 42px sans-serif";
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.fillText("→", arrowX, eqY);
+  ctx.font = "bold 30px sans-serif";
+  ctx.fillStyle = "rgba(255,255,255,0.45)";
+  for (let side = 0; side < 2; side++) {
+    const ts = terms.filter(t => t.side === side);
+    for (let i = 0; i + 1 < ts.length; i++)
+      ctx.fillText("+", (ts[i].cx + ts[i + 1].cx) / 2, eqY);
+  }
+  // 各项（或反应演示）
+  for (const t of terms) drawTerm(t);
+  if (state === "react" || state === "success") {
+    if (state === "react") drawReact();
+    else for (const t of terms)   // 成功后定格显示生成物状态
+      for (let k = 0; k < t.coef; k++) {
+        const [mx, my] = molPos(t, k);
+        drawMolecule(t.key, mx, my, MS);
+      }
+  }
+  drawChart();
+  // 底部卡片
+  for (const c of cards) drawCard(c, false);
+  // 拖拽中的幽灵卡片
+  if (drag) drawCard({ key:drag.key, x:drag.x - 44, y:drag.y - 50, w:88, h:100 }, true);
+  // 彩带
+  for (const p of confetti) {
+    ctx.save();
+    ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+    ctx.globalAlpha = Math.min(1, p.life);
+    ctx.fillStyle = p.c;
+    ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size * 0.6);
+    ctx.restore();
+  }
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function step(now) {
+  const dt = Math.max(0, Math.min(0.033, (now - lastT) / 1000));
+  lastT = now;
+  for (const t of terms) t.flash = Math.max(0, t.flash - dt * 3);
+  if (state === "react") {
+    const prev = reactT;
+    reactT += dt;
+    if (prev < 0.9 && reactT >= 0.9) whoosh();
+    if (reactT >= 2.3) finishReaction();
+  }
+  for (const p of confetti) {
+    p.vy += 800 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.rot += p.vr * dt; p.life -= dt;
+  }
+  confetti = confetti.filter(p => p.life > 0);
+  draw();
+}
+function loop(now) {
+  step(now);
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const ding = () => tone(1046, 0.1, 0.08);
+const whoosh = () => tone(520, 0.18, 0.09, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 1800);
+}
+nextBtn.addEventListener("click", () => {
+  pop(880);
+  loadLevel(levelIdx < LEVELS.length - 1 ? levelIdx + 1 : 0);
+});
+
+/* ================= 启动 ================= */
+resize();
+loadLevel(0);
+draw();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

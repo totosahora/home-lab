@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>七巧板乐园</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#fdf3dd; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #topbar {
+    position:absolute; top:10px; left:50%; transform:translateX(-50%);
+    display:flex; gap:8px; z-index:10; white-space:nowrap;
+  }
+  #topbar button {
+    font-size:17px; font-weight:bold; padding:9px 16px;
+    border-radius:22px; border:2px solid rgba(180,130,60,0.5);
+    background:rgba(255,255,255,0.9); color:#7a5220; cursor:pointer;
+    box-shadow:0 2px 6px rgba(120,80,20,0.15);
+  }
+  #topbar button.active { background:#ffd54a; border-color:#e0a800; }
+  #topbar button.done { background:#b7f0b1; border-color:#4caf50; color:#1b5e20; }
+  #topbar button:active { transform:scale(1.07); }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(60,40,15,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="topbar">
+  <button data-lv="0">🏠 小房子</button>
+  <button data-lv="1">⛵ 小船</button>
+  <button data-lv="2">🐱 小猫</button>
+  <button data-lv="-1">🎨 自由拼</button>
+  <button id="resetBtn">⟲ 放回</button>
+</div>
+<div id="hint">从左边把七巧板拖出来，拼到灰色轮廓上！点一下积木可以选中旋转</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+const topbar = document.getElementById("topbar");
+let W = 0, H = 0, DPR = 1;
+
+const BOX_W = 150;             // 左侧工具箱宽
+let U = 60, ox = 0, oy = 0;    // 世界→屏幕：sx=ox+U*wx, sy=oy-U*wy（世界 y 轴向上）
+
+function toScreen(wx, wy) { return [ox + U * wx, oy - U * wy]; }
+function toWorld(sx, sy) { return [(sx - ox) / U, (oy - sy) / U]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 单位 = 小三角形直角边。所有顶点精确落在整数格点上（关卡数据由离线求解器精确验证：
+// 七块无缝拼满轮廓，无重叠）。
+const SHAPES = {
+  T: { verts: [[0,0],[2,0],[0,2]],       name: "大三角" },
+  M: { verts: [[0,0],[2,0],[1,1]],       name: "中三角" },
+  S: { verts: [[0,0],[1,0],[0,1]],       name: "小三角" },
+  Q: { verts: [[0,0],[1,0],[1,1],[0,1]], name: "正方形" },
+  P: { verts: [[0,0],[1,0],[2,1],[1,1]], name: "平行四边形" },
+};
+// 每块的质心相对局部坐标（绕质心旋转，旋转时位置不飘）
+for (const t in SHAPES) {
+  const vs = SHAPES[t].verts;
+  let cx = 0, cy = 0;
+  for (const v of vs) { cx += v[0]; cy += v[1]; }
+  cx /= vs.length; cy /= vs.length;
+  SHAPES[t].local = vs.map(v => [v[0] - cx, v[1] - cy]);
+}
+
+const PIECE_DEFS = [
+  { id:"T1", type:"T", color:"#ef4444" },
+  { id:"T2", type:"T", color:"#3b82f6" },
+  { id:"M",  type:"M", color:"#22c55e" },
+  { id:"S1", type:"S", color:"#a855f7" },
+  { id:"S2", type:"S", color:"#06b6d4" },
+  { id:"Q",  type:"Q", color:"#facc15" },
+  { id:"P",  type:"P", color:"#ec4899" },
+];
+
+// 三个关卡的目标拼法（求解器输出的绝对顶点，载入时整体平移到以轮廓中心为原点）
+const LEVELS = [
+  { name:"小房子", icon:"🏠", targets: [
+    { type:"T", verts:[[1,0],[3,0],[1,2]] },
+    { type:"T", verts:[[2,1],[4,1],[2,3]] },
+    { type:"M", verts:[[2,1],[2,3],[1,2]] },
+    { type:"S", verts:[[1,1],[1,2],[0,1]] },
+    { type:"S", verts:[[4,1],[3,1],[4,0]] },
+    { type:"Q", verts:[[0,0],[1,0],[1,1],[0,1]] },
+    { type:"P", verts:[[4,0],[3,1],[2,1],[3,0]] },
+  ]},
+  { name:"小船", icon:"⛵", targets: [
+    { type:"T", verts:[[2,0],[4,0],[2,2]] },
+    { type:"T", verts:[[3,1],[5,1],[3,3]] },
+    { type:"M", verts:[[3,1],[3,3],[2,2]] },
+    { type:"S", verts:[[1,0],[1,1],[0,0]] },
+    { type:"S", verts:[[2,1],[2,2],[1,1]] },
+    { type:"Q", verts:[[1,0],[2,0],[2,1],[1,1]] },
+    { type:"P", verts:[[5,0],[4,1],[3,1],[4,0]] },
+  ]},
+  { name:"小猫", icon:"🐱", targets: [
+    { type:"T", verts:[[0,0],[2,0],[0,2]] },
+    { type:"T", verts:[[0,2],[2,2],[0,4]] },
+    { type:"M", verts:[[3,1],[1,1],[2,0]] },
+    { type:"S", verts:[[2,1],[3,1],[2,2]] },
+    { type:"S", verts:[[1,2],[0,2],[1,1]] },
+    { type:"Q", verts:[[1,1],[2,1],[2,2],[1,2]] },
+    { type:"P", verts:[[2,2],[2,3],[1,4],[1,3]] },
+  ]},
+];
+// 轮廓整体居中到原点
+for (const lv of LEVELS) {
+  let mnx=1e9, mny=1e9, mxx=-1e9, mxy=-1e9;
+  for (const t of lv.targets) for (const v of t.verts) {
+    mnx=Math.min(mnx,v[0]); mny=Math.min(mny,v[1]);
+    mxx=Math.max(mxx,v[0]); mxy=Math.max(mxy,v[1]);
+  }
+  const cx=(mnx+mxx)/2, cy=(mny+mxy)/2;
+  lv.bw = mxx-mnx; lv.bh = mxy-mny;
+  for (const t of lv.targets) t.verts = t.verts.map(v => [v[0]-cx, v[1]-cy]);
+}
+
+/* ================= 游戏状态 ================= */
+let pieces = [];          // {id,type,color,cx,cy,k,flip,inBox,placed}
+let levelIdx = 0;         // -1 = 自由模式
+let levelDone = [false, false, false];
+let selected = null;      // 选中的块（显示手柄）
+let drag = null;          // {p, dx, dy, moved, snapKey}
+let snapGlow = null;      // {wx, wy, t} 吸附点高亮
+let confetti = [];
+let celebrated = false;
+
+function resetPieces() {
+  pieces = PIECE_DEFS.map((d, i) => ({
+    id:d.id, type:d.type, color:d.color,
+    cx:0, cy:0, k:0, flip:false,
+    inBox:true, placed:false, slot:i
+  }));
+  selected = null; drag = null; snapGlow = null; celebrated = false;
+}
+function curLevel() { return levelIdx >= 0 ? LEVELS[levelIdx] : null; }
+function fitView() {
+  const lv = curLevel();
+  const bw = lv ? lv.bw + 1.2 : 6, bh = lv ? lv.bh + 1.2 : 5;
+  U = Math.max(28, Math.min(100, (W - BOX_W - 70) / bw, (H - 130) / bh));
+  ox = BOX_W + (W - BOX_W) / 2;
+  oy = H / 2 + 10;
+}
+function setLevel(i) {
+  levelIdx = i;
+  celebrated = false;
+  confetti = [];
+  for (const p of pieces) { p.placed = false; }
+  fitView();
+  for (const p of pieces) recheckPiece(p);   // 已拼对的块保持打勾状态
+  updateTopbar();
+  if (i >= 0) showHint(`拼一个${LEVELS[i].icon}${LEVELS[i].name}吧！`);
+  else showHint("自由拼模式：随便拼你喜欢的图案！");
+}
+function updateTopbar() {
+  const btns = topbar.querySelectorAll("button[data-lv]");
+  btns.forEach(b => {
+    const i = +b.dataset.lv;
+    b.classList.toggle("active", i === levelIdx);
+    b.classList.toggle("done", i >= 0 && levelDone[i]);
+    if (i >= 0) b.textContent = `${LEVELS[i].icon} ${LEVELS[i].name}${levelDone[i] ? " ✓" : ""}`;
+  });
+}
+
+/* ================= 拼图逻辑 ================= */
+// 块的世界坐标顶点
+function worldVerts(p) {
+  const loc = SHAPES[p.type].local;
+  const a = p.k * Math.PI / 4, c = Math.cos(a), s = Math.sin(a);
+  return loc.map(v => {
+    const x = p.flip ? -v[0] : v[0];
+    return [p.cx + x * c - v[1] * s, p.cy + x * s + v[1] * c];
+  });
+}
+function sameVerts(a, b, tol) {
+  if (a.length !== b.length) return false;
+  const used = b.map(() => false);
+  for (const va of a) {
+    let best = -1, bd = tol;
+    for (let j = 0; j < b.length; j++) {
+      if (used[j]) continue;
+      const d = Math.hypot(va[0]-b[j][0], va[1]-b[j][1]);
+      if (d < bd) { bd = d; best = j; }
+    }
+    if (best < 0) return false;
+    used[best] = true;
+  }
+  return true;
+}
+// 顶点磁吸：拖动时若任一顶点附近 22px 内有同类目标顶点，自动对齐
+const SNAP_R = 22, PLACE_TOL = 15;
+function findSnap(p) {
+  const lv = curLevel(); if (!lv) return null;
+  const wv = worldVerts(p);
+  let best = null, bd = SNAP_R / U;
+  for (const t of lv.targets) {
+    if (t.type !== p.type) continue;
+    for (const v of wv) for (const tv of t.verts) {
+      const d = Math.hypot(v[0]-tv[0], v[1]-tv[1]);
+      if (d < bd) { bd = d; best = { vx:v[0], vy:v[1], tx:tv[0], ty:tv[1] }; }
+    }
+  }
+  return best;
+}
+// 拼对判定：顶点集合与某个同类目标重合
+function recheckPiece(p) {
+  const lv = curLevel();
+  p.placed = false;
+  if (!lv || p.inBox) return;
+  const wv = worldVerts(p);
+  for (const t of lv.targets) {
+    if (t.type !== p.type) continue;
+    if (sameVerts(wv, t.verts, PLACE_TOL / U)) { p.placed = true; return; }
+  }
+}
+function afterMove(p) {
+  recheckPiece(p);
+  if (p.placed) { pop(720); }
+  const lv = curLevel();
+  if (lv && !celebrated && pieces.every(q => q.placed)) {
+    celebrated = true;
+    levelDone[levelIdx] = true;
+    updateTopbar();
+    fanfare();
+    spawnConfetti();
+    showHint(`🎉 ${lv.name}拼好啦！太棒了！`);
+  }
+}
+
+/* ================= 绘制 ================= */
+function drawPoly(verts, fill, stroke, lw) {
+  ctx.beginPath();
+  verts.forEach((v, i) => i ? ctx.lineTo(v[0], v[1]) : ctx.moveTo(v[0], v[1]));
+  ctx.closePath();
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw || 2; ctx.stroke(); }
+}
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#fff8e8"); g.addColorStop(1, "#ffe9c0");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+function drawToolbox() {
+  ctx.fillStyle = "rgba(255,255,255,0.78)";
+  ctx.strokeStyle = "rgba(180,130,60,0.5)"; ctx.lineWidth = 2;
+  roundRect(8, 8, BOX_W - 16, H - 16, 16, true, true);
+  ctx.fillStyle = "#7a5220";
+  ctx.font = "bold 19px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("七巧板", BOX_W / 2, 32);
+  // 槽位里的迷你块
+  for (const p of pieces) {
+    if (!p.inBox) continue;
+    const [cx, cy, ms] = slotGeom(p.slot);
+    const vs = SHAPES[p.type].local.map(v => [cx + v[0] * ms, cy - v[1] * ms]);
+    drawPoly(vs, p.color, "rgba(0,0,0,0.4)", 1.5);
+    ctx.fillStyle = "#8a6a35"; ctx.font = "11px sans-serif";
+    ctx.fillText(SHAPES[p.type].name, cx, cy + slotH() * 0.34);
+  }
+}
+function slotH() { return Math.min(92, (H - 66) / 7); }
+function slotGeom(i) {
+  // 槽位中心 + 迷你缩放（把块装进 46px）；槽位与 PIECE_DEFS 固定对应
+  const cy = 56 + slotH() * i + slotH() / 2;
+  return [BOX_W / 2, cy, miniScale(PIECE_DEFS[i].type)];
+}
+function miniScale(type) {
+  const vs = SHAPES[type].local;
+  let mnx=1e9,mny=1e9,mxx=-1e9,mxy=-1e9;
+  for (const v of vs){ mnx=Math.min(mnx,v[0]);mny=Math.min(mny,v[1]);mxx=Math.max(mxx,v[0]);mxy=Math.max(mxy,v[1]); }
+  return 46 / Math.max(mxx-mnx, mxy-mny);
+}
+function drawTargets() {
+  const lv = curLevel(); if (!lv) return;
+  for (const t of lv.targets) {
+    // 已被拼对盖住的目标不再画（块本身就在那儿）
+    if (pieces.some(p => p.placed && !p.inBox && p.type === t.type &&
+        sameVerts(worldVerts(p), t.verts, PLACE_TOL / U))) continue;
+    const vs = t.verts.map(v => toScreen(v[0], v[1]));
+    const pieceColor = (PIECE_DEFS.find(d => d.type === t.type) || {}).color || "#999";
+    ctx.save();
+    ctx.globalAlpha = 0.13;
+    drawPoly(vs, pieceColor, null);
+    ctx.restore();
+    ctx.save();
+    ctx.setLineDash([7, 5]);
+    drawPoly(vs, null, "rgba(90,90,90,0.75)", 2);
+    ctx.restore();
+    // 顶点磁吸点
+    ctx.fillStyle = "rgba(90,90,90,0.5)";
+    for (const v of vs) { ctx.beginPath(); ctx.arc(v[0], v[1], 3.2, 0, 7); ctx.fill(); }
+  }
+  // 吸附高亮
+  if (snapGlow) {
+    const [sx, sy] = toScreen(snapGlow.wx, snapGlow.wy);
+    ctx.beginPath(); ctx.arc(sx, sy, 11, 0, 7);
+    ctx.strokeStyle = "#2fbf4a"; ctx.lineWidth = 3.5; ctx.stroke();
+    ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 7);
+    ctx.fillStyle = "#2fbf4a"; ctx.fill();
+  }
+}
+function drawPiece(p) {
+  const vs = worldVerts(p).map(v => toScreen(v[0], v[1]));
+  ctx.save();
+  if (drag && drag.p === p) { ctx.shadowColor = "rgba(0,0,0,0.35)"; ctx.shadowBlur = 14; ctx.shadowOffsetY = 5; }
+  drawPoly(vs, p.color, "rgba(0,0,0,0.4)", 2);
+  ctx.restore();
+  if (p.placed) {
+    // 拼对的块画个小勾光圈
+    let cx=0, cy=0;
+    for (const v of vs){ cx+=v[0]; cy+=v[1]; }
+    cx/=vs.length; cy/=vs.length;
+    ctx.beginPath(); ctx.arc(cx, cy, 13, 0, 7);
+    ctx.fillStyle = "rgba(47,191,74,0.9)"; ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.font = "bold 15px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("✓", cx, cy + 1);
+  }
+  if (selected === p && !(drag && drag.p === p)) drawHandles(p, vs);
+}
+function handlePos(p, vs) {
+  // ↻ 手柄在块的包围盒上方；⇋ 手柄（仅平行四边形）在其右侧
+  let mny = 1e9, mnx = 1e9, mxx = -1e9;
+  for (const v of vs) { mny = Math.min(mny, v[1]); mnx = Math.min(mnx, v[0]); mxx = Math.max(mxx, v[0]); }
+  const hx = (mnx + mxx) / 2, hy = Math.max(26, mny - 30);
+  const hs = [{ x:hx, y:hy, kind:"rot" }];
+  if (p.type === "P") hs.push({ x:hx + 46, y:hy, kind:"flip" });
+  return hs;
+}
+function drawHandles(p, vs) {
+  for (const h of handlePos(p, vs)) {
+    ctx.beginPath(); ctx.arc(h.x, h.y, 17, 0, 7);
+    ctx.fillStyle = "#fff"; ctx.fill();
+    ctx.strokeStyle = h.kind === "rot" ? "#3b82f6" : "#a855f7"; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.fillStyle = h.kind === "rot" ? "#3b82f6" : "#a855f7";
+    ctx.font = "bold 19px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(h.kind === "rot" ? "↻" : "⇋", h.x, h.y + 1);
+  }
+}
+function roundRect(x, y, w, h, r, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+function spawnConfetti() {
+  const colors = ["#ef4444","#f97316","#facc15","#22c55e","#3b82f6","#a855f7","#ec4899"];
+  for (let i = 0; i < 90; i++) {
+    confetti.push({
+      x: BOX_W + (W - BOX_W) / 2 + (Math.random()-0.5) * 120,
+      y: H * 0.3 + (Math.random()-0.5) * 60,
+      vx: (Math.random()-0.5) * 420, vy: -Math.random() * 380 - 60,
+      c: colors[i % colors.length], s: 5 + Math.random() * 6,
+      r: Math.random() * 7, vr: (Math.random()-0.5) * 9
+    });
+  }
+}
+function drawConfetti(dt) {
+  if (!confetti.length) return;
+  for (const c of confetti) {
+    c.vy += 780 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt; c.r += c.vr * dt;
+  }
+  confetti = confetti.filter(c => c.y < H + 30);
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.r);
+    ctx.fillStyle = c.c;
+    ctx.fillRect(-c.s/2, -c.s/2, c.s, c.s * 0.6);
+    ctx.restore();
+  }
+}
+function draw(dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawTargets();
+  for (const p of pieces) if (!p.inBox) drawPiece(p);
+  drawToolbox();
+  drawConfetti(dt);
+}
+
+/* ================= 交互 ================= */
+function pointInPoly(sx, sy, vs) {
+  let inside = false;
+  for (let i = 0, j = vs.length - 1; i < vs.length; j = i++) {
+    const a = vs[i], b = vs[j];
+    if ((a[1] > sy) !== (b[1] > sy) &&
+        sx < (b[0]-a[0]) * (sy - a[1]) / (b[1]-a[1]) + a[0]) inside = !inside;
+  }
+  return inside;
+}
+function hitBoxPiece(sx, sy) {
+  // 槽位整条矩形都是热区（儿童友好）
+  if (sx > BOX_W - 8) return null;
+  for (const p of pieces) {
+    if (!p.inBox) continue;
+    const [cx, cy] = slotGeom(p.slot);
+    if (Math.abs(sy - cy) < slotH() * 0.48 && Math.abs(sx - cx) < 58) return p;
+  }
+  return null;
+}
+function hitCanvasPiece(sx, sy) {
+  for (let i = pieces.length - 1; i >= 0; i--) {
+    const p = pieces[i];
+    if (p.inBox) continue;
+    const vs = worldVerts(p).map(v => toScreen(v[0], v[1]));
+    if (pointInPoly(sx, sy, vs)) return p;
+  }
+  return null;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const sx = e.clientX, sy = e.clientY;
+  // 1) 手柄
+  if (selected && !selected.inBox) {
+    const vs = worldVerts(selected).map(v => toScreen(v[0], v[1]));
+    for (const h of handlePos(selected, vs)) {
+      if (Math.hypot(sx - h.x, sy - h.y) < 24) {
+        if (h.kind === "rot") { selected.k = (selected.k + 1) % 8; pop(520); }
+        else { selected.flip = !selected.flip; whoosh(); }
+        afterMove(selected);
+        return;
+      }
+    }
+  }
+  // 2) 工具箱里的块 → 拖出
+  let p = hitBoxPiece(sx, sy);
+  if (p) {
+    p.inBox = false;
+    const [wx, wy] = toWorld(sx, sy);
+    p.cx = wx; p.cy = wy;
+    pieces.splice(pieces.indexOf(p), 1); pieces.push(p);   // 置顶
+    selected = p;
+    drag = { p, dx:0, dy:0, moved:0, fromBox:true, snapKey:null, lx:e.clientX, ly:e.clientY };
+    canvas.setPointerCapture(e.pointerId);
+    pop(440);
+    return;
+  }
+  // 3) 画布上的块 → 拖动 / 点选
+  p = hitCanvasPiece(sx, sy);
+  if (p) {
+    const [wx, wy] = toWorld(sx, sy);
+    pieces.splice(pieces.indexOf(p), 1); pieces.push(p);
+    selected = p;
+    drag = { p, dx:wx - p.cx, dy:wy - p.cy, moved:0, fromBox:false, snapKey:null, lx:e.clientX, ly:e.clientY };
+    canvas.setPointerCapture(e.pointerId);
+    return;
+  }
+  // 4) 空白处 → 取消选中
+  selected = null;
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  drag.moved += Math.abs(e.clientX - drag.lx) + Math.abs(e.clientY - drag.ly);
+  drag.lx = e.clientX; drag.ly = e.clientY;
+  let nx = wx - drag.dx, ny = wy - drag.dy;
+  drag.p.cx = nx; drag.p.cy = ny;
+  // 顶点磁吸
+  const lv = curLevel();
+  snapGlow = null;
+  if (lv) {
+    const s = findSnap(drag.p);
+    if (s) {
+      const ddx = s.tx - s.vx, ddy = s.ty - s.vy;
+      drag.p.cx += ddx; drag.p.cy += ddy;
+      drag.dx -= ddx; drag.dy -= ddy;
+      snapGlow = { wx: s.tx, wy: s.ty };
+      const key = s.tx + "," + s.ty;
+      if (drag.snapKey !== key) { drag.snapKey = key; blip(); }
+    } else drag.snapKey = null;
+  }
+});
+function endDrag(e) {
+  if (!drag) return;
+  const p = drag.p;
+  const wasTap = drag.moved < 8 && !drag.fromBox;
+  snapGlow = null;
+  if (!wasTap) {
+    // 拖回工具箱 = 放回
+    if (e.clientX < BOX_W - 8) {
+      p.inBox = true; p.placed = false;
+      if (selected === p) selected = null;
+      pop(300);
+    } else {
+      // 别拖出屏幕
+      p.cx = Math.min(Math.max(p.cx, toWorld(BOX_W + 20, 0)[0]), toWorld(W - 20, 0)[0]);
+      p.cy = Math.min(Math.max(p.cy, toWorld(0, H - 20)[1]), toWorld(0, 20)[1]);
+      afterMove(p);
+    }
+  } else {
+    pop(600);   // 点选：显示手柄
+  }
+  drag = null;
+}
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+
+topbar.querySelectorAll("button[data-lv]").forEach(b => {
+  b.addEventListener("click", () => { setLevel(+b.dataset.lv); pop(660); });
+});
+document.getElementById("resetBtn").addEventListener("click", () => {
+  resetPieces(); pop(330); showHint("都放回工具箱啦");
+});
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const blip = () => tone(1500, 0.05, 0.08, "square");
+const whoosh = () => tone(320, 0.12, 0.1, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 主循环 ================= */
+resize();
+resetPieces();
+setLevel(0);
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  draw(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 测试接口 ================= */
+window.__tg = {
+  pieces: () => pieces,
+  setLevel, resetPieces, worldVerts,
+  levelDone: () => levelDone,
+  // 模拟完美游玩：把每块精确放到同类目标上，走与真实操作相同的判定路径
+  solveLevel(i) {
+    setLevel(i);
+    const usedTargets = new Set();
+    for (const p of pieces) {
+      const lv = curLevel();
+      const t = lv.targets.find((t, j) => t.type === p.type && !usedTargets.has(j));
+      usedTargets.add(lv.targets.indexOf(t));
+      let cx = 0, cy = 0;
+      for (const v of t.verts) { cx += v[0]; cy += v[1]; }
+      cx /= t.verts.length; cy /= t.verts.length;
+      let done = false;
+      for (const flip of [false, true]) {
+        for (let k = 0; k < 8 && !done; k++) {
+          p.flip = flip; p.k = k; p.cx = cx; p.cy = cy; p.inBox = false;
+          if (sameVerts(worldVerts(p), t.verts, 1e-6)) done = true;
+        }
+        if (done) break;
+      }
+      if (!done) return "FAIL-place-" + p.id;
+      afterMove(p);
+    }
+    return pieces.every(p => p.placed) ? "OK" : "FAIL-check";
+  }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

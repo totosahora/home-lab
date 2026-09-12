@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>搬砖上楼 · 功与功率</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#274b73; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(15,30,50,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(15,30,50,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #quizPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center;
+    background:rgba(0,0,0,0.5);
+  }
+  #quizPanel .qcard {
+    position:relative; background:#fff8e8; border-radius:24px;
+    padding:30px 34px; width:min(580px, 92vw);
+    box-shadow:0 10px 40px rgba(0,0,0,0.4); text-align:center;
+  }
+  #qText { font-size:24px; font-weight:bold; color:#4a3a10; margin-bottom:20px; line-height:1.4; }
+  #qOpts { display:flex; flex-direction:column; gap:12px; }
+  #qOpts button {
+    font-size:21px; font-weight:bold; padding:14px; border-radius:16px;
+    border:3px solid #e0c060; background:#ffffff; color:#5a4a10; cursor:pointer;
+  }
+  #qOpts button:active { transform:scale(1.03); }
+  #qOpts button.right { background:#c8f0b0; border-color:#4aaf4a; }
+  #qOpts button.wrong { background:#eeeeee; border-color:#cccccc; color:#999999; }
+  #qExplain { margin-top:16px; font-size:17px; color:#6a5a20; line-height:1.6; }
+  #qNext {
+    margin-top:18px; font-size:19px; font-weight:bold; padding:12px 32px;
+    border-radius:26px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; display:none; box-shadow:0 4px 10px rgba(0,0,0,0.25);
+  }
+  #qSkip {
+    position:absolute; top:12px; right:16px; border:none; background:none;
+    font-size:15px; color:#a08c50; cursor:pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">⚡ 功与功率 · 比赛模式</div>
+<div id="hint">点右上角「▶ 开始」，看小明和小华搬砖上楼比赛！</div>
+<div id="quizPanel">
+  <div class="qcard">
+    <button id="qSkip">先去看看 ✕</button>
+    <div id="qText"></div>
+    <div id="qOpts"></div>
+    <div id="qExplain"></div>
+    <button id="qNext">下一题 ▶</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const quizPanel = document.getElementById("quizPanel");
+const qText = document.getElementById("qText");
+const qOpts = document.getElementById("qOpts");
+const qExplain = document.getElementById("qExplain");
+const qNext = document.getElementById("qNext");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 场景与视图 ================= */
+// 世界坐标 1200 x 750；两层小楼剖面：一楼地面 y=660，二楼地面 y=400
+const WORLD_W = 1200, WORLD_H = 750;
+const FLOOR1 = 660, FLOOR2 = 400, ROOF0 = 110, ROOF1 = 140;
+const BLD_X0 = 300, BLD_X1 = 900;
+const LADDER_X = 600;              // 中间竖直梯子
+const PILE_L = 380, PILE_R = 820;  // 两侧箱堆 / 送货点
+const BOX_S = 34;                  // 箱子边长
+
+// 物理常量（科学准确：W = F·s，P = W/t）
+const BOX_N = 100;                 // 每箱重 100 N
+const HEIGHT_M = 3;                // 楼高 3 m
+const W_PER_BOX = BOX_N * HEIGHT_M; // 每箱做功 300 J
+
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / WORLD_W, H / WORLD_H);
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+let mode = 1;              // 1 比赛模式  2 实验模式
+let state = "idle";        // idle | running | done
+let simT = 0;              // 模拟时间（秒）
+let workers = [];
+let floats = [];           // 飘字 "+300 J"
+let confetti = [];
+// 实验模式滑杆
+let perTrip = 2;           // 每次搬几箱 1..3
+let speedK = 0.5;          // 走多快 0..1
+let history = [];          // 实验记录
+
+const M2_TOTAL = 6;        // 实验模式总箱数
+
+function makeWorker(name, color, pileX, nPerTrip, total, targetT) {
+  const path = [
+    { x:pileX, y:FLOOR1 }, { x:LADDER_X, y:FLOOR1 },
+    { x:LADDER_X, y:FLOOR2 }, { x:pileX, y:FLOOR2 }
+  ];
+  let leg = 0;
+  for (let i = 0; i < 3; i++) leg += Math.hypot(path[i+1].x - path[i].x, path[i+1].y - path[i].y);
+  const trips = Math.ceil(total / nPerTrip);
+  const totalLen = leg * 2 * trips;
+  return {
+    name, color, pileX, path, perTrip:nPerTrip, total, targetT,
+    speed: targetT ? totalLen / targetT : 0,   // 速度由目标用时反推，保证 8s / 24s 整
+    x:pileX, y:FLOOR1, idx:1, dir:1,
+    carrying:0, remaining:total, delivered:0,
+    work:0, finished:false, finishT:0, phase:0, face: pileX < LADDER_X ? 1 : -1
+  };
+}
+
+function setupMode(m) {
+  mode = m; state = "idle"; simT = 0;
+  floats = []; confetti = [];
+  if (m === 1) {
+    // 小明：大力又快，每次搬 2 箱；小华：每次 1 箱，走得慢
+    workers = [
+      makeWorker("小明", "#3a86d8", PILE_L, 2, 4, 8),
+      makeWorker("小华", "#e0782a", PILE_R, 1, 4, 24)
+    ];
+  } else {
+    workers = [ makeWorker("你", "#2fbf4a", PILE_L, perTrip, M2_TOTAL, 0) ];
+  }
+  updateScorebar();
+}
+
+function updateScorebar() {
+  const mName = mode === 1 ? "比赛模式" : "实验模式";
+  if (state === "running") scorebar.textContent = `⏱ ${simT.toFixed(1)} s · ${mName}`;
+  else if (state === "done" && mode === 1) {
+    scorebar.textContent = `🏁 小明 ${workers[0].finishT.toFixed(1)}s ⚡150W ｜ 小华 ${workers[1].finishT.toFixed(1)}s ⚡50W`;
+  }
+  else scorebar.textContent = `⚡ 功与功率 · ${mName}`;
+}
+setupMode(1);
+
+/* ================= 模拟（物理） ================= */
+function pickup(w) {
+  w.carrying = Math.min(w.perTrip, w.remaining);
+  w.remaining -= w.carrying;
+  pop(520);
+}
+
+function startRun() {
+  state = "running"; simT = 0;
+  floats = []; confetti = [];
+  for (const w of workers) {
+    w.x = w.pileX; w.y = FLOOR1; w.idx = 1; w.dir = 1;
+    w.remaining = w.total; w.delivered = 0; w.work = 0;
+    w.finished = false; w.finishT = 0; w.phase = 0;
+    if (mode === 2) {
+      w.perTrip = perTrip;
+      w.speed = 170 + 230 * speedK;   // 170 ~ 400 单位/秒
+    }
+    pickup(w);   // 在楼下先抱起第一趟的箱子
+  }
+  whoosh();
+  updateScorebar();
+}
+
+function arrive(w) {
+  if (w.idx === 3) {                    // 到达二楼送货点：做功！
+    const gain = w.carrying * W_PER_BOX;
+    w.work += gain;
+    w.delivered += w.carrying;
+    floats.push({ x:w.x, y:FLOOR2 - 100, vy:-40, life:1.5, text:"+" + gain + " J", color:w.color });
+    pop(880); setTimeout(() => pop(1175), 90);
+    w.carrying = 0; w.dir = -1; w.idx = 2;
+  } else if (w.idx === 0) {             // 回到楼下箱堆
+    if (w.remaining > 0) { pickup(w); w.dir = 1; w.idx = 1; }
+    else {                              // 全部搬完
+      w.finished = true;
+      w.finishT = w.targetT || simT;    // 比赛模式用精确目标时间 8s / 24s
+    }
+  } else {
+    w.idx += w.dir;
+  }
+}
+
+function step(dt) {
+  if (state === "running") {
+    simT += dt;
+    for (const w of workers) {
+      if (w.finished) continue;
+      const t = w.path[w.idx];
+      const dx = t.x - w.x, dy = t.y - w.y;
+      const d = Math.hypot(dx, dy);
+      const len = w.speed * dt;
+      w.phase += len * 0.055;
+      if (d <= len) { w.x = t.x; w.y = t.y; arrive(w); }
+      else {
+        w.x += dx / d * len; w.y += dy / d * len;
+        if (Math.abs(dx) > 0.5) w.face = dx > 0 ? 1 : -1;
+      }
+    }
+    if (workers.every(w => w.finished)) finishRun();
+    updateScorebar();
+  }
+  // 飘字
+  for (let i = floats.length - 1; i >= 0; i--) {
+    const f = floats[i];
+    f.y += f.vy * dt; f.life -= dt;
+    if (f.life <= 0) floats.splice(i, 1);
+  }
+  // 彩带
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.vy += 500 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += c.vr * dt; c.life -= dt;
+    if (c.life <= 0 || c.y > WORLD_H + 30) confetti.splice(i, 1);
+  }
+}
+
+function finishRun() {
+  state = "done";
+  fanfare();
+  confettiBurst();
+  if (mode === 1) {
+    showHint("两人都搬完了！看看数据，再点「❓ 问题卡」");
+    setTimeout(() => { if (state === "done" && mode === 1) openQuiz(); }, 1500);
+  } else {
+    const w = workers[0];
+    const P = w.work / w.finishT;
+    history.unshift({ n:w.perTrip, k:speedK, t:w.finishT, P:P });
+    if (history.length > 4) history.pop();
+    showHint(`总功 ${w.work} J 不变！时间 ${w.finishT.toFixed(1)} s → 功率 ${P.toFixed(0)} W`);
+  }
+  updateScorebar();
+}
+
+function confettiBurst() {
+  const colors = ["#ffd54a", "#ff5252", "#2fbf4a", "#3a86d8", "#ff7a1a", "#c86bff"];
+  for (let i = 0; i < 90; i++) {
+    confetti.push({
+      x: 600 + (Math.random() - 0.5) * 300, y: 260 + Math.random() * 80,
+      vx: (Math.random() - 0.5) * 420, vy: -Math.random() * 380 - 60,
+      rot: Math.random() * 7, vr: (Math.random() - 0.5) * 12,
+      w: 7 + Math.random() * 6, h: 5 + Math.random() * 5,
+      color: colors[i % colors.length], life: 2.4 + Math.random()
+    });
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBox(cx, cy, s) {
+  ctx.fillStyle = "#d9963f";
+  ctx.fillRect(cx - s/2, cy - s/2, s, s);
+  ctx.strokeStyle = "rgba(90,50,10,0.6)"; ctx.lineWidth = 2;
+  ctx.strokeRect(cx - s/2, cy - s/2, s, s);
+  ctx.strokeStyle = "rgba(90,50,10,0.45)";
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - s/2); ctx.lineTo(cx, cy + s/2);
+  ctx.moveTo(cx - s/2, cy); ctx.lineTo(cx + s/2, cy);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(60,30,5,0.75)";
+  ctx.font = "bold 10px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("100N", cx, cy);
+}
+
+// 箱堆：两列向上码
+function drawPile(cx, floorY, count) {
+  for (let i = 0; i < count; i++) {
+    const col = i % 2, row = Math.floor(i / 2);
+    drawBox(cx + (col === 0 ? -BOX_S/2 - 1 : BOX_S/2 + 1), floorY - BOX_S/2 - row * (BOX_S + 2), BOX_S);
+  }
+}
+
+function drawWorker(w) {
+  ctx.save();
+  // 在梯子上时两人错开一点，避免完全重叠
+  const onLadder = Math.abs(w.x - LADDER_X) < 1 && w.y < FLOOR1 - 1;
+  const ox = onLadder ? (w.name === "小华" ? 13 : -13) : 0;
+  ctx.translate(w.x + ox, w.y);
+  const bob = (w.finished || state !== "running") ? 0 : Math.abs(Math.sin(w.phase)) * 3;
+  // 腿
+  ctx.strokeStyle = "#333"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  const sw = w.finished ? 0 : Math.sin(w.phase) * 7;
+  ctx.beginPath();
+  ctx.moveTo(-5, -30); ctx.lineTo(-5 + sw, 0);
+  ctx.moveTo(5, -30); ctx.lineTo(5 - sw, 0);
+  ctx.stroke();
+  // 身体
+  ctx.fillStyle = w.color;
+  roundRect(-13, -62 - bob, 26, 34, 8, true);
+  // 头
+  ctx.beginPath(); ctx.arc(0, -72 - bob, 11, 0, 7);
+  ctx.fillStyle = "#ffdcb8"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 1.5; ctx.stroke();
+  // 眼睛 + 微笑
+  ctx.fillStyle = "#333";
+  ctx.beginPath(); ctx.arc(w.face * 4, -74 - bob, 1.8, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(w.face * 2, -69 - bob, 4, 0.3, Math.PI - 0.3);
+  ctx.strokeStyle = "#333"; ctx.lineWidth = 1.5; ctx.stroke();
+  // 名字
+  ctx.fillStyle = w.color;
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(w.name, 0, -92 - bob);
+  // 抱着的箱子
+  if (w.carrying > 0) {
+    const bx = w.face * 24, bw = 28;
+    for (let i = 0; i < w.carrying; i++) {
+      drawBox(bx, -44 - i * (bw + 2) - bob, bw);
+    }
+    // 力箭头：竖直向上，F = 箱数 × 100 N
+    const topY = -44 - (w.carrying - 1) * (bw + 2) - bw/2 - bob;
+    const aLen = 34 + w.carrying * 8;
+    ctx.strokeStyle = "#ff2d2d"; ctx.fillStyle = "#ff2d2d"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(bx, topY - 4); ctx.lineTo(bx, topY - 4 - aLen); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(bx, topY - 10 - aLen);
+    ctx.lineTo(bx - 7, topY - aLen + 2); ctx.lineTo(bx + 7, topY - aLen + 2);
+    ctx.closePath(); ctx.fill();
+    ctx.font = "bold 14px sans-serif";
+    ctx.fillText("F=" + (w.carrying * BOX_N) + "N", bx, topY - aLen - 18);
+  }
+  ctx.restore();
+}
+
+function drawBuilding() {
+  // 楼体
+  ctx.fillStyle = "#f2e4c8";
+  ctx.fillRect(BLD_X0, ROOF1, BLD_X1 - BLD_X0, FLOOR1 - ROOF1 + 20);
+  // 二楼地板 / 一楼天花板（楼板）
+  ctx.fillStyle = "#b08954";
+  ctx.fillRect(BLD_X0, FLOOR2 - 8, BLD_X1 - BLD_X0, 14);
+  // 一楼地面
+  ctx.fillStyle = "#9a7443";
+  ctx.fillRect(BLD_X0 - 30, FLOOR1, BLD_X1 - BLD_X0 + 60, 16);
+  // 屋顶
+  ctx.fillStyle = "#c0552b";
+  ctx.fillRect(BLD_X0 - 14, ROOF0, BLD_X1 - BLD_X0 + 28, ROOF1 - ROOF0);
+  // 屋顶公式标语：把核心公式挂出来
+  ctx.fillStyle = "#ffe9c9";
+  ctx.font = "bold 19px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("W = F × s          P = W ÷ t", (BLD_X0 + BLD_X1) / 2, (ROOF0 + ROOF1) / 2);
+  // 楼层标签
+  ctx.fillStyle = "rgba(120,80,30,0.5)";
+  ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("二楼", BLD_X0 + 10, FLOOR2 + 26);
+  ctx.fillText("一楼", BLD_X0 + 10, FLOOR1 - 14);
+  // 梯子
+  ctx.strokeStyle = "#7a5a30"; ctx.lineWidth = 6; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(LADDER_X - 14, FLOOR1); ctx.lineTo(LADDER_X - 14, FLOOR2 - 4);
+  ctx.moveTo(LADDER_X + 14, FLOOR1); ctx.lineTo(LADDER_X + 14, FLOOR2 - 4);
+  ctx.stroke();
+  ctx.lineWidth = 4;
+  for (let y = FLOOR1 - 22; y > FLOOR2; y -= 26) {
+    ctx.beginPath(); ctx.moveTo(LADDER_X - 14, y); ctx.lineTo(LADDER_X + 14, y); ctx.stroke();
+  }
+  // 高度箭头 h = 3 m
+  const ax = 336;
+  ctx.strokeStyle = "#2f7fe9"; ctx.lineWidth = 3;
+  ctx.setLineDash([6, 5]);
+  ctx.beginPath(); ctx.moveTo(ax, FLOOR2); ctx.lineTo(ax, FLOOR1); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#2f7fe9";
+  for (const [yy, dir] of [[FLOOR2, 1], [FLOOR1, -1]]) {
+    ctx.beginPath();
+    ctx.moveTo(ax, yy); ctx.lineTo(ax - 6, yy + 10 * dir); ctx.lineTo(ax + 6, yy + 10 * dir);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#1a4fc0";
+  ctx.fillText("h = 3 m", ax + 12, (FLOOR1 + FLOOR2) / 2);
+  ctx.font = "13px sans-serif";
+  ctx.fillText("每箱 300 J", ax + 12, (FLOOR1 + FLOOR2) / 2 + 22);
+}
+
+function drawBar(x, y, w, h, frac, color, label) {
+  ctx.fillStyle = "rgba(255,255,255,0.18)";
+  roundRect(x, y, w, h, h/2, true);
+  if (frac > 0.01) {
+    ctx.fillStyle = color;
+    roundRect(x + 2, y + 2, (w - 4) * Math.min(1, frac), h - 4, (h - 4)/2, true);
+  }
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 13px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(label, x + w / 2, y + h / 2);
+}
+
+function drawPanel(x, y, w, h, wk) {
+  ctx.fillStyle = "rgba(10,25,45,0.75)";
+  roundRect(x, y, w, h, 16, true);
+  ctx.strokeStyle = wk.color; ctx.lineWidth = 3;
+  roundRect(x, y, w, h, 16, false); ctx.stroke();
+  const cx = x + w / 2;
+  // 名字
+  ctx.fillStyle = wk.color;
+  ctx.beginPath(); ctx.arc(x + 24, y + 26, 8, 0, 7); ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 20px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText(wk.name, x + 40, y + 27);
+  ctx.font = "15px sans-serif";
+  ctx.textAlign = "right";
+  ctx.fillText(`箱子 ${wk.delivered} / ${wk.total}`, x + w - 14, y + 27);
+  // 做功条
+  const wMax = wk.total * W_PER_BOX;
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 16px sans-serif";
+  ctx.fillText(`做功 W = ${wk.work} J`, x + 16, y + 62);
+  drawBar(x + 16, y + 76, w - 32, 22, wk.work / wMax, wk.color, `${wk.work} / ${wMax} J`);
+  // 功率条：P = W / t
+  const tEff = wk.finished ? wk.finishT : Math.max(simT, 0.05);
+  const P = wk.work / tEff;
+  const pMax = mode === 1 ? 160 : 300;
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#ffd54a";
+  ctx.fillText(`功率 P = W÷t = ${P.toFixed(0)} W`, x + 16, y + 122);
+  drawBar(x + 16, y + 136, w - 32, 22, P / pMax, "#ff7a1a", `${P.toFixed(0)} W`);
+  // 用时
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#cfe3ff";
+  ctx.font = "15px sans-serif";
+  const tTxt = wk.finished ? `用时 ${wk.finishT.toFixed(1)} s` :
+    (state === "running" ? "搬运中…" : "准备就绪");
+  ctx.fillText(tTxt, x + 16, y + 178);
+  if (mode === 1) {
+    ctx.fillText(wk.perTrip === 2 ? "每次搬 2 箱 · 走得快" : "每次搬 1 箱 · 走得慢", x + 16, y + 202);
+  }
+}
+
+// 实验模式的记录表面板
+function drawHistoryPanel(x, y, w, h) {
+  ctx.fillStyle = "rgba(10,25,45,0.75)";
+  roundRect(x, y, w, h, 16, true);
+  ctx.strokeStyle = "#2fbf4a"; ctx.lineWidth = 3;
+  roundRect(x, y, w, h, 16, false); ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 19px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("📋 实验记录", x + 16, y + 28);
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillText(`总功 ${M2_TOTAL * W_PER_BOX} J（不变！）`, x + 16, y + 58);
+  ctx.fillStyle = "#cfe3ff";
+  ctx.font = "14px sans-serif";
+  if (history.length === 0) {
+    ctx.fillText("还没有记录，点 ▶ 开始搬吧", x + 16, y + 92);
+  }
+  history.forEach((r, i) => {
+    const spd = r.k < 0.34 ? "慢" : r.k < 0.67 ? "中" : "快";
+    ctx.fillText(`${r.n}箱/趟 · ${spd} → ${r.t.toFixed(1)}s · ${r.P.toFixed(0)}W`, x + 16, y + 92 + i * 26);
+  });
+  ctx.fillStyle = "#9fd8ff";
+  ctx.font = "bold 14px sans-serif";
+  ctx.fillText("时间越短 → 功率越大！", x + 16, y + h - 24);
+}
+
+/* ---------- 按钮与滑杆（Canvas UI） ---------- */
+const BTN = {
+  tab1:  { x:16,   y:10, w:150, h:44, label:"① 比赛模式" },
+  tab2:  { x:176,  y:10, w:150, h:44, label:"② 实验模式" },
+  quiz:  { x:846,  y:10, w:150, h:44, label:"❓ 问题卡" },
+  start: { x:1006, y:10, w:178, h:44, label:"▶ 开始" }
+};
+const sliders = [
+  { x0:350, x1:590, y:716, label:"每次搬几箱",
+    get:() => (perTrip - 1) / 2,
+    set:v => { perTrip = 1 + Math.round(v * 2); },
+    text:() => `每次搬几箱：${perTrip} 箱` },
+  { x0:670, x1:910, y:716, label:"走多快",
+    get:() => speedK,
+    set:v => { speedK = v; },
+    text:() => `走多快：${speedK < 0.34 ? "慢" : speedK < 0.67 ? "中" : "快"}` }
+];
+let dragSlider = null;
+
+function drawButton(b, active, disabled) {
+  ctx.fillStyle = disabled ? "rgba(60,70,90,0.8)" : active ? "#ffd54a" : "rgba(15,30,50,0.85)";
+  roundRect(b.x, b.y, b.w, b.h, 22, true);
+  ctx.strokeStyle = active ? "#fff" : "rgba(255,213,74,0.6)"; ctx.lineWidth = 2;
+  roundRect(b.x, b.y, b.w, b.h, 22, false); ctx.stroke();
+  ctx.fillStyle = disabled ? "#999" : active ? "#5a3d00" : "#ffd54a";
+  ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2);
+}
+
+function drawControls() {
+  drawButton(BTN.tab1, mode === 1, false);
+  drawButton(BTN.tab2, mode === 2, false);
+  drawButton(BTN.quiz, false, false);
+  BTN.start.label = state === "running" ? "搬运中…" : state === "done" ? "↻ 再来一次" : "▶ 开始";
+  drawButton(BTN.start, state !== "running", state === "running");
+  // 底部条
+  ctx.fillStyle = "rgba(10,25,45,0.7)";
+  roundRect(290, 686, 620, 56, 14, true);
+  if (mode === 1) {
+    ctx.fillStyle = "#ffe9c9";
+    ctx.font = "bold 16px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("每人 4 箱 · 每箱 100 N · 楼高 3 m · 每箱做功 W = Fs = 300 J", 600, 714);
+  } else {
+    for (const s of sliders) {
+      ctx.fillStyle = "#ffe9c9";
+      ctx.font = "bold 14px sans-serif";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(s.text(), (s.x0 + s.x1) / 2, 698);
+      // 轨道
+      ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 6; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(s.x0, s.y); ctx.lineTo(s.x1, s.y); ctx.stroke();
+      ctx.strokeStyle = "#ffd54a";
+      const kx = s.x0 + s.get() * (s.x1 - s.x0);
+      ctx.beginPath(); ctx.moveTo(s.x0, s.y); ctx.lineTo(kx, s.y); ctx.stroke();
+      // 大旋钮（拖拽区）
+      ctx.beginPath(); ctx.arc(kx, s.y, 15, 0, 7);
+      ctx.fillStyle = state === "running" ? "#888" : "#ffd54a"; ctx.fill();
+      ctx.strokeStyle = "#5a3d00"; ctx.lineWidth = 2.5; ctx.stroke();
+    }
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 天空
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, "#3a6ea8"); sky.addColorStop(1, "#7fb2d9");
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  // 太阳和云
+  ctx.beginPath(); ctx.arc(600, 52, 26, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  for (const [cx, cy, r] of [[180, 40, 20], [205, 48, 16], [1010, 70, 18], [1032, 78, 14]]) {
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fill();
+  }
+  // 地面
+  ctx.fillStyle = "#4a7a3a";
+  ctx.fillRect(0, FLOOR1 + 16, WORLD_W, WORLD_H - FLOOR1);
+  drawBuilding();
+  // 箱堆（剩余）与已送达
+  for (const w of workers) {
+    drawPile(w.pileX, FLOOR1, w.remaining);
+    drawPile(w.pileX, FLOOR2 - 8, w.delivered);
+  }
+  // 工人
+  for (const w of workers) drawWorker(w);
+  // 飘字
+  for (const f of floats) {
+    ctx.globalAlpha = Math.min(1, f.life);
+    ctx.fillStyle = f.color;
+    ctx.font = "bold 24px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(f.text, f.x, f.y);
+    ctx.globalAlpha = 1;
+  }
+  // 数据面板
+  drawPanel(16, 60, 270, 230, workers[0]);
+  if (mode === 1) drawPanel(914, 60, 270, 230, workers[1]);
+  else drawHistoryPanel(914, 60, 270, 230);
+  // 彩带
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.w/2, -c.h/2, c.w, c.h);
+    ctx.restore();
+  }
+  drawControls();
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  step(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 交互 ================= */
+function inRect(b, x, y) { return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h; }
+
+canvas.addEventListener("pointerdown", e => {
+  if (quizPanel.style.display === "flex") return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  // 按钮
+  if (inRect(BTN.tab1, wx, wy)) { switchMode(1); return; }
+  if (inRect(BTN.tab2, wx, wy)) { switchMode(2); return; }
+  if (inRect(BTN.quiz, wx, wy)) { pop(660); openQuiz(); return; }
+  if (inRect(BTN.start, wx, wy)) {
+    if (state === "running") { showHint("还在搬呢，看完吧！"); return; }
+    startRun();
+    hintEl.style.opacity = "0";
+    return;
+  }
+  // 滑杆拖拽（实验模式 & 非进行中）
+  if (mode === 2 && state !== "running") {
+    for (const s of sliders) {
+      if (Math.abs(wy - s.y) < 30 && wx >= s.x0 - 24 && wx <= s.x1 + 24) {
+        dragSlider = s;
+        s.set(Math.max(0, Math.min(1, (wx - s.x0) / (s.x1 - s.x0))));
+        tick();
+        canvas.setPointerCapture(e.pointerId);
+        return;
+      }
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragSlider) return;
+  const [wx] = toWorld(e.clientX, e.clientY);
+  dragSlider.set(Math.max(0, Math.min(1, (wx - dragSlider.x0) / (dragSlider.x1 - dragSlider.x0))));
+});
+window.addEventListener("pointerup", () => {
+  if (dragSlider) { tick(); dragSlider = null; }
+});
+
+function switchMode(m) {
+  if (m === mode) return;
+  if (state === "running") { showHint("搬运进行中，先看完吧！"); return; }
+  pop(660);
+  setupMode(m);
+  showHint(m === 1 ? "点「▶ 开始」，看小明和小华搬砖比赛！"
+                 : "拖动滑杆选「每次搬几箱」和「走多快」，再点 ▶ 开始！");
+}
+
+/* ================= 问题卡 ================= */
+const QUIZ = [
+  {
+    q: "比赛结束！小明和小华谁做的功多？",
+    opts: ["小明做的功多", "小华做的功多", "一样多"],
+    ans: 2,
+    wrong: "再想想：W = F × s。两人搬的箱子一样重、一样多，楼一样高哦！",
+    right: "对！每箱 W = 100N × 3m = 300J，各搬 4 箱，都是 1200J。做功多少只看 F 和 s，跟快慢无关！"
+  },
+  {
+    q: "那谁的功率大呢？",
+    opts: ["小明功率大", "小华功率大", "一样大"],
+    ans: 0,
+    wrong: "再想想：P = W ÷ t。功一样多，谁用的时间短？",
+    right: "对！功率表示做功的快慢。功都是 1200J，小明只用 8s（P = 150W），小华用 24s（P = 50W）。时间短，功率大！"
+  }
+];
+let qIdx = 0;
+
+function openQuiz() { qIdx = 0; renderQ(); quizPanel.style.display = "flex"; }
+function renderQ() {
+  const q = QUIZ[qIdx];
+  qText.textContent = `第 ${qIdx + 1} 题：${q.q}`;
+  qExplain.textContent = "";
+  qNext.style.display = "none";
+  qOpts.innerHTML = "";
+  q.opts.forEach((label, i) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.addEventListener("click", () => answerQ(i, b));
+    qOpts.appendChild(b);
+  });
+}
+function answerQ(i, btn) {
+  const q = QUIZ[qIdx];
+  if (i === q.ans) {
+    btn.classList.add("right");
+    qExplain.textContent = "✅ " + q.right;
+    for (const b of qOpts.children) b.style.pointerEvents = "none";
+    qNext.style.display = "inline-block";
+    qNext.textContent = qIdx + 1 < QUIZ.length ? "下一题 ▶" : "🎉 我懂了！";
+    fanfare();
+  } else {
+    btn.classList.add("wrong");
+    btn.style.pointerEvents = "none";
+    qExplain.textContent = "🤔 " + q.wrong;
+    pop(220);
+  }
+}
+qNext.addEventListener("click", () => {
+  pop(660);
+  qIdx++;
+  if (qIdx >= QUIZ.length) quizPanel.style.display = "none";
+  else renderQ();
+});
+document.getElementById("qSkip").addEventListener("click", () => {
+  pop(440);
+  quizPanel.style.display = "none";
+});
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const tick = () => tone(900, 0.05, 0.08, "square");
+const whoosh = () => tone(320, 0.18, 0.1, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+
+/* ================= 测试接口 ================= */
+window.__wp = {
+  step, startRun, setupMode, openQuiz, draw,
+  getState: () => state,
+  getSimT: () => simT,
+  getWorkers: () => workers,
+  setSliders: (n, k) => { perTrip = n; speedK = k; },
+  getHistory: () => history
+};
+
+// 初始提示自动淡出，避免长期遮挡底部信息条
+showHint("点右上角「▶ 开始」，看小明和小华搬砖上楼比赛！");
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

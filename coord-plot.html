@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>坐标寻宝乐园</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#f7efd9; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #modeBar {
+    position:absolute; top:12px; left:14px; z-index:10; display:flex; gap:10px;
+  }
+  #modeBar button {
+    font-size:18px; font-weight:bold; padding:10px 20px;
+    border-radius:24px; border:3px solid #c9a86a; background:rgba(255,252,240,0.92);
+    color:#7a5c22; cursor:pointer; box-shadow:0 3px 8px rgba(120,90,30,0.18);
+  }
+  #modeBar button.on { background:#ffd54a; color:#5a3d00; border-color:#e0a918; }
+  #modeBar button:active { transform:scale(1.06); }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(80,58,18,0.88); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:19px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(80,58,18,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92%;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(60,40,10,0.45);
+  }
+  #winPanel .msg {
+    font-size:42px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.55); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="modeBar">
+  <button id="modeA" class="on">🗺️ 寻宝</button>
+  <button id="modeB">🎨 连点画</button>
+</div>
+<div id="scorebar"></div>
+<div id="hint">看上面的坐标，点网格交叉点挖宝藏！按住拖动可以先看准位置，松手才下笔。</div>
+<div id="winPanel">
+  <div class="msg">🎉 完成啦！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 网格与视图 ================= */
+// 第一象限 10×10 网格：坐标 0..10，共 11×11 个交叉点
+const GS = 10;
+const grid = { ox:0, oy:0, cell:40 };   // (0,0) 的屏幕坐标 + 格子边长
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  const mL = 64, mR = 28, mT = 96, mB = 60;   // 给坐标数字留边距
+  const pw = W - mL - mR, ph = H - mT - mB;
+  grid.cell = Math.min(pw, ph) / GS;
+  grid.ox = mL + (pw - grid.cell * GS) / 2;
+  grid.oy = mT + (ph - grid.cell * GS) / 2 + grid.cell * GS;
+}
+window.addEventListener("resize", resize);
+resize();
+function toScreen(gx, gy) { return [grid.ox + gx * grid.cell, grid.oy - gy * grid.cell]; }
+function nearestGrid(sx, sy) {
+  const fx = (sx - grid.ox) / grid.cell, fy = (grid.oy - sy) / grid.cell;
+  const gx = Math.round(fx), gy = Math.round(fy);
+  if (gx < 0 || gx > GS || gy < 0 || gy > GS) return null;
+  if (Math.hypot(fx - gx, fy - gy) > 0.55) return null;   // 离交叉点太远不算
+  return { gx, gy };
+}
+
+/* ================= 关卡数据 ================= */
+// 连点画的 3 个图案：点按顺序连线；最后一个点允许与起点重复（封闭图形）
+const LEVELS = [
+  { name:"小船", emoji:"⛵",
+    pts:[[1,3],[2,1],[8,1],[9,3],[5,3],[5,8],[1,3]],
+    deco() {   // 完工后补小旗和波浪
+      ctx.fillStyle = "#e2574c";
+      ctx.beginPath();
+      let p = toScreen(5, 8); ctx.moveTo(p[0], p[1]);
+      p = toScreen(6.3, 7.55); ctx.lineTo(p[0], p[1]);
+      p = toScreen(5, 7.1); ctx.lineTo(p[0], p[1]);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = "#4a90d9"; ctx.lineWidth = 3; ctx.lineCap = "round";
+      for (const wx of [2.5, 5, 7.5]) {
+        ctx.beginPath();
+        const [sx, sy] = toScreen(wx, 0.7);
+        ctx.arc(sx, sy, grid.cell * 0.28, Math.PI * 1.15, Math.PI * 1.85);
+        ctx.stroke();
+      }
+    } },
+  { name:"小鱼", emoji:"🐟",
+    pts:[[4,7],[7,7],[9,5],[7,3],[4,3],[2,5],[1,3],[1,7],[2,5],[4,7]],
+    deco() {   // 眼睛和泡泡
+      let [ex, ey] = toScreen(7.2, 5.5);
+      ctx.beginPath(); ctx.arc(ex, ey, grid.cell * 0.3, 0, 7);
+      ctx.fillStyle = "#fff"; ctx.fill();
+      ctx.beginPath(); ctx.arc(ex + 3, ey, grid.cell * 0.13, 0, 7);
+      ctx.fillStyle = "#26323f"; ctx.fill();
+      ctx.strokeStyle = "#4a90d9"; ctx.lineWidth = 2.5;
+      for (const [bx, by, br] of [[9.4,6.3,0.16],[9.8,7.2,0.12],[9.3,7.9,0.09]]) {
+        const [sx, sy] = toScreen(bx, by);
+        ctx.beginPath(); ctx.arc(sx, sy, grid.cell * br, 0, 7); ctx.stroke();
+      }
+    } },
+  { name:"小猫", emoji:"🐱",
+    pts:[[3,5],[2,8],[4,7],[6,7],[8,8],[7,5],[7,3],[3,3],[3,5]],
+    deco() {   // 眼睛、鼻子和胡须
+      for (const ex of [4.2, 5.8]) {
+        const [sx, sy] = toScreen(ex, 5.3);
+        ctx.beginPath(); ctx.arc(sx, sy, grid.cell * 0.22, 0, 7);
+        ctx.fillStyle = "#fff"; ctx.fill();
+        ctx.beginPath(); ctx.arc(sx, sy, grid.cell * 0.1, 0, 7);
+        ctx.fillStyle = "#26323f"; ctx.fill();
+      }
+      const [nx, ny] = toScreen(5, 4.5);
+      ctx.beginPath(); ctx.arc(nx, ny, grid.cell * 0.12, 0, 7);
+      ctx.fillStyle = "#e2574c"; ctx.fill();
+      ctx.strokeStyle = "#8a6d3b"; ctx.lineWidth = 2.5; ctx.lineCap = "round";
+      for (const [x1,y1,x2,y2] of [[3.3,4.7,1.8,5.2],[3.3,4.3,1.8,4.2],[6.7,4.7,8.2,5.2],[6.7,4.3,8.2,4.2]]) {
+        const [a, b] = toScreen(x1, y1), [c, d] = toScreen(x2, y2);
+        ctx.beginPath(); ctx.moveTo(a, b); ctx.lineTo(c, d); ctx.stroke();
+      }
+    } },
+];
+
+/* ================= 游戏状态 ================= */
+let mode = "A";              // A 寻宝 | B 连点画
+let targets = [], tIdx = 0;  // 寻宝：目标坐标串
+let chests = [];             // 挖到的宝箱 {x, y, t0}
+let level = 0, pIdx = 0;     // 连点画：第几关 / 第几个点
+let placed = [];             // 已按顺序放下的钉子 {x, y}
+let busy = false;            // 过关庆祝期间暂停输入
+let wrongs = 0;              // 当前目标连续点错次数
+let wrongFlash = null;       // 点错的位置 {x, y, t0}
+let guideUntil = 0;          // 辅助线显示截止时间
+let ghost = null, dragging = false;   // 手指/鼠标指向的交叉点
+let particles = [];
+
+const ri = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+function makeTargets() {
+  const set = new Set(), arr = [];
+  // 第一个宝藏故意放在坐标轴上，帮孩子理解 0
+  const first = Math.random() < 0.5 ? [0, ri(2, 9)] : [ri(2, 9), 0];
+  arr.push(first); set.add(first.join(","));
+  while (arr.length < 5) {
+    const p = [ri(0, GS), ri(0, GS)], k = p.join(",");
+    if (!set.has(k)) { set.add(k); arr.push(p); }
+  }
+  return arr;
+}
+function resetA() {
+  targets = makeTargets(); tIdx = 0; chests = [];
+  wrongs = 0; wrongFlash = null; guideUntil = 0; busy = false; particles = [];
+}
+function resetB() {
+  level = 0; pIdx = 0; placed = [];
+  wrongs = 0; wrongFlash = null; guideUntil = 0; busy = false; particles = [];
+}
+function setMode(m) {
+  mode = m;
+  document.getElementById("modeA").classList.toggle("on", m === "A");
+  document.getElementById("modeB").classList.toggle("on", m === "B");
+  winPanel.style.display = "none";
+  if (m === "A") { resetA(); showHint("🗺️ 寻宝：看坐标，点网格交叉点挖宝藏！"); }
+  else { resetB(); showHint("🎨 连点画：按顺序点出每个坐标，钉子会连成图案！"); }
+  updateScore();
+}
+function updateScore() {
+  if (mode === "A") {
+    if (tIdx >= targets.length) { scorebar.textContent = "🏆 宝藏全部挖到啦！"; return; }
+    const t = targets[tIdx];
+    scorebar.textContent = `🗺️ 第 ${tIdx + 1} / ${targets.length} 个宝藏：藏在 (${t[0]}, ${t[1]})`;
+  } else {
+    if (level >= LEVELS.length) { scorebar.textContent = "🎉 三幅画全部完成！"; return; }
+    const L = LEVELS[level];
+    const i = Math.min(pIdx, L.pts.length - 1);
+    scorebar.textContent = pIdx >= L.pts.length
+      ? `🎨 第 ${level + 1} / ${LEVELS.length} 关 · ${L.emoji} ${L.name}完成！`
+      : `🎨 第 ${level + 1} / ${LEVELS.length} 关 ${L.name} · 第 ${pIdx + 1} / ${L.pts.length} 个点：(${L.pts[i][0]}, ${L.pts[i][1]})`;
+  }
+}
+
+/* ================= 交互 ================= */
+canvas.addEventListener("pointerdown", e => {
+  dragging = true;
+  updateGhost(e.clientX, e.clientY);
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+});
+canvas.addEventListener("pointermove", e => updateGhost(e.clientX, e.clientY));
+window.addEventListener("pointerup", e => {
+  if (!dragging) return;
+  dragging = false;
+  updateGhost(e.clientX, e.clientY);
+  if (ghost) attempt(ghost.gx, ghost.gy);
+});
+canvas.addEventListener("pointerleave", () => { if (!dragging) ghost = null; });
+function updateGhost(sx, sy) { ghost = nearestGrid(sx, sy); }
+
+function attempt(gx, gy) {
+  if (busy || winPanel.style.display === "flex") return;
+  const tgt = mode === "A" ? targets[tIdx] : LEVELS[level].pts[pIdx];
+  if (gx === tgt[0] && gy === tgt[1]) onCorrect(gx, gy);
+  else onWrong(gx, gy, tgt);
+}
+function onCorrect(gx, gy) {
+  const now = performance.now();
+  const [sx, sy] = toScreen(gx, gy);
+  wrongs = 0; guideUntil = 0;
+  if (mode === "A") {
+    chests.push({ x:gx, y:gy, t0:now });
+    burst(sx, sy, 26);
+    dig(); fanfare();
+    showHint(`🎉 在 (${gx}, ${gy}) 挖到宝藏啦！`);
+    tIdx++;
+    if (tIdx >= targets.length) {
+      busy = true;
+      setTimeout(() => {
+        winPanel.querySelector(".msg").innerHTML = "🏆 太棒了！<br>全部宝藏都挖到啦！";
+        winPanel.style.display = "flex";
+        fanfare();
+      }, 1100);
+    }
+  } else {
+    placed.push({ x:gx, y:gy });
+    burst(sx, sy, 14);
+    pop(500 + pIdx * 70);
+    pIdx++;
+    const L = LEVELS[level];
+    if (pIdx >= L.pts.length) {
+      fanfare();
+      showHint(`🎉 ${L.emoji} ${L.name}出现啦！`);
+      const [cx, cy] = toScreen(5, 5);
+      burst(cx, cy, 40);
+      busy = true;
+      setTimeout(() => {
+        level++; pIdx = 0; placed = [];
+        if (level >= LEVELS.length) {
+          winPanel.querySelector(".msg").innerHTML = "🎉 三幅连点画<br>全部完成！";
+          winPanel.style.display = "flex";
+          fanfare();
+        } else {
+          showHint(`下一关：${LEVELS[level].name}！`);
+        }
+        busy = false;
+        updateScore();
+      }, 1900);
+    }
+  }
+  updateScore();
+}
+function onWrong(gx, gy, tgt) {
+  wrongs++;
+  wrongFlash = { x:gx, y:gy, t0:performance.now() };
+  tone(180, 0.18, 0.1, "triangle");   // 轻轻提醒，不扣分不批评
+  if (wrongs >= 2) {
+    guideUntil = performance.now() + 2000;   // 错两次就亮出辅助线
+    showHint(`看橙色线：竖线 x=${tgt[0]} 和横线 y=${tgt[1]} 相交的地方！`);
+  } else {
+    showHint(`还差一点！先找下面的 x=${tgt[0]}，再找左边的 y=${tgt[1]}`);
+  }
+}
+
+/* ================= 粒子 ================= */
+const CONFETTI = ["#ff5252","#ffb800","#2fbf4a","#4a90d9","#b668d9","#ff8c42"];
+function burst(sx, sy, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 320;
+    particles.push({
+      x:sx, y:sy, vx:Math.cos(a) * sp, vy:Math.sin(a) * sp - 160,
+      life:0.9 + Math.random() * 0.5, t:0,
+      size:4 + Math.random() * 5, color:CONFETTI[ri(0, CONFETTI.length - 1)],
+      rot:Math.random() * 7, vr:(Math.random() - 0.5) * 12
+    });
+  }
+}
+function stepParticles(dt) {
+  for (const p of particles) {
+    p.t += dt;
+    p.vy += 640 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.rot += p.vr * dt;
+  }
+  particles = particles.filter(p => p.t < p.life && p.y < H + 30);
+}
+
+/* ================= 绘制 ================= */
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#fdf6e0"); g.addColorStop(1, "#f2e4c4");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawGrid() {
+  const [x0, y0] = toScreen(0, 0), [x1, y1] = toScreen(GS, GS);
+  // 图纸底板
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.strokeStyle = "#c9a86a"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.rect(x0 - 14, y1 - 14, (x1 - x0) + 28, (y0 - y1) + 28);
+  ctx.fill(); ctx.stroke();
+  // 网格线
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= GS; i++) {
+    const [ax, ay] = toScreen(i, 0), [bx, by] = toScreen(i, GS);
+    ctx.strokeStyle = i === 0 ? "#8a6d3b" : "#dccb9f";
+    ctx.lineWidth = i === 0 ? 3 : 1;
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+    const [cx, cy] = toScreen(0, i), [dx, dy] = toScreen(GS, i);
+    ctx.strokeStyle = i === 0 ? "#8a6d3b" : "#dccb9f";
+    ctx.lineWidth = i === 0 ? 3 : 1;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(dx, dy); ctx.stroke();
+  }
+  // 交叉点小圆点
+  ctx.fillStyle = "#b7a271";
+  for (let gx = 0; gx <= GS; gx++)
+    for (let gy = 0; gy <= GS; gy++) {
+      const [sx, sy] = toScreen(gx, gy);
+      ctx.beginPath(); ctx.arc(sx, sy, 2.2, 0, 7); ctx.fill();
+    }
+  // 轴末端箭头 + x / y 标记
+  ctx.strokeStyle = "#8a6d3b"; ctx.fillStyle = "#8a6d3b"; ctx.lineWidth = 3;
+  const [axx, axy] = toScreen(GS, 0);
+  ctx.beginPath(); ctx.moveTo(axx + 16, axy); ctx.lineTo(axx + 4, axy - 6); ctx.lineTo(axx + 4, axy + 6); ctx.closePath(); ctx.fill();
+  const [ayx, ayy] = toScreen(0, GS);
+  ctx.beginPath(); ctx.moveTo(ayx, ayy - 16); ctx.lineTo(ayx - 6, ayy - 4); ctx.lineTo(ayx + 6, ayy - 4); ctx.closePath(); ctx.fill();
+  ctx.font = "bold 18px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("x", axx + 26, axy - 12);
+  ctx.fillText("y", ayx + 14, ayy - 26);
+  // 坐标数字
+  ctx.font = "bold 14px sans-serif"; ctx.fillStyle = "#7a6436";
+  for (let i = 1; i <= GS; i++) {
+    const [sx] = toScreen(i, 0);
+    ctx.fillText(String(i), sx, y0 + 20);
+    const [, sy] = toScreen(0, i);
+    ctx.fillText(String(i), x0 - 20, sy);
+  }
+  ctx.fillText("0", x0 - 18, y0 + 20);
+}
+
+// 当前目标的辅助线（连续点错两次后出现）
+function drawGuides(now) {
+  if (now >= guideUntil || busy) return;
+  const tgt = mode === "A" ? targets[tIdx] : LEVELS[level].pts[pIdx];
+  if (!tgt) return;
+  const a = 0.45 + 0.3 * Math.sin(now / 120);
+  ctx.strokeStyle = `rgba(255,159,28,${a})`; ctx.lineWidth = 4;
+  const [vx1, vy1] = toScreen(tgt[0], 0), [vx2, vy2] = toScreen(tgt[0], GS);
+  ctx.beginPath(); ctx.moveTo(vx1, vy1); ctx.lineTo(vx2, vy2); ctx.stroke();
+  const [hx1, hy1] = toScreen(0, tgt[1]), [hx2, hy2] = toScreen(GS, tgt[1]);
+  ctx.beginPath(); ctx.moveTo(hx1, hy1); ctx.lineTo(hx2, hy2); ctx.stroke();
+}
+
+// 点错的位置画一个淡出的红叉
+function drawWrongFlash(now) {
+  if (!wrongFlash) return;
+  const k = (now - wrongFlash.t0) / 600;
+  if (k >= 1) { wrongFlash = null; return; }
+  const [sx, sy] = toScreen(wrongFlash.x, wrongFlash.y);
+  const r = grid.cell * 0.28 * (1 + k * 0.4);
+  ctx.strokeStyle = `rgba(230,70,60,${1 - k})`; ctx.lineWidth = 4; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(sx - r, sy - r); ctx.lineTo(sx + r, sy + r);
+  ctx.moveTo(sx + r, sy - r); ctx.lineTo(sx - r, sy + r);
+  ctx.stroke();
+}
+
+// 坐标小标签：白底药丸 + 文字
+function drawTag(sx, sy, text, color) {
+  ctx.font = "bold 13px sans-serif";
+  const tw = ctx.measureText(text).width + 14;
+  let tx = sx + 12, ty = sy - 30;
+  if (tx + tw > W - 6) tx = sx - tw - 12;
+  if (ty < 6) ty = sy + 14;
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.rect(tx, ty, tw, 22);
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = color; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText(text, tx + 7, ty + 12);
+}
+
+function easeOutBack(k) {
+  const c = 1.70158;
+  return 1 + (c + 1) * Math.pow(k - 1, 3) + c * Math.pow(k - 1, 2);
+}
+
+// 寻宝模式：土坑 + 弹出的宝箱 + 坐标标签
+function drawChests(now) {
+  for (const c of chests) {
+    const [sx, sy] = toScreen(c.x, c.y);
+    ctx.beginPath(); ctx.ellipse(sx, sy + grid.cell * 0.16, grid.cell * 0.4, grid.cell * 0.14, 0, 0, 7);
+    ctx.fillStyle = "rgba(120,84,40,0.5)"; ctx.fill();
+    const k = Math.min(1, (now - c.t0) / 380);
+    const s = k < 1 ? easeOutBack(k) : 1 + 0.05 * Math.sin(now / 300);
+    ctx.save();
+    ctx.translate(sx, sy - grid.cell * 0.12);
+    ctx.scale(s, s);
+    ctx.font = `${Math.round(grid.cell * 0.85)}px sans-serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("🎁", 0, 0);
+    ctx.restore();
+    drawTag(sx, sy - grid.cell * 0.3, `(${c.x}, ${c.y})`, "#b6680a");
+  }
+}
+
+// 连点画模式：连线 + 钉子 + 标签 + 完工装饰
+function drawPicture() {
+  const L = LEVELS[Math.min(level, LEVELS.length - 1)];
+  const done = pIdx >= L.pts.length;
+  // 连线
+  if (placed.length > 1) {
+    ctx.strokeStyle = "#e2574c"; ctx.lineWidth = 5;
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    ctx.beginPath();
+    placed.forEach((p, i) => {
+      const [sx, sy] = toScreen(p.x, p.y);
+      if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+    });
+    ctx.stroke();
+  }
+  // 钉子（同一坐标的标签只贴一次）
+  const labeled = new Set();
+  for (const p of placed) {
+    const [sx, sy] = toScreen(p.x, p.y);
+    const r = Math.max(8, grid.cell * 0.15);
+    const g = ctx.createRadialGradient(sx - 3, sy - 4, 1, sx, sy, r);
+    g.addColorStop(0, "#ff8a80"); g.addColorStop(1, "#c62828");
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, 7);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(sx - r * 0.3, sy - r * 0.35, r * 0.28, 0, 7);
+    ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.fill();
+    const key = p.x + "," + p.y;
+    if (!labeled.has(key)) {
+      labeled.add(key);
+      drawTag(sx, sy, `(${p.x}, ${p.y})`, "#c62828");
+    }
+  }
+  // 完工装饰
+  if (done) {
+    L.deco();
+    const [sx, sy] = toScreen(5, 9.4);
+    ctx.font = `${Math.round(grid.cell * 0.7)}px sans-serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(L.emoji, sx, Math.max(sy, 34));
+  }
+}
+
+// 手指/鼠标指向的交叉点：虚线连到两根轴 + 实时坐标
+function drawGhost() {
+  if (!ghost || busy) return;
+  const [sx, sy] = toScreen(ghost.gx, ghost.gy);
+  const [x0] = toScreen(0, 0), [, y0] = toScreen(0, 0);
+  ctx.save();
+  ctx.setLineDash([6, 6]);
+  ctx.strokeStyle = dragging ? "rgba(47,158,68,0.8)" : "rgba(47,158,68,0.45)";
+  ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx, y0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(x0, sy); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath(); ctx.arc(sx, sy, Math.max(9, grid.cell * 0.18), 0, 7);
+  ctx.fillStyle = dragging ? "rgba(47,158,68,0.85)" : "rgba(47,158,68,0.5)";
+  ctx.fill();
+  ctx.strokeStyle = "#1e6e33"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.restore();
+  drawTag(sx, sy, `(${ghost.gx}, ${ghost.gy})`, "#1e6e33");
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const a = 1 - p.t / p.life;
+    ctx.save();
+    ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+    ctx.globalAlpha = Math.max(0, a);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size * 0.6);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const now = performance.now();
+  drawBackground();
+  drawGrid();
+  drawGuides(now);
+  if (mode === "A") drawChests(now); else drawPicture();
+  drawWrongFlash(now);
+  drawGhost();
+  drawParticles();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  stepParticles(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const dig = () => { tone(90, 0.2, 0.18, "triangle"); setTimeout(() => pop(320), 90); };
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+document.getElementById("modeA").addEventListener("click", () => { if (mode !== "A") { setMode("A"); pop(660); } });
+document.getElementById("modeB").addEventListener("click", () => { if (mode !== "B") { setMode("B"); pop(660); } });
+document.getElementById("replayBtn").addEventListener("click", () => { setMode(mode); pop(880); });
+setMode("A");
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

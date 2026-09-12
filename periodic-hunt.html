@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>周期表寻宝</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#1c2340; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,14,32,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,14,32,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:18px;
+    background:rgba(0,0,0,0.55);
+  }
+  #winPanel .msg {
+    font-size:36px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.4;
+  }
+  #winPanel .badges {
+    display:flex; flex-wrap:wrap; gap:10px; justify-content:center;
+    max-width:640px; padding:0 16px;
+  }
+  #winPanel .badge {
+    width:64px; height:64px; border-radius:14px; background:#ffd54a;
+    color:#5a3d00; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; font-weight:bold;
+    box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel .badge .sym { font-size:24px; }
+  #winPanel .badge .nm { font-size:12px; }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🏅 徽章 0 / 10</div>
+<div id="hint">读线索卡，点击周期表里正确的元素格子！</div>
+<div id="winPanel">
+  <div class="msg">🎉 寻宝成功！<br>你集齐了 10 个元素徽章！</div>
+  <div class="badges" id="badgeBox"></div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 元素数据（前 20 号） ================= */
+// zone: 分类；col/row: 简化周期表位置（18 列 × 4 行）
+const ZONES = {
+  alkali:  { name: "碱金属",   color: "#e74c3c" },
+  alkaline:{ name: "碱土金属", color: "#e67e22" },
+  halogen: { name: "卤素",     color: "#9b59b6" },
+  noble:   { name: "稀有气体", color: "#3498db" },
+  nonmetal:{ name: "其他非金属", color: "#2ecc71" },
+  metalloid:{ name: "类金属",  color: "#d4ac0d" },
+  metal:   { name: "其他金属", color: "#7f8c9b" },
+};
+const ELEMENTS = [
+  { z:1,  sym:"H",  name:"氢", zone:"nonmetal",  col:1,  row:1 },
+  { z:2,  sym:"He", name:"氦", zone:"noble",     col:18, row:1 },
+  { z:3,  sym:"Li", name:"锂", zone:"alkali",    col:1,  row:2 },
+  { z:4,  sym:"Be", name:"铍", zone:"alkaline",  col:2,  row:2 },
+  { z:5,  sym:"B",  name:"硼", zone:"metalloid", col:13, row:2 },
+  { z:6,  sym:"C",  name:"碳", zone:"nonmetal",  col:14, row:2 },
+  { z:7,  sym:"N",  name:"氮", zone:"nonmetal",  col:15, row:2 },
+  { z:8,  sym:"O",  name:"氧", zone:"nonmetal",  col:16, row:2 },
+  { z:9,  sym:"F",  name:"氟", zone:"halogen",   col:17, row:2 },
+  { z:10, sym:"Ne", name:"氖", zone:"noble",     col:18, row:2 },
+  { z:11, sym:"Na", name:"钠", zone:"alkali",    col:1,  row:3 },
+  { z:12, sym:"Mg", name:"镁", zone:"alkaline",  col:2,  row:3 },
+  { z:13, sym:"Al", name:"铝", zone:"metal",     col:13, row:3 },
+  { z:14, sym:"Si", name:"硅", zone:"metalloid", col:14, row:3 },
+  { z:15, sym:"P",  name:"磷", zone:"nonmetal",  col:15, row:3 },
+  { z:16, sym:"S",  name:"硫", zone:"nonmetal",  col:16, row:3 },
+  { z:17, sym:"Cl", name:"氯", zone:"halogen",   col:17, row:3 },
+  { z:18, sym:"Ar", name:"氩", zone:"noble",     col:18, row:3 },
+  { z:19, sym:"K",  name:"钾", zone:"alkali",    col:1,  row:4 },
+  { z:20, sym:"Ca", name:"钙", zone:"alkaline",  col:2,  row:4 },
+];
+
+/* ================= 线索（由易到难 10 条） ================= */
+const CLUES = [
+  { sym:"H",  clue:"我是最轻的气体，能充气球",        fact:"氢是宇宙中最多的元素，太阳主要由氢组成！" },
+  { sym:"O",  clue:"我住在第 2 周期第 16 列",         fact:"你呼吸的空气中约有 21% 是氧气，燃烧也离不开它。" },
+  { sym:"Ca", clue:"我能让骨头和牙齿变得强壮",        fact:"牛奶、豆腐里都有钙，它让骨骼又硬又结实。" },
+  { sym:"He", clue:"我是充气球更安全的轻气体，永远不会着火", fact:"氦气比空气轻又不燃烧，所以飞艇用它最安全。" },
+  { sym:"N",  clue:"我是空气中含量最多的气体",        fact:"空气中约 78% 是氮气，它还是植物生长需要的营养。" },
+  { sym:"C",  clue:"铅笔芯和璀璨钻石都是我",          fact:"钻石和铅笔芯都是碳，只是原子排列方式不同！" },
+  { sym:"Na", clue:"我是食盐里的一种金属，遇水会剧烈反应", fact:"金属钠遇水会剧烈反应甚至起火，实验室里要把它泡在煤油里保存。" },
+  { sym:"Cl", clue:"我住在第 3 周期第 17 列，游泳池消毒水里有我", fact:"氯气能杀菌，游泳池和自来水的消毒都离不开含氯物质。" },
+  { sym:"Al", clue:"我是造飞机的轻金属，易拉罐也是我", fact:"铝又轻又耐腐蚀；回收一个易拉罐能节省约 95% 的能源。" },
+  { sym:"K",  clue:"我住在第 4 周期第 1 列，香蕉里有我", fact:"香蕉、土豆都富含钾，它能帮助你的肌肉和神经正常工作。" },
+];
+
+/* ================= 游戏状态 ================= */
+let cells = [];          // {el, x, y, w, h, found, flip, shakeT}
+let clueIdx = 0;
+let foundCount = 0;
+let factCard = null;     // {el, fact, t}
+let particles = [];      // {x, y, vx, vy, life, color}
+let hoverCell = null;
+let gameOver = false;
+
+function buildCells() {
+  cells = ELEMENTS.map(el => ({ el, x:0, y:0, w:0, h:0, found:false, flip:0, shakeT:0 }));
+}
+function resetGame() {
+  buildCells();
+  clueIdx = 0; foundCount = 0;
+  factCard = null; particles = []; gameOver = false;
+  winPanel.style.display = "none";
+  layout();
+  updateScore();
+}
+function updateScore() {
+  scorebar.textContent = `🏅 徽章 ${foundCount} / ${CLUES.length} · 线索 ${Math.min(clueIdx + 1, CLUES.length)}`;
+}
+
+/* ================= 布局 ================= */
+// 区域：线索卡(上) → 周期表(中) → 图例(下)
+const view = { clue:null, gridX:0, gridY:0, cellW:0, cellH:0, gap:6, legendY:0 };
+function layout() {
+  const gap = Math.max(4, Math.min(8, W / 160));
+  view.gap = gap;
+  // 线索卡
+  const clueW = Math.min(W - 32, 760);
+  view.clue = { x:(W - clueW) / 2, y:58, w:clueW, h:92 };
+  // 图例高度（窄屏两行）；留出底部提示条空间
+  const legendRows = W < 760 ? 2 : 1;
+  const legendH = legendRows * 30 + 12;
+  view.legendY = H - legendH - 54;
+  // 表格可用区
+  const top = view.clue.y + view.clue.h + 14;
+  const availH = view.legendY - top - 12;
+  const availW = W - 28;
+  const cw = Math.min((availW - 17 * gap) / 18, (availH - 3 * gap - 20) / 4);
+  view.cellW = cw;
+  view.cellH = Math.min(cw * 1.06, (availH - 3 * gap - 20) / 4);
+  view.gridX = (W - (18 * cw + 17 * gap)) / 2;
+  // 在可用区内垂直居中，留出列号
+  const gridH = 4 * view.cellH + 3 * gap;
+  view.gridY = top + 20 + Math.max(0, (availH - 20 - gridH) / 2);
+  for (const c of cells) {
+    c.x = view.gridX + (c.el.col - 1) * (cw + gap);
+    c.y = view.gridY + (c.el.row - 1) * (view.cellH + gap);
+    c.w = cw; c.h = view.cellH;
+  }
+}
+
+/* ================= 交互 ================= */
+function cellAt(px, py) {
+  for (const c of cells)
+    if (px >= c.x && px <= c.x + c.w && py >= c.y && py <= c.y + c.h) return c;
+  return null;
+}
+canvas.addEventListener("pointerdown", e => {
+  hintEl.style.opacity = "0";
+  if (gameOver) return;
+  // 趣闻卡打开时：点任意处收下徽章、进入下一条线索
+  if (factCard) {
+    if (factCard.t > 0.35) { closeFactCard(); }
+    return;
+  }
+  const c = cellAt(e.clientX, e.clientY);
+  if (!c) return;
+  answer(c);
+});
+canvas.addEventListener("pointermove", e => {
+  hoverCell = factCard || gameOver ? null : cellAt(e.clientX, e.clientY);
+  canvas.style.cursor = hoverCell ? "pointer" : "default";
+});
+
+function answer(cell) {
+  if (factCard || gameOver) return;   // 趣闻卡打开/已通关时不接受作答
+  const target = CLUES[clueIdx];
+  if (cell.el.sym === target.sym) {
+    // 答对：翻转 + 趣闻卡 + 庆祝
+    cell.found = true;
+    foundCount++;
+    spawnConfetti(cell.x + cell.w / 2, cell.y + cell.h / 2, ZONES[cell.el.zone].color);
+    factCard = { el: cell.el, fact: target.fact, t: 0 };
+    dingDong();
+    updateScore();
+  } else {
+    // 答错：轻晃，无惩罚
+    cell.shakeT = 1;
+    buzz();
+    showHint(cell.found ? "这个徽章已经拿到啦，试试别的格子" : "不对哦，再读一遍线索试试～");
+  }
+}
+function closeFactCard() {
+  factCard = null;
+  clueIdx++;
+  updateScore();
+  if (clueIdx >= CLUES.length) {
+    gameOver = true;
+    setTimeout(showWin, 700);
+  } else {
+    showHint(`第 ${clueIdx + 1} 条线索来啦！`);
+    pop(660);
+  }
+}
+function showWin() {
+  const box = document.getElementById("badgeBox");
+  box.innerHTML = "";
+  for (const cl of CLUES) {
+    const el = ELEMENTS.find(e => e.sym === cl.sym);
+    const d = document.createElement("div");
+    d.className = "badge";
+    d.innerHTML = `<div class="sym">${el.sym}</div><div class="nm">${el.name}</div>`;
+    box.appendChild(d);
+  }
+  winPanel.style.display = "flex";
+  fanfare();
+}
+
+/* ================= 粒子 ================= */
+function spawnConfetti(x, y, color) {
+  const palette = [color, "#ffd54a", "#ffffff", "#ff8a65"];
+  for (let i = 0; i < 26; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = 90 + Math.random() * 260;
+    particles.push({
+      x, y,
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 120,
+      life: 0.9 + Math.random() * 0.5,
+      color: palette[i % palette.length],
+      r: 2.5 + Math.random() * 3.5
+    });
+  }
+}
+function stepParticles(dt) {
+  for (const p of particles) {
+    p.life -= dt;
+    p.vy += 620 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  particles = particles.filter(p => p.life > 0);
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+function shade(hex, amt) {   // amt: -1..1 变暗/变亮
+  const n = parseInt(hex.slice(1), 16);
+  let r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+  const f = c => Math.max(0, Math.min(255, Math.round(amt > 0 ? c + (255 - c) * amt : c * (1 + amt))));
+  return `rgb(${f(r)},${f(g)},${f(b)})`;
+}
+
+function drawClueCard() {
+  const v = view.clue;
+  ctx.save();
+  ctx.shadowColor = "rgba(0,0,0,0.35)"; ctx.shadowBlur = 12; ctx.shadowOffsetY = 3;
+  ctx.fillStyle = "rgba(255,255,255,0.96)";
+  roundRect(v.x, v.y, v.w, v.h, 16, true);
+  ctx.restore();
+  // 左侧放大镜徽章
+  ctx.beginPath(); ctx.arc(v.x + 46, v.y + v.h / 2, 28, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  ctx.font = "26px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("🔍", v.x + 46, v.y + v.h / 2 + 1);
+  // 线索文本
+  const cl = CLUES[Math.min(clueIdx, CLUES.length - 1)];
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#8a6d00";
+  ctx.font = "bold 13px sans-serif";
+  ctx.fillText(`线索 ${Math.min(clueIdx + 1, CLUES.length)} / ${CLUES.length}`, v.x + 88, v.y + 22);
+  ctx.fillStyle = "#26304e";
+  const fs = Math.max(16, Math.min(22, (v.w - 120) / (cl.clue.length * 0.62)));
+  ctx.font = `bold ${fs}px sans-serif`;
+  wrapText(cl.clue, v.x + 88, v.y + 50, v.w - 110, fs * 1.35, v.y + v.h - 14);
+}
+function wrapText(text, x, y, maxW, lh, maxY) {
+  let line = "", yy = y;
+  for (const ch of text) {
+    if (ctx.measureText(line + ch).width > maxW && line) {
+      if (yy + lh > maxY + lh * 0.2) { ctx.fillText(line + "…", x, yy); return; }
+      ctx.fillText(line, x, yy); line = ch; yy += lh;
+    } else line += ch;
+  }
+  ctx.fillText(line, x, yy);
+}
+
+function drawGridLabels() {
+  ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "rgba(255,255,255,0.45)";
+  ctx.font = `${Math.max(10, view.cellW * 0.2)}px sans-serif`;
+  for (let col = 1; col <= 18; col++) {
+    // 只标有元素的列
+    if (!cells.some(c => c.el.col === col)) continue;
+    ctx.fillText(col, view.gridX + (col - 1) * (view.cellW + view.gap) + view.cellW / 2, view.gridY - 6);
+  }
+  ctx.textAlign = "right";
+  for (let row = 1; row <= 4; row++) {
+    ctx.fillText(row, view.gridX - 6, view.gridY + (row - 1) * (view.cellH + view.gap) + view.cellH / 2 + 4);
+  }
+}
+
+function drawCell(c) {
+  const col = ZONES[c.el.zone].color;
+  // 答错轻晃
+  let sx = 0;
+  if (c.shakeT > 0) sx = Math.sin(c.shakeT * 28) * 5 * c.shakeT;
+  ctx.save();
+  ctx.translate(c.x + c.w / 2 + sx, c.y + c.h / 2);
+  // 翻转动画：答对后 flip 0→1，先压扁再展开，翻面后变金色徽章
+  if (c.found && c.flip < 1) c.flip = Math.min(1, c.flip + 0.055);
+  const scaleX = Math.abs(Math.cos(c.flip * Math.PI));
+  const back = c.flip > 0.5;
+  ctx.scale(Math.max(0.02, scaleX), 1);
+  if (hoverCell === c && !back) ctx.scale(1.07, 1.07);
+  const w = c.w, h = c.h;
+  ctx.shadowColor = "rgba(0,0,0,0.3)"; ctx.shadowBlur = 6; ctx.shadowOffsetY = 2;
+  ctx.fillStyle = back ? "#ffd54a" : col;
+  roundRect(-w / 2, -h / 2, w, h, Math.min(10, w * 0.16), true);
+  ctx.shadowColor = "transparent";
+  // 边框
+  ctx.lineWidth = back ? 3 : 2;
+  ctx.strokeStyle = back ? "#fff3c4" : shade(col, 0.35);
+  roundRect(-w / 2, -h / 2, w, h, Math.min(10, w * 0.16), false);
+  ctx.stroke();
+  if (scaleX > 0.3) {
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    if (back) {
+      // 徽章面：大符号 + ⭐
+      ctx.fillStyle = "#5a3d00";
+      ctx.font = `bold ${h * 0.42}px sans-serif`;
+      ctx.fillText(c.el.sym, 0, -h * 0.08);
+      ctx.font = `${h * 0.24}px sans-serif`;
+      ctx.fillText("⭐", 0, h * 0.3);
+    } else {
+      // 正面：原子序数 + 符号 + 中文名
+      ctx.fillStyle = "rgba(255,255,255,0.92)";
+      ctx.textAlign = "left";
+      ctx.font = `${Math.max(9, h * 0.18)}px sans-serif`;
+      ctx.fillText(c.el.z, -w / 2 + 5, -h / 2 + h * 0.2);
+      ctx.textAlign = "center";
+      ctx.font = `bold ${h * 0.4}px sans-serif`;
+      ctx.fillText(c.el.sym, 0, -h * 0.02);
+      ctx.font = `${Math.max(10, h * 0.2)}px sans-serif`;
+      ctx.fillText(c.el.name, 0, h * 0.32);
+    }
+  }
+  ctx.restore();
+}
+
+function drawLegend() {
+  const keys = Object.keys(ZONES);
+  ctx.font = "13px sans-serif";
+  const items = keys.map(k => ({ name: ZONES[k].name, color: ZONES[k].color, w: 18 + 8 + ctx.measureText(ZONES[k].name).width + 16 }));
+  const rows = [[]];
+  let rowW = 0;
+  const maxRowW = W - 40;
+  for (const it of items) {
+    if (rowW + it.w > maxRowW && rows[rows.length - 1].length) { rows.push([]); rowW = 0; }
+    rows[rows.length - 1].push(it); rowW += it.w;
+  }
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  rows.forEach((row, ri) => {
+    let x = (W - row.reduce((s, i) => s + i.w, 0)) / 2;
+    const y = view.legendY + ri * 30 + 15;
+    for (const it of row) {
+      ctx.fillStyle = it.color;
+      roundRect(x, y - 8, 16, 16, 4, true);
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.fillText(it.name, x + 22, y);
+      x += it.w;
+    }
+  });
+}
+
+function drawFactCard() {
+  if (!factCard) return;
+  factCard.t = Math.min(1, factCard.t + 0.07);
+  const el = factCard.el;
+  const pw = Math.min(W - 40, 520), ph = Math.min(H - 120, 300);
+  const px = (W - pw) / 2, py = (H - ph) / 2;
+  const s = 0.6 + 0.4 * easeOutBack(factCard.t);
+  ctx.save();
+  ctx.translate(W / 2, H / 2); ctx.scale(s, s); ctx.translate(-W / 2, -H / 2);
+  ctx.globalAlpha = Math.min(1, factCard.t * 1.6);
+  // 背景遮罩
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
+  ctx.fillRect(-W, -H, W * 3, H * 3);
+  // 卡片
+  ctx.shadowColor = "rgba(0,0,0,0.5)"; ctx.shadowBlur = 24;
+  ctx.fillStyle = "#ffffff";
+  roundRect(px, py, pw, ph, 20, true);
+  ctx.shadowColor = "transparent";
+  // 左侧大图块
+  const col = ZONES[el.zone].color;
+  ctx.fillStyle = col;
+  roundRect(px + 18, py + 18, 128, ph - 36, 14, true);
+  ctx.fillStyle = "rgba(255,255,255,0.95)";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.font = "bold 16px sans-serif";
+  ctx.fillText(el.z, px + 32, py + 42);
+  ctx.textAlign = "center";
+  ctx.font = "bold 56px sans-serif";
+  ctx.fillText(el.sym, px + 82, py + ph / 2 - 14);
+  ctx.font = "bold 20px sans-serif";
+  ctx.fillText(el.name, px + 82, py + ph / 2 + 30);
+  // 右侧信息
+  const tx = px + 168, tw = pw - 190;
+  ctx.textAlign = "left";
+  ctx.fillStyle = col;
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillText(`${ZONES[el.zone].name} · 第 ${el.row} 周期 第 ${el.col} 列`, tx, py + 40);
+  ctx.fillStyle = "#26304e";
+  ctx.font = "bold 22px sans-serif";
+  ctx.fillText("🎉 答对啦！获得徽章", tx, py + 74);
+  ctx.fillStyle = "#4a5578";
+  ctx.font = "16px sans-serif";
+  wrapText(factCard.fact, tx, py + 108, tw, 26, py + ph - 44);
+  ctx.fillStyle = "#9aa3bd";
+  ctx.font = "14px sans-serif";
+  ctx.fillText("点任意处继续寻宝 →", tx, py + ph - 22);
+  ctx.restore();
+}
+function easeOutBack(t) {
+  const c = 1.70158;
+  return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2);
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, p.life));
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.r / 2, p.y - p.r / 2, p.r, p.r * 0.7);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 深蓝夜空渐变背景
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#232c52"); g.addColorStop(1, "#161b36");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  drawClueCard();
+  drawGridLabels();
+  for (const c of cells) drawCell(c);
+  drawLegend();
+  drawParticles();
+  drawFactCard();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  for (const c of cells) if (c.shakeT > 0) c.shakeT = Math.max(0, c.shakeT - dt * 2.4);
+  stepParticles(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const buzz = () => tone(160, 0.18, 0.08, "square");
+function dingDong() { pop(784); setTimeout(() => pop(1047), 110); }
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 1800);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+// 测试钩子（不影响游戏）
+window.__hunt = {
+  get clueIdx() { return clueIdx; },
+  get foundCount() { return foundCount; },
+  get factOpen() { return !!factCard; },
+  get over() { return gameOver; },
+  cellRect(sym) { const c = cells.find(c => c.el.sym === sym); return c ? { x:c.x, y:c.y, w:c.w, h:c.h } : null; },
+  answerSym(sym) { const c = cells.find(c => c.el.sym === sym); if (c) answer(c); },
+  closeFact() { if (factCard) closeFactCard(); },
+};
+
+resize();
+resetGame();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

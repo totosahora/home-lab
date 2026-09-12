@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>热传导小实验</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#1c2634; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,26,0.85); color:#7fd4ff; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,26,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  #toolbar {
+    position:absolute; top:12px; left:12px; z-index:10;
+    display:flex; flex-wrap:wrap; gap:8px; max-width:46vw;
+  }
+  #toolbar button {
+    font-size:17px; font-weight:bold; padding:10px 18px;
+    border-radius:22px; border:none; cursor:pointer;
+    background:rgba(255,255,255,0.14); color:#cfe6ff;
+    box-shadow:0 3px 8px rgba(0,0,0,0.35);
+  }
+  #toolbar button:active { transform:scale(1.06); }
+  #toolbar .tab.on { background:#2e7fd4; color:#fff; }
+  #startBtn { background:#ff7043 !important; color:#fff !important; font-size:19px !important; }
+  #startBtn:disabled { background:#8a4a34 !important; color:#d8bdae !important; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="toolbar">
+  <button class="tab on" id="tab1">🥄 勺子传热</button>
+  <button class="tab" id="tab2">🕯️ 蜡粒实验</button>
+  <button id="startBtn">▶ 开始加热</button>
+  <button id="resetBtn">↺ 重来</button>
+</div>
+<div id="scorebar">实验一 · 哪种勺子传热最快？</div>
+<div id="hint">按住勺子可以左右拖动交换位置，点“开始加热”看热量爬勺柄！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const startBtn = document.getElementById("startBtn");
+const resetBtn = document.getElementById("resetBtn");
+const tab1 = document.getElementById("tab1");
+const tab2 = document.getElementById("tab2");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+// 温度 → 颜色（把看不见的温度画出来：冷蓝 → 热红）
+function tempColor(t, tMin, tMax) {
+  let u = (t - tMin) / (tMax - tMin);
+  u = Math.max(0, Math.min(1, u));
+  return `hsl(${220 - 220 * u}, 90%, ${48 + 8 * u}%)`;
+}
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+/* ================= 场景数据 ================= */
+const WATER_T = 90;      // 热水温度 °C
+const ROOM_T = 25;       // 室温 °C
+const N = 22;            // 勺柄温度节点数
+
+// 实验一：三把勺子（导热系数 rate 不同）
+const exp1 = {
+  running: false, time: 0,
+  announcedMetal: false, announcedSlow: false,
+  spoons: [
+    { key:"metal",   name:"金属勺", rate:40,  slot:0, dot:0, T:new Float64Array(N).fill(ROOM_T) },
+    { key:"wood",    name:"木勺",   rate:5,   slot:1, dot:0, T:new Float64Array(N).fill(ROOM_T) },
+    { key:"plastic", name:"塑料勺", rate:6,   slot:2, dot:0, T:new Float64Array(N).fill(ROOM_T) },
+  ],
+};
+
+// 实验二：两端加热的金属条 + 蜡粒
+const M = 70;            // 金属条温度节点数
+const SLOTS = 7;         // 金属条上可放蜡粒的位置数
+const exp2 = {
+  running: false, time: 0, announced: false,
+  bar: new Float64Array(M).fill(ROOM_T),
+  waxes: [],             // {slot:-1 在托盘, melt:0..1, done}
+  drips: [],             // 滴落的蜡 {x, y, vy, a}
+};
+for (let i = 0; i < 6; i++) exp2.waxes.push({ slot:-1, melt:0, done:false });
+
+let exp = 1;             // 当前实验 1 | 2
+
+function resetExp1() {
+  exp1.running = false; exp1.time = 0;
+  exp1.announcedMetal = false; exp1.announcedSlow = false;
+  for (const sp of exp1.spoons) { sp.T.fill(ROOM_T); sp.dot = 0; }
+}
+function resetExp2() {
+  exp2.running = false; exp2.time = 0; exp2.announced = false;
+  exp2.bar.fill(ROOM_T);
+  for (const w of exp2.waxes) { w.slot = -1; w.melt = 0; w.done = false; }
+  exp2.drips = [];
+}
+
+/* ---- 布局（随窗口变化） ---- */
+function slotX(s) { return W / 2 + (s - 1) * Math.min(190, W * 0.24); }
+function handleTop() { return H * 0.22; }
+function cupTop() { return H * 0.46; }
+function cupH() { return H * 0.24; }
+function handleBot() { return cupTop() + cupH() * 0.42; }
+function barX1() { return W * 0.16; }
+function barX2() { return W * 0.84; }
+function barY() { return H * 0.40; }
+function waxSlotX(s) { return barX1() + (s + 0.5) * (barX2() - barX1()) / SLOTS; }
+function trayY() { return H * 0.84; }
+
+/* ================= 物理（热传导扩散模拟） ================= */
+function stepExp1(dt) {
+  if (!exp1.running) return;
+  exp1.time += dt;
+  for (const sp of exp1.spoons) {
+    const T = sp.T;
+    // 水中的勺头快速趋近水温
+    T[0] += (WATER_T - T[0]) * Math.min(1, 3 * dt);
+    // 沿勺柄扩散（显式差分，子步进保稳定）
+    const sub = 30, h = dt / sub;
+    for (let s = 0; s < sub; s++) {
+      for (let i = 1; i < N - 1; i++)
+        T[i] += sp.rate * h * (T[i - 1] + T[i + 1] - 2 * T[i]);
+      T[N - 1] += sp.rate * h * (T[N - 2] - T[N - 1]);   // 顶端绝热
+    }
+    // 热量小圆点沿勺柄爬升，速度体现导热快慢
+    sp.dot = (sp.dot + dt * Math.sqrt(sp.rate) * 0.10) % 1;
+  }
+  const metal = exp1.spoons.find(s => s.key === "metal");
+  if (!exp1.announcedMetal && metal.T[N - 1] >= 45) {
+    exp1.announcedMetal = true;
+    showHint("🔥 金属勺传热最快！勺柄顶端都烫手啦");
+    fanfare();
+  }
+  const slow = exp1.spoons.filter(s => s.key !== "metal");
+  if (!exp1.announcedSlow && slow.every(s => s.T[N - 1] >= 45)) {
+    exp1.announcedSlow = true;
+    showHint("木勺和塑料勺也终于热了——它们传热慢得多！");
+    fanfare();
+  }
+}
+
+function stepExp2(dt) {
+  // 蜡滴下落（不加热时也要动画）
+  for (let i = exp2.drips.length - 1; i >= 0; i--) {
+    const d = exp2.drips[i];
+    d.vy += 900 * dt; d.y += d.vy * dt; d.a -= dt * 0.5;
+    if (d.y > H * 0.97 || d.a <= 0) exp2.drips.splice(i, 1);
+  }
+  if (!exp2.running) return;
+  exp2.time += dt;
+  const B = exp2.bar;
+  // 两端火焰温度在 1.5s 内升到 100°C
+  const endT = ROOM_T + (100 - ROOM_T) * Math.min(1, exp2.time / 1.5);
+  B[0] = endT; B[M - 1] = endT;
+  const sub = 40, h = dt / sub, RATE = 25;
+  for (let s = 0; s < sub; s++)
+    for (let i = 1; i < M - 1; i++)
+      B[i] += RATE * h * (B[i - 1] + B[i + 1] - 2 * B[i]);
+  // 蜡粒受热融化滴落
+  for (const w of exp2.waxes) {
+    if (w.slot < 0 || w.done) continue;
+    const node = Math.round((w.slot + 0.5) / SLOTS * (M - 1));
+    if (B[node] > 50) {
+      w.melt += dt / 1.5;
+      if (w.melt >= 1) {
+        w.done = true;
+        const x = waxSlotX(w.slot);
+        for (let k = 0; k < 3; k++)
+          exp2.drips.push({ x: x + (k - 1) * 6, y: barY() + 14, vy: 20, a: 1 });
+        pop(300 + Math.random() * 200);
+      }
+    }
+  }
+  const placed = exp2.waxes.filter(w => w.slot >= 0);
+  if (!exp2.announced && placed.length > 0 && placed.every(w => w.done)) {
+    exp2.announced = true;
+    showHint("🕯️ 热从两端同时传向中间，蜡粒从外到内依次融化！");
+    fanfare();
+  }
+}
+
+/* ================= 绘制 ================= */
+function drawBackground() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#22304a"); g.addColorStop(1, "#16202e");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 桌面
+  ctx.fillStyle = "#3a2c20";
+  ctx.fillRect(0, H * 0.78, W, H * 0.22);
+  ctx.fillStyle = "rgba(255,255,255,0.05)";
+  ctx.fillRect(0, H * 0.78, W, 4);
+}
+
+/* ---- 实验一绘制 ---- */
+function drawSteam(cx, top, t) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,0.35)";
+  ctx.lineWidth = 3; ctx.lineCap = "round";
+  for (let k = -1; k <= 1; k++) {
+    ctx.beginPath();
+    const bx = cx + k * 46;
+    for (let i = 0; i <= 10; i++) {
+      const y = top - 14 - i * 7;
+      const x = bx + Math.sin(t * 2 + i * 0.7 + k * 2) * 8 * (i / 10);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    ctx.globalAlpha = 0.5 - k * k * 0.1;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawThermometer(x, y, t, name) {
+  // 温度柱比例
+  const u = Math.max(0, Math.min(1, (t - ROOM_T) / (WATER_T - ROOM_T)));
+  const stemH = 46, stemW = 8;
+  ctx.save();
+  ctx.translate(x, y);
+  // 玻璃管
+  ctx.fillStyle = "rgba(230,240,255,0.9)";
+  roundRect(-stemW / 2, -stemH, stemW, stemH + 4, 4, true);
+  ctx.beginPath(); ctx.arc(0, 6, 10, 0, 7); ctx.fill();
+  // 红色液柱
+  ctx.fillStyle = "#ff3b30";
+  const colH = u * (stemH - 4);
+  if (colH > 1) ctx.fillRect(-stemW / 2 + 2, -4 - colH, stemW - 4, colH + 10);
+  ctx.beginPath(); ctx.arc(0, 6, 6.5, 0, 7); ctx.fill();
+  // 读数
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(Math.round(t) + "°C", 0, 32);
+  ctx.restore();
+  // 名字标签
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 18px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(name, x, y - stemH - 18);
+}
+
+function drawSpoon(sp, t) {
+  const x = slotX(sp.slot);
+  const yT = handleTop(), yB = handleBot();
+  const T = sp.T;
+  ctx.save();
+  // 勺头（水中椭圆）
+  ctx.beginPath(); ctx.ellipse(x, yB + 22, 17, 24, 0, 0, 7);
+  ctx.fillStyle = tempColor(T[0], ROOM_T, WATER_T);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 2; ctx.stroke();
+  // 勺柄：逐段按节点温度上色
+  ctx.lineCap = "butt";
+  ctx.lineWidth = 16;
+  for (let i = 0; i < N - 1; i++) {
+    const y1 = yB - i * (yB - yT) / (N - 1);
+    const y2 = yB - (i + 1) * (yB - yT) / (N - 1);
+    ctx.strokeStyle = tempColor((T[i] + T[i + 1]) / 2, ROOM_T, WATER_T);
+    ctx.beginPath(); ctx.moveTo(x, y1); ctx.lineTo(x, y2); ctx.stroke();
+  }
+  // 勺柄描边 + 顶端圆头
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.ellipse(x, yT, 8, 8, 0, 0, 7); ctx.stroke();
+  // 爬升的热量小圆点
+  if (exp1.running) {
+    for (let k = 0; k < 3; k++) {
+      const p = (sp.dot + k / 3) % 1;
+      const y = yB - p * (yB - yT);
+      ctx.beginPath(); ctx.arc(x, y, 5, 0, 7);
+      ctx.fillStyle = `rgba(255,220,120,${0.85 * (1 - p * 0.6)})`;
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+  // 温度计
+  drawThermometer(x, yT - 34, T[N - 1], sp.name);
+  // 拖拽中的高亮
+  if (drag && drag.type === "spoon" && drag.sp === sp) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,213,74,0.9)"; ctx.lineWidth = 3;
+    ctx.setLineDash([6, 5]);
+    ctx.strokeRect(x - 34, yT - 96, 68, yB - yT + 130);
+    ctx.restore();
+  }
+}
+
+function drawCup(t) {
+  const cx = W / 2, top = cupTop(), ch = cupH();
+  const halfTop = Math.min(230, W * 0.3), halfBot = halfTop * 0.78;
+  // 杯身（梯形玻璃）
+  ctx.beginPath();
+  ctx.moveTo(cx - halfTop, top); ctx.lineTo(cx - halfBot, top + ch);
+  ctx.lineTo(cx + halfBot, top + ch); ctx.lineTo(cx + halfTop, top);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(190,225,255,0.16)"; ctx.fill();
+  // 热水（半透明，盖在勺子上）
+  const waterTop = top + ch * 0.14;
+  ctx.beginPath();
+  ctx.moveTo(cx - halfTop + 8, waterTop);
+  ctx.lineTo(cx - halfBot + 8, top + ch - 8);
+  ctx.lineTo(cx + halfBot - 8, top + ch - 8);
+  ctx.lineTo(cx + halfTop - 8, waterTop);
+  ctx.closePath();
+  const g = ctx.createLinearGradient(0, waterTop, 0, top + ch);
+  g.addColorStop(0, "rgba(255,120,60,0.75)");
+  g.addColorStop(1, "rgba(230,60,40,0.85)");
+  ctx.fillStyle = g; ctx.fill();
+  // 波动的水面
+  ctx.beginPath();
+  for (let i = 0; i <= 24; i++) {
+    const x = cx - halfTop + 8 + i * (2 * halfTop - 16) / 24;
+    const y = waterTop + Math.sin(t * 2.2 + i * 0.8) * 3;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  }
+  ctx.strokeStyle = "rgba(255,200,160,0.9)"; ctx.lineWidth = 3; ctx.stroke();
+  // 杯口描边
+  ctx.beginPath();
+  ctx.moveTo(cx - halfTop, top); ctx.lineTo(cx - halfBot, top + ch);
+  ctx.lineTo(cx + halfBot, top + ch); ctx.lineTo(cx + halfTop, top);
+  ctx.strokeStyle = "rgba(220,240,255,0.6)"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("热水 " + WATER_T + "°C", cx, top + ch + 26);
+  drawSteam(cx - halfTop * 0.55, top, t);
+  drawSteam(cx + halfTop * 0.55, top, t + 3);
+}
+
+function drawExp1(t) {
+  // 先画勺子，再画杯子（水面半透明盖住勺头）
+  for (const sp of exp1.spoons) drawSpoon(sp, t);
+  drawCup(t);
+}
+
+/* ---- 实验二绘制 ---- */
+function drawFlame(x, y, t, on) {
+  if (!on) return;
+  const f = 1 + Math.sin(t * 13 + x) * 0.15;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(f, f);
+  // 外焰
+  ctx.beginPath();
+  ctx.moveTo(0, -34);
+  ctx.quadraticCurveTo(16, -10, 0, 0);
+  ctx.quadraticCurveTo(-16, -10, 0, -34);
+  ctx.fillStyle = "rgba(255,120,30,0.9)"; ctx.fill();
+  // 内焰
+  ctx.beginPath();
+  ctx.moveTo(0, -20);
+  ctx.quadraticCurveTo(8, -6, 0, 0);
+  ctx.quadraticCurveTo(-8, -6, 0, -20);
+  ctx.fillStyle = "rgba(255,220,80,0.95)"; ctx.fill();
+  ctx.restore();
+}
+
+function drawBar() {
+  const x1 = barX1(), x2 = barX2(), y = barY(), th = 24;
+  // 逐段按温度上色
+  for (let i = 0; i < M - 1; i++) {
+    const xa = x1 + i * (x2 - x1) / (M - 1);
+    const xb = x1 + (i + 1) * (x2 - x1) / (M - 1);
+    ctx.strokeStyle = tempColor((exp2.bar[i] + exp2.bar[i + 1]) / 2, ROOM_T, 100);
+    ctx.lineWidth = th;
+    ctx.beginPath(); ctx.moveTo(xa, y); ctx.lineTo(xb + 1, y); ctx.stroke();
+  }
+  // 边框与支架
+  ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 2;
+  roundRect(x1, y - th / 2, x2 - x1, th, 10, false);
+  ctx.stroke();
+  ctx.fillStyle = "#5a4a3a";
+  ctx.fillRect(x1 - 10, y + th / 2, 14, H * 0.78 - y - th / 2);
+  ctx.fillRect(x2 - 4, y + th / 2, 14, H * 0.78 - y - th / 2);
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("金属条", (x1 + x2) / 2, y + th / 2 + 22);
+}
+
+function drawWax(t) {
+  // 托盘
+  const ty = trayY();
+  ctx.fillStyle = "rgba(255,255,255,0.08)";
+  roundRect(W / 2 - 220, ty - 30, 440, 62, 16, true);
+  ctx.fillStyle = "rgba(255,255,255,0.7)";
+  ctx.font = "15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("蜡粒托盘：把蜡粒拖到金属条上", W / 2, ty + 52);
+  // 托盘里的蜡粒
+  let ti = 0;
+  for (const w of exp2.waxes) {
+    if (w.slot >= 0) continue;
+    if (drag && drag.type === "wax" && drag.wax === w) continue;
+    drawWaxDot(W / 2 - 165 + ti * 66, ty, 0);
+    ti++;
+  }
+  // 金属条上的蜡粒（融化时摊平）
+  for (const w of exp2.waxes) {
+    if (w.slot < 0 || w.done) continue;
+    if (drag && drag.type === "wax" && drag.wax === w) continue;
+    drawWaxDot(waxSlotX(w.slot), barY() - 14, w.melt);
+  }
+  // 滴落的蜡
+  for (const d of exp2.drips) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, d.a);
+    ctx.beginPath(); ctx.ellipse(d.x, d.y, 5, 8, 0, 0, 7);
+    ctx.fillStyle = "#ffe9b0"; ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawWaxDot(x, y, melt) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(1 + melt * 0.8, 1 - melt * 0.7);
+  ctx.beginPath(); ctx.arc(0, 0, 15, 0, 7);
+  ctx.fillStyle = "#ffe9b0"; ctx.fill();
+  ctx.strokeStyle = "rgba(150,110,40,0.6)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.beginPath(); ctx.arc(-4, -5, 4.5, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.fill();
+  ctx.restore();
+}
+
+function drawExp2(t) {
+  drawBar();
+  if (exp2.running) {
+    // 火光灯罩底座
+    ctx.fillStyle = "#444";
+    ctx.fillRect(barX1() - 14, barY() + 46, 28, 10);
+    ctx.fillRect(barX2() - 14, barY() + 46, 28, 10);
+  }
+  // 两端火焰（画在支架上层，加热时）
+  drawFlame(barX1(), barY() + 46, t, exp2.running);
+  drawFlame(barX2(), barY() + 46, t + 1, exp2.running);
+  drawWax(t);
+}
+
+function draw(t) {
+  drawBackground();
+  if (exp === 1) drawExp1(t); else drawExp2(t);
+  // 拖拽中的物体画在最上层
+  if (drag && drag.type === "spoon") {
+    const sp = drag.sp;
+    ctx.save();
+    ctx.globalAlpha = 0.35;
+    ctx.beginPath(); ctx.arc(drag.x, drag.y, 40, 0, 7);
+    ctx.fillStyle = "#ffd54a"; ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = "#fff"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(sp.name, drag.x, drag.y + 5);
+  } else if (drag && drag.type === "wax") {
+    drawWaxDot(drag.x, drag.y, 0);
+  }
+}
+
+/* ================= 交互 ================= */
+let drag = null;   // {type:'spoon',sp} | {type:'wax',wax}
+
+canvas.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  if (exp === 1) {
+    for (const sp of exp1.spoons) {
+      const sx = slotX(sp.slot);
+      if (Math.abs(x - sx) < 46 && y > handleTop() - 110 && y < handleBot() + 50) {
+        drag = { type:"spoon", sp, x, y };
+        canvas.setPointerCapture(e.pointerId);
+        pop(500);
+        return;
+      }
+    }
+  } else {
+    // 托盘上的蜡粒
+    let ti = 0;
+    for (const w of exp2.waxes) {
+      if (w.slot >= 0) continue;
+      const wx = W / 2 - 165 + ti * 66;
+      if (Math.hypot(x - wx, y - trayY()) < 34) { drag = { type:"wax", wax:w, x, y }; canvas.setPointerCapture(e.pointerId); pop(500); return; }
+      ti++;
+    }
+    // 金属条上还没融化的蜡粒（可拿回）
+    for (const w of exp2.waxes) {
+      if (w.slot < 0 || w.done || w.melt > 0) continue;
+      if (Math.hypot(x - waxSlotX(w.slot), y - (barY() - 14)) < 34) { drag = { type:"wax", wax:w, x, y }; canvas.setPointerCapture(e.pointerId); pop(500); return; }
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  drag.x = e.clientX; drag.y = e.clientY;
+});
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  const x = e.clientX, y = e.clientY;
+  if (drag.type === "spoon") {
+    // 交换槽位
+    const spacing = Math.min(190, W * 0.24);
+    const target = Math.max(0, Math.min(2, Math.round((x - W / 2) / spacing) + 1));
+    const other = exp1.spoons.find(s => s.slot === target);
+    if (other && other !== drag.sp) { other.slot = drag.sp.slot; drag.sp.slot = target; pop(700); }
+  } else if (drag.type === "wax") {
+    const w = drag.wax;
+    if (Math.abs(y - barY()) < 70 && x > barX1() - 20 && x < barX2() + 20) {
+      // 吸附到最近的空槽
+      const s = Math.max(0, Math.min(SLOTS - 1, Math.floor((x - barX1()) / (barX2() - barX1()) * SLOTS)));
+      if (!exp2.waxes.some(o => o !== w && o.slot === s)) {
+        w.slot = s;
+        pop(800);
+        showHint("放好啦！点“开始加热”，看蜡粒谁先融化");
+      }
+    } else if (w.slot >= 0) {
+      w.slot = -1;   // 放回托盘
+      pop(400);
+    }
+  }
+  drag = null;
+});
+
+/* ---- 按钮 ---- */
+function refreshUI() {
+  tab1.classList.toggle("on", exp === 1);
+  tab2.classList.toggle("on", exp === 2);
+  const running = exp === 1 ? exp1.running : exp2.running;
+  startBtn.disabled = running;
+  startBtn.textContent = running ? "🔥 加热中…" : "▶ 开始加热";
+  scorebar.textContent = exp === 1 ? "实验一 · 哪种勺子传热最快？" : "实验二 · 热沿着金属条往哪传？";
+}
+tab1.addEventListener("click", () => { if (exp !== 1) { exp = 1; refreshUI(); showHint("按住勺子可以左右拖动交换位置哦"); pop(600); } });
+tab2.addEventListener("click", () => { if (exp !== 2) { exp = 2; refreshUI(); showHint("先把蜡粒拖到金属条上，再点开始加热"); pop(600); } });
+startBtn.addEventListener("click", () => {
+  if (exp === 1 && !exp1.running) {
+    exp1.running = true;
+    showHint("看！热量正沿着勺柄往上爬，盯住温度计");
+    tone(660, 0.2, 0.12);
+  } else if (exp === 2 && !exp2.running) {
+    exp2.running = true;
+    showHint(exp2.waxes.some(w => w.slot >= 0) ? "两端的火点着了！热量向中间传" : "也可以先把蜡粒拖到金属条上哦");
+    tone(660, 0.2, 0.12);
+  }
+  refreshUI();
+});
+resetBtn.addEventListener("click", () => {
+  if (exp === 1) { resetExp1(); showHint("已冷却，可以再来一次"); }
+  else { resetExp2(); showHint("已重置，重新摆蜡粒吧"); }
+  pop(880);
+  refreshUI();
+});
+refreshUI();
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 主循环 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+setTimeout(() => { hintEl.style.opacity = "0"; }, 6000);
+
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  stepExp1(dt);
+  stepExp2(dt);
+  draw(now / 1000);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 测试钩子 ================= */
+window.__ht = { exp1, exp2, stepExp1, stepExp2, N, M,
+  get exp() { return exp; },
+  setExp(v) { exp = v; refreshUI(); } };
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

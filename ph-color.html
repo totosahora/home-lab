@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>pH 调色师 · 彩虹比色</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#dff1fb; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,90,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,90,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:20px;
+    background:rgba(10,40,70,0.55);
+  }
+  #winPanel .msg {
+    font-size:34px; font-weight:bold; color:#ffd54a; line-height:1.7;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; padding:0 20px;
+  }
+  #winPanel .msg small { font-size:19px; color:#fff; font-weight:normal; }
+  #rainbowWrap { width:min(640px, 88vw); }
+  #rainbow { width:100%; height:44px; border-radius:12px; box-shadow:0 4px 12px rgba(0,0,0,0.4); }
+  #rainbowWrap .zones { display:flex; margin-top:8px; font-size:15px; font-weight:bold; color:#fff; text-shadow:0 1px 3px rgba(0,0,0,0.7); }
+  #rainbowWrap .zones span { text-align:center; }
+  #rainbowWrap .zones span:nth-child(1) { width:46.6%; }
+  #rainbowWrap .zones span:nth-child(2) { width:6.8%; font-size:12px; }
+  #rainbowWrap .zones span:nth-child(3) { width:46.6%; }
+  #rainbowWrap .ticks { display:flex; justify-content:space-between; font-size:13px; color:#cfe8ff; margin-top:2px; }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🧪 已测 0 / 8</div>
+<div id="hint">把左下角的 pH 试纸拖进试剂瓶里蘸一蘸，看它变成什么颜色！</div>
+<div id="winPanel">
+  <div class="msg">🌈 全部测完啦！<br><small>你用试纸画出了一条完整的 pH 彩虹</small></div>
+  <div id="rainbowWrap">
+    <div id="rainbow"></div>
+    <div class="zones"><span>酸性区 pH&lt;7</span><span>中性</span><span>碱性区 pH&gt;7</span></div>
+    <div class="ticks"><span>0</span><span>7</span><span>14</span></div>
+  </div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  computeLayout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 通用指示剂 pH 0-14 标准比色：红→橙→黄→绿→蓝→紫
+const PH_COLORS = ["#e53935","#ef3b32","#f4511e","#fb8c00","#ffb300",
+                   "#fdd835","#c6d92e","#43a047","#26a69a","#29b6f6",
+                   "#1e88e5","#3949ab","#5e35b1","#8e24aa","#6a1b9a"];
+function phColor(ph) { return PH_COLORS[Math.max(0, Math.min(14, Math.round(ph)))]; }
+function acidWord(ph) { return ph < 7 ? "酸性" : ph > 7 ? "碱性" : "中性"; }
+
+const SOLUTIONS = [
+  { name:"洁厕灵",     emoji:"🚽", ph:1,  approx:true,  liquid:"#8fd0f0" }, // 含盐酸，强酸
+  { name:"白醋",       emoji:"🍶", ph:2,  approx:true,  liquid:"#f7f3df" }, // 醋酸
+  { name:"雪碧",       emoji:"🥤", ph:3,  approx:true,  liquid:"#eef7ee" }, // 碳酸+柠檬酸
+  { name:"纯水",       emoji:"💧", ph:7,  approx:false, liquid:"#e4f2fb" },
+  { name:"食盐水",     emoji:"🧂", ph:7,  approx:false, liquid:"#eef5f7" }, // 中性盐溶液
+  { name:"小苏打水",   emoji:"🥛", ph:8,  approx:true,  liquid:"#f4f4ec" }, // 碳酸氢钠，弱碱
+  { name:"肥皂水",     emoji:"🧼", ph:10, approx:true,  liquid:"#f2f2e6" },
+  { name:"炉具清洁剂", emoji:"🔥", ph:13, approx:true,  liquid:"#dfe9f0" }  // 含氢氧化钠，强碱
+];
+
+let bottles = [];       // {sol, cx, top, bw, bh, tested, labelT}
+let measured = [];      // 比色画廊卡片 {sol, order, x, y, tx, ty}
+let testedCount = 0;
+let bubbles = [];       // 蘸取气泡 {x, y, r, life, bIdx}
+let particles = [];     // 庆祝彩纸 {x, y, vx, vy, rot, vr, color, life}
+let winCountdown = -1;  // 全部测完后的庆祝倒计时（帧）
+let done = false;
+
+const PAPER_W = 34, PAPER_H = 140;
+const paper = { x:0, y:0, hx:0, hy:0, drag:false, prog:0, dipB:-1 };
+
+function resetGame() {
+  bottles = SOLUTIONS.map(s => ({ sol:s, cx:0, top:0, bw:0, bh:0, tested:false, labelT:0 }));
+  measured = []; testedCount = 0;
+  bubbles = []; particles = [];
+  winCountdown = -1; done = false;
+  paper.drag = false; paper.prog = 0; paper.dipB = -1;
+  winPanel.style.display = "none";
+  computeLayout();
+  paper.x = paper.hx; paper.y = paper.hy;
+  updateScore();
+}
+function updateScore() { scorebar.textContent = `🧪 已测 ${testedCount} / ${SOLUTIONS.length}`; }
+
+/* ================= 布局 ================= */
+let benchY = 0;                       // 实验台面 y
+let gal = { x0:0, y:0, cw:0, ch:0 };  // 比色画廊
+let box = { x:0, y:0, w:0, h:0 };     // 试纸盒
+
+function computeLayout() {
+  if (!bottles.length) return;
+  benchY = H - 250;
+  const cellW = W / bottles.length;
+  const bw = Math.min(100, cellW - 14);
+  const bh = Math.min(180, Math.max(120, benchY - 150));
+  bottles.forEach((b, i) => {
+    b.cx = cellW * (i + 0.5);
+    b.top = benchY - bh;
+    b.bw = bw; b.bh = bh;
+  });
+  // 试纸盒：左下角台面上
+  box.w = 112; box.h = 150;
+  box.x = 16; box.y = H - 236;
+  paper.hx = box.x + box.w / 2; paper.hy = box.y + 14;
+  if (!paper.drag) { paper.x = paper.hx; paper.y = paper.hy; }
+  // 比色画廊：台面下缘一排卡槽
+  gal.ch = 100;
+  gal.cw = Math.min(80, (W - box.w - 70) / 8 - 8);
+  const gap = Math.min(12, (W - box.w - 70 - gal.cw * 8) / 7);
+  gal.gap = Math.max(4, gap);
+  gal.x0 = box.x + box.w + 18 + ((W - (box.x + box.w + 18) - 12) - (gal.cw * 8 + gal.gap * 7)) / 2;
+  gal.y = H - 172;
+  layoutGallery();
+}
+// 画廊按 pH 从小到大排序（酸性在左，碱性在右）
+function layoutGallery() {
+  const sorted = measured.slice().sort((a, b) => a.sol.ph - b.sol.ph || a.order - b.order);
+  sorted.forEach((m, i) => {
+    m.tx = gal.x0 + i * (gal.cw + gal.gap);
+    m.ty = gal.y;
+  });
+}
+function liquidRect(b) {
+  return { x0:b.cx - b.bw / 2 + 7, x1:b.cx + b.bw / 2 - 7,
+           y0:b.top + b.bh * 0.32, y1:b.top + b.bh - 8 };
+}
+
+/* ================= 交互：拖试纸蘸取 ================= */
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  // 点到试纸（上半部分为手持区，判定放宽）
+  if (Math.abs(e.clientX - paper.x) < PAPER_W && e.clientY > paper.y - 14 && e.clientY < paper.y + PAPER_H) {
+    paper.drag = true;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    hintEl.style.opacity = "0";
+    pop(660);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!paper.drag) return;
+  paper.x = e.clientX;
+  paper.y = Math.max(60, e.clientY - 16);   // 手指捏住试纸顶端
+  // 试纸尖是否伸进某瓶液面下
+  const tipX = paper.x, tipY = paper.y + PAPER_H;
+  paper.dipB = -1;
+  for (let i = 0; i < bottles.length; i++) {
+    const r = liquidRect(bottles[i]);
+    if (tipX > r.x0 && tipX < r.x1 && tipY > r.y0 + 4 && tipY < r.y1 + 30) { paper.dipB = i; break; }
+  }
+});
+window.addEventListener("pointerup", () => {
+  if (!paper.drag) return;
+  paper.drag = false;
+  if (paper.dipB >= 0 && bottles[paper.dipB].tested) showHint("这瓶已经测过啦，看它头上的标签！");
+  paper.dipB = -1;
+});
+
+function completeDip(i) {
+  const b = bottles[i];
+  b.tested = true; b.labelT = 0;
+  testedCount++;
+  measured.push({ sol:b.sol, order:measured.length, x:b.cx - gal.cw / 2, y:b.top + b.bh * 0.4, tx:0, ty:0 });
+  layoutGallery();
+  paper.drag = false; paper.dipB = -1; paper.prog = 0;
+  paper.x = paper.hx; paper.y = paper.hy;
+  pop(440 + b.sol.ph * 40);
+  showHint(`${b.sol.name}：pH ${b.sol.approx ? "≈" : "="} ${b.sol.ph}，${acidWord(b.sol.ph)}！`);
+  updateScore();
+  if (testedCount === SOLUTIONS.length) winCountdown = 50;   // 等卡片飞进画廊再庆祝
+}
+
+function showWin() {
+  done = true;
+  document.getElementById("rainbow").style.background =
+    "linear-gradient(90deg," + PH_COLORS.map((c, i) => `${c} ${(i / 14 * 100).toFixed(1)}%`).join(",") + ")";
+  winPanel.style.display = "flex";
+  fanfare();
+  // 彩纸礼花：pH 彩虹的颜色
+  for (let k = 0; k < 140; k++) {
+    particles.push({
+      x: W / 2 + (Math.random() - 0.5) * 240, y: H * 0.3,
+      vx: (Math.random() - 0.5) * 520, vy: -Math.random() * 420 - 60,
+      rot: Math.random() * 7, vr: (Math.random() - 0.5) * 12,
+      color: PH_COLORS[k % 15], life: 2.6 + Math.random()
+    });
+  }
+}
+
+/* ================= 主更新 ================= */
+function update(dt) {
+  // 蘸取进度：试纸尖在液面下逐渐变色
+  if (paper.drag && paper.dipB >= 0) {
+    const b = bottles[paper.dipB];
+    if (!b.tested) {
+      paper.prog = Math.min(1, paper.prog + dt / 0.9);
+      if (Math.random() < dt * 14) {   // 冒小气泡
+        const r = liquidRect(b);
+        bubbles.push({ x:paper.x + (Math.random() - 0.5) * 18, y:r.y1 - 6,
+                       r:2 + Math.random() * 3, life:0.8, bIdx:paper.dipB });
+        if (Math.random() < 0.3) blip();
+      }
+      if (paper.prog >= 1) completeDip(paper.dipB);
+    }
+  } else {
+    paper.prog = Math.max(0, paper.prog - dt * 1.4);   // 没蘸够就慢慢褪色，可以再蘸
+  }
+  // 试纸回家
+  if (!paper.drag) {
+    paper.x += (paper.hx - paper.x) * Math.min(1, dt * 12);
+    paper.y += (paper.hy - paper.y) * Math.min(1, dt * 12);
+  }
+  // 气泡上升
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const u = bubbles[i];
+    u.y -= 40 * dt; u.life -= dt;
+    if (u.life <= 0) bubbles.splice(i, 1);
+  }
+  // 画廊卡片飞入卡槽
+  for (const m of measured) {
+    m.x += (m.tx - m.x) * Math.min(1, dt * 6);
+    m.y += (m.ty - m.y) * Math.min(1, dt * 6);
+  }
+  // 标签弹出动画
+  for (const b of bottles) if (b.tested && b.labelT < 1) b.labelT = Math.min(1, b.labelT + dt * 2.2);
+  // 彩纸
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.vy += 620 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.rot += p.vr * dt; p.life -= dt;
+    if (p.life <= 0 || p.y > H + 30) particles.splice(i, 1);
+  }
+  // 胜利倒计时
+  if (winCountdown > 0 && --winCountdown === 0) showWin();
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+function easeOutBack(t) { const c = 1.70158; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); }
+// 白色渐变为目标 pH 色
+function mixWhite(hex, t) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  return `rgb(${Math.round(255 + (r - 255) * t)},${Math.round(255 + (g - 255) * t)},${Math.round(255 + (b - 255) * t)})`;
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#cdeafb"); g.addColorStop(1, "#f4fbff");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 实验台
+  ctx.fillStyle = "#c89b6d"; ctx.fillRect(0, benchY, W, H - benchY);
+  ctx.fillStyle = "#a87c4f"; ctx.fillRect(0, benchY, W, 10);
+  ctx.fillStyle = "rgba(255,255,255,0.25)"; ctx.fillRect(0, benchY + 10, W, 4);
+}
+
+function drawBottle(b, i) {
+  const x = b.cx - b.bw / 2, y = b.top, w = b.bw, h = b.bh;
+  const dipping = paper.drag && paper.dipB === i;
+  ctx.save();
+  if (dipping) { ctx.shadowColor = "rgba(255,213,74,0.9)"; ctx.shadowBlur = 24; }
+  // 玻璃瓶身
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  roundRect(x, y, w, h, 14, true);
+  // 液体
+  const r = liquidRect(b);
+  ctx.save();
+  roundRect(x + 4, y + 6, w - 8, h - 10, 11, false);
+  ctx.clip();
+  ctx.fillStyle = b.sol.liquid;
+  ctx.fillRect(x + 4, r.y0, w - 8, y + h - r.y0);
+  // 液面高光
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  ctx.fillRect(x + 4, r.y0, w - 8, 4);
+  // 蘸取时的气泡
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  for (const u of bubbles) if (u.bIdx === i) {
+    ctx.globalAlpha = Math.min(1, u.life * 2);
+    ctx.beginPath(); ctx.arc(u.x, u.y, u.r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+  // 瓶口与瓶盖
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.fillRect(b.cx - w * 0.2, y - 14, w * 0.4, 16);
+  ctx.fillStyle = dipping ? "#ffd54a" : "#607d8b";
+  roundRect(b.cx - w * 0.24, y - 26, w * 0.48, 14, 5, true);
+  // 瓶身边框与高光
+  ctx.strokeStyle = "rgba(70,100,120,0.55)"; ctx.lineWidth = 2.5;
+  roundRect(x, y, w, h, 14, false); ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  ctx.fillRect(x + 8, y + 12, 6, h - 30);
+  // 瓶身 emoji 与名称贴纸（贴在液面上方，不与台面元素重叠）
+  ctx.font = `${Math.round(w * 0.3)}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(b.sol.emoji, b.cx, y + h * 0.18);
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  roundRect(b.cx - w / 2 + 6, y + h * 0.6, w - 12, 26, 8, true);
+  ctx.font = `bold ${Math.round(Math.min(15, w * 0.17))}px sans-serif`;
+  ctx.fillStyle = "#3d2c18";
+  ctx.fillText(b.sol.name, b.cx, y + h * 0.6 + 13);
+  // 测过后贴上 pH 标签
+  if (b.tested) {
+    const s = easeOutBack(b.labelT);
+    ctx.save();
+    ctx.translate(b.cx, y - 46); ctx.scale(s, s);
+    ctx.fillStyle = phColor(b.sol.ph);
+    roundRect(-44, -17, 88, 34, 17, true);
+    ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 2.5;
+    roundRect(-44, -17, 88, 34, 17, false); ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 17px sans-serif";
+    ctx.fillText(`pH ${b.sol.approx ? "≈" : "="} ${b.sol.ph}`, 0, 1);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawPaperBox() {
+  ctx.fillStyle = "#ffffff";
+  roundRect(box.x, box.y, box.w, box.h, 12, true);
+  ctx.strokeStyle = "rgba(70,100,120,0.4)"; ctx.lineWidth = 2;
+  roundRect(box.x, box.y, box.w, box.h, 12, false); ctx.stroke();
+  ctx.fillStyle = "#40607a";
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("pH 试纸", box.x + box.w / 2, box.y + box.h - 18);
+}
+
+function drawPaper() {
+  const dipping = paper.drag && paper.dipB >= 0 && !bottles[paper.dipB].tested;
+  ctx.save();
+  ctx.translate(paper.x, paper.y);
+  if (paper.drag) ctx.rotate(dipping ? 0.04 : Math.sin(performance.now() / 300) * 0.03);
+  // 试纸本体
+  ctx.fillStyle = "#fdfdf6";
+  roundRect(-PAPER_W / 2, 0, PAPER_W, PAPER_H, 5, true);
+  ctx.strokeStyle = "rgba(120,120,90,0.5)"; ctx.lineWidth = 1.5;
+  roundRect(-PAPER_W / 2, 0, PAPER_W, PAPER_H, 5, false); ctx.stroke();
+  // 蘸取端：随进度渐变为对应 pH 颜色
+  if (paper.prog > 0 && paper.dipB >= 0) {
+    const target = phColor(bottles[paper.dipB].sol.ph);
+    const dipH = PAPER_H * 0.55;
+    ctx.fillStyle = mixWhite(target, 0.25 + 0.75 * paper.prog);
+    ctx.save();
+    roundRect(-PAPER_W / 2, 0, PAPER_W, PAPER_H, 5, false); ctx.clip();
+    ctx.fillRect(-PAPER_W / 2, PAPER_H - dipH * (0.3 + 0.7 * paper.prog), PAPER_W, dipH);
+    ctx.restore();
+  }
+  // 手持端标记
+  ctx.fillStyle = "#90a4ae";
+  ctx.fillRect(-PAPER_W / 2 + 4, 8, PAPER_W - 8, 5);
+  ctx.restore();
+}
+
+function drawGallery() {
+  // 标题
+  ctx.fillStyle = "rgba(61,44,24,0.75)";
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("比色画廊（酸性 ← → 碱性）", gal.x0, gal.y - 14);
+  // 空卡槽
+  ctx.setLineDash([6, 5]);
+  ctx.strokeStyle = "rgba(61,44,24,0.35)"; ctx.lineWidth = 2;
+  for (let i = 0; i < SOLUTIONS.length; i++)
+    roundRect(gal.x0 + i * (gal.cw + gal.gap), gal.y, gal.cw, gal.ch, 10, false), ctx.stroke();
+  ctx.setLineDash([]);
+  // 已测卡片
+  for (const m of measured) {
+    const c = phColor(m.sol.ph);
+    ctx.save();
+    ctx.translate(m.x, m.y);
+    ctx.fillStyle = "#ffffff";
+    roundRect(0, 0, gal.cw, gal.ch, 10, true);
+    ctx.strokeStyle = "rgba(0,0,0,0.15)"; ctx.lineWidth = 1.5;
+    roundRect(0, 0, gal.cw, gal.ch, 10, false); ctx.stroke();
+    // 上半：颜色带 + pH 值
+    ctx.fillStyle = c;
+    roundRect(4, 4, gal.cw - 8, gal.ch * 0.52, 7, true);
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 15px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(`${m.sol.approx ? "≈" : "="}${m.sol.ph}`, gal.cw / 2, 4 + gal.ch * 0.27);
+    // 下半：名称 + 酸碱性
+    ctx.fillStyle = "#3d2c18";
+    ctx.font = `bold ${Math.round(Math.min(13, gal.cw * 0.18))}px sans-serif`;
+    ctx.fillText(m.sol.name, gal.cw / 2, gal.ch * 0.72);
+    ctx.fillStyle = c;
+    ctx.font = "11px sans-serif";
+    ctx.fillText(acidWord(m.sol.ph), gal.cw / 2, gal.ch * 0.88);
+    ctx.restore();
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.save();
+    ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+    ctx.globalAlpha = Math.min(1, p.life);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawGallery();
+  drawPaperBox();
+  bottles.forEach(drawBottle);
+  drawPaper();
+  drawParticles();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const blip = () => tone(500 + Math.random() * 400, 0.06, 0.05, "triangle");
+function fanfare() { [523, 659, 784, 1047, 1319].forEach((f, i) => setTimeout(() => pop(f), i * 120)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+resize();
+resetGame();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

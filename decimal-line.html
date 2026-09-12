@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>小数数轴 · 气球定位</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#aee3ff; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,90,0.8); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; top:60px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,90,0.8); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #feedback {
+    position:absolute; left:50%; transform:translateX(-50%);
+    background:rgba(255,255,255,0.9); color:#1a3a6b; padding:10px 26px;
+    border-radius:26px; font-size:21px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; box-shadow:0 3px 10px rgba(0,0,0,0.15);
+    transition:color 0.15s, background 0.15s;
+  }
+  #feedback.ok { background:rgba(46,160,67,0.92); color:#fff; }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(10,30,60,0.45);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">第 1 / 2 波 · 🎈 0 / 10</div>
+<div id="hint">🎈 按住气球，拖到数轴上对应的位置再松手！（点我可隐藏）</div>
+<div id="feedback">把气球拖到数轴上试试吧！</div>
+<div id="winPanel">
+  <div class="msg">🎉 全部完成！<br>你是小数小达人！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const feedbackEl = document.getElementById("feedback");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 场景数据 ================= */
+// 数轴：0 到 2，0.1 小格、0.5 中格、整数大格
+let x0 = 0, x1 = 0, lineY = 0, hoverY = 0;
+const TOL = 0.05;   // 吸附容差（数值误差 < 0.05）
+
+function val2x(v) { return x0 + (v / 2) * (x1 - x0); }
+function x2val(px) { return Math.max(0, Math.min(2, (px - x0) / (x1 - x0) * 2)); }
+function formatVal(v) { return String(Math.round(v * 100) / 100); }
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  x0 = Math.max(50, W * 0.06); x1 = W - x0;
+  lineY = H * 0.68;
+  hoverY = H * 0.30;
+  feedbackEl.style.top = (lineY + 74) + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+// 两波气球数值：第 1 波一位/两位（0.05 倍数），第 2 波任意两位小数
+const WAVES = [
+  [0.5, 1.25, 0.8, 1.6, 0.3, 1.75, 0.15, 1.1, 1.9, 0.65],
+  [0.12, 0.47, 0.83, 1.06, 1.38, 1.71, 0.29, 0.94, 1.57, 1.88]
+];
+const COLORS = ["#ff6b6b","#ffa94d","#ffd43b","#69db7c","#4dabf7","#b197fc","#f783ac","#63e6be","#74c0fc","#e599f7"];
+const FW_COLORS = ["#ff5252","#ffd740","#69f0ae","#40c4ff","#e040fb","#ff9800"];
+
+let wave = 1, values = [], idx = 0, placedCount = 0;
+let cur = null;        // 当前活动气球 {v,x,y,vy,hoverX,state,animT,phase,color,...}
+let pinned = [];       // 已钉住气球 {v,x,y,color,alpha,leaving}
+let dragging = null;   // 正在拖的气球 {b, dx, dy}
+let sparks = [];       // 烟花粒子
+let clouds = [];
+let spawnT = 0, celebrateT = 0, fireT = 0, winT = 0;
+let tNow = 0;
+
+function shuffle(a) {
+  a = a.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+for (let i = 0; i < 5; i++)
+  clouds.push({ x: Math.random() * W, y: 40 + Math.random() * H * 0.2, s: 0.7 + Math.random() * 0.7, v: 6 + Math.random() * 10 });
+
+function resetGame() {
+  wave = 1; values = shuffle(WAVES[0]); idx = 0; placedCount = 0;
+  cur = null; pinned = []; sparks = []; dragging = null;
+  spawnT = 0.8; celebrateT = 0; winT = 0;
+  winPanel.style.display = "none";
+  setFeedback("把气球拖到数轴上试试吧！", null);
+  updateScore();
+}
+function updateScore() {
+  scorebar.textContent = `第 ${wave} / 2 波 · 🎈 ${placedCount} / 10`;
+}
+function setFeedback(text, ok) {
+  feedbackEl.textContent = text;
+  feedbackEl.classList.toggle("ok", ok === true);
+}
+
+/* ================= 气球流程 ================= */
+function nextBalloon() {
+  if (idx >= values.length) return;
+  const v = values[idx];
+  cur = {
+    v, color: COLORS[idx % COLORS.length],
+    x: 0, y: -80, vy: 60,
+    hoverX: 90 + Math.random() * Math.max(40, W - 180),
+    state: "falling", animT: 0, phase: Math.random() * 6.28,
+    fromX: 0, fromY: 0, returnT: 0
+  };
+  idx++;
+}
+
+function endDrag() {
+  if (!dragging) return;
+  const b = dragging.b;
+  dragging = null;
+  const placed = x2val(b.x);
+  if (Math.abs(placed - b.v) < TOL) {
+    // 吸附成功：钉在数轴上
+    pinned.push({ v: b.v, x: val2x(b.v), y: lineY - 66, color: b.color, alpha: 1, leaving: false });
+    placedCount++;
+    updateScore();
+    setFeedback(`你放在 ${formatVal(placed)} ✓ 气球钉住啦！`, true);
+    ding();
+    cur = null;
+    if (placedCount >= values.length) waveComplete();
+    else spawnT = 0.7;
+  } else {
+    // 偏差大：弹回（无惩罚）
+    b.state = "returning";
+    b.fromX = b.x; b.fromY = b.y; b.returnT = 0;
+    setFeedback(`你放在 ${formatVal(placed)}，还差一点点，再试试！`, false);
+    boing();
+  }
+}
+
+function waveComplete() {
+  fanfare();
+  celebrateT = 3.4; fireT = 0;
+  for (const p of pinned) p.leaving = true;
+  if (wave === 1) {
+    showHint("🎆 第 1 波全部放对！第 2 波是两位小数，更难哦！");
+    wave = 2; values = shuffle(WAVES[1]); idx = 0; placedCount = 0;
+    spawnT = 2.8;
+    updateScore();
+  } else {
+    showHint("🎆 第 2 波也全部放对！太棒了！");
+    winT = 3.0;
+  }
+}
+
+function burst(x, y) {
+  const col = FW_COLORS[Math.floor(Math.random() * FW_COLORS.length)];
+  for (let i = 0; i < 46; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 90 + Math.random() * 230;
+    sparks.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1, col });
+  }
+  crackle();
+}
+
+/* ================= 物理 / 动画步进 ================= */
+function step(dt) {
+  tNow += dt;
+  // 云
+  for (const c of clouds) {
+    c.x += c.v * dt;
+    if (c.x > W + 170) c.x = -170;
+  }
+  // 当前气球
+  const b = cur;
+  if (b && b !== (dragging && dragging.b)) {
+    b.animT += dt;
+    if (b.state === "falling") {
+      b.vy = Math.min(150, b.vy + 90 * dt);
+      b.y += b.vy * dt;
+      b.x = b.hoverX + Math.sin(b.animT * 2 + b.phase) * 16;
+      if (b.y >= hoverY) b.state = "hover";
+    } else if (b.state === "hover") {
+      b.y = hoverY + Math.sin(b.animT * 2.4) * 6;
+      b.x = b.hoverX + Math.sin(b.animT * 1.7 + b.phase) * 10;
+    } else if (b.state === "returning") {
+      b.returnT += dt / 0.45;
+      const t = Math.min(1, b.returnT), e = 1 - Math.pow(1 - t, 3);
+      b.x = b.fromX + (b.hoverX - b.fromX) * e;
+      b.y = b.fromY + (hoverY - b.fromY) * e;
+      if (t >= 1) { b.state = "hover"; b.animT = 0; }
+    }
+  }
+  // 一波结束后旧气球飞走
+  for (const p of pinned) {
+    if (p.leaving) { p.y -= 130 * dt; p.alpha -= dt * 0.8; }
+  }
+  pinned = pinned.filter(p => !p.leaving || p.alpha > 0);
+  // 烟花粒子
+  for (const s of sparks) {
+    s.vy += 260 * dt;
+    s.x += s.vx * dt; s.y += s.vy * dt;
+    s.life -= dt / 1.2;
+  }
+  sparks = sparks.filter(s => s.life > 0);
+  // 下一气球
+  if (spawnT > 0) {
+    spawnT -= dt;
+    if (spawnT <= 0) nextBalloon();
+  }
+  // 庆祝烟花
+  if (celebrateT > 0) {
+    celebrateT -= dt; fireT -= dt;
+    if (fireT <= 0) {
+      fireT = 0.32;
+      burst(W * (0.15 + Math.random() * 0.7), H * (0.12 + Math.random() * 0.3));
+    }
+  }
+  // 通关面板
+  if (winT > 0) {
+    winT -= dt;
+    if (winT <= 0) winPanel.style.display = "flex";
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#8fd3ff"); g.addColorStop(1, "#e8f7ff");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 太阳
+  ctx.save();
+  ctx.translate(W * 0.1, H * 0.12);
+  ctx.strokeStyle = "rgba(255,200,40,0.7)"; ctx.lineWidth = 4;
+  for (let i = 0; i < 8; i++) {
+    const a = i * Math.PI / 4 + tNow * 0.15;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * 42, Math.sin(a) * 42);
+    ctx.lineTo(Math.cos(a) * 56, Math.sin(a) * 56);
+    ctx.stroke();
+  }
+  ctx.beginPath(); ctx.arc(0, 0, 32, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  ctx.restore();
+  // 云
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  for (const c of clouds) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.scale(c.s, c.s);
+    ctx.beginPath();
+    ctx.arc(0, 0, 26, 0, 7);
+    ctx.arc(28, 6, 20, 0, 7);
+    ctx.arc(-28, 8, 18, 0, 7);
+    ctx.arc(8, -12, 20, 0, 7);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawNumberLine() {
+  // 拖拽时高亮数轴落区
+  if (dragging) {
+    ctx.fillStyle = "rgba(255,213,74,0.22)";
+    roundRect(x0 - 24, lineY - 40, (x1 - x0) + 48, 92, 18);
+    ctx.fill();
+  }
+  // 主线（带箭头）
+  ctx.strokeStyle = "#2a4a7f"; ctx.lineWidth = 6; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(x0 - 18, lineY); ctx.lineTo(x1 + 26, lineY); ctx.stroke();
+  ctx.fillStyle = "#2a4a7f";
+  ctx.beginPath();
+  ctx.moveTo(x1 + 42, lineY); ctx.lineTo(x1 + 22, lineY - 10); ctx.lineTo(x1 + 22, lineY + 10);
+  ctx.closePath(); ctx.fill();
+  // 刻度：0.1 小格、0.5 中格、整数大格
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let i = 0; i <= 20; i++) {
+    const v = i * 0.1, x = val2x(v);
+    let len, lw;
+    if (i % 10 === 0) { len = 26; lw = 5; }
+    else if (i % 5 === 0) { len = 18; lw = 4; }
+    else { len = 10; lw = 2.5; }
+    ctx.strokeStyle = "#2a4a7f"; ctx.lineWidth = lw;
+    ctx.beginPath(); ctx.moveTo(x, lineY - len / 2); ctx.lineTo(x, lineY + len / 2); ctx.stroke();
+    if (i % 10 === 0) {
+      ctx.fillStyle = "#1a3a6b"; ctx.font = "bold 24px sans-serif";
+      ctx.fillText(String(i / 10), x, lineY + 34);
+    } else if (i % 5 === 0) {
+      ctx.fillStyle = "#4a6a9f"; ctx.font = "15px sans-serif";
+      ctx.fillText((i / 10).toFixed(1), x, lineY + 36);
+    }
+  }
+}
+
+function drawBalloon(x, y, r, color, text, fontSize, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+  const ry = r * 1.18;
+  // 绳子
+  ctx.strokeStyle = "rgba(90,60,40,0.7)"; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x, y + ry);
+  ctx.quadraticCurveTo(x + 8, y + ry + 12, x - 3, y + ry + 24);
+  ctx.stroke();
+  // 球身
+  ctx.beginPath(); ctx.ellipse(x, y, r, ry, 0, 0, 7);
+  const g = ctx.createRadialGradient(x - r * 0.35, y - ry * 0.4, r * 0.15, x, y, ry * 1.1);
+  g.addColorStop(0, "#ffffff"); g.addColorStop(0.25, color); g.addColorStop(1, shade(color, -0.25));
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.2)"; ctx.lineWidth = 2; ctx.stroke();
+  // 球结
+  ctx.fillStyle = shade(color, -0.35);
+  ctx.beginPath();
+  ctx.moveTo(x, y + ry + 2); ctx.lineTo(x - 6, y + ry + 9); ctx.lineTo(x + 6, y + ry + 9);
+  ctx.closePath(); ctx.fill();
+  // 高光
+  ctx.beginPath(); ctx.ellipse(x - r * 0.38, y - ry * 0.42, r * 0.2, ry * 0.26, -0.5, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.fill();
+  // 数值
+  ctx.fillStyle = "#26314b"; ctx.font = `bold ${fontSize}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(text, x, y);
+  ctx.restore();
+}
+function shade(hex, k) {
+  const n = parseInt(hex.slice(1), 16);
+  const f = c => Math.max(0, Math.min(255, Math.round(c * (1 + k))));
+  return `rgb(${f(n >> 16)},${f((n >> 8) & 255)},${f(n & 255)})`;
+}
+
+function drawPinned() {
+  for (const p of pinned) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, p.alpha);
+    // 钉线
+    ctx.strokeStyle = "rgba(90,60,40,0.7)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(p.x, p.y + 22); ctx.lineTo(p.x, lineY); ctx.stroke();
+    ctx.restore();
+    drawBalloon(p.x, p.y, 18, p.color, String(p.v), p.v >= 1 || String(p.v).length > 3 ? 11 : 12, Math.max(0, p.alpha));
+    // 图钉
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, p.alpha);
+    ctx.beginPath(); ctx.arc(p.x, lineY, 5, 0, 7);
+    ctx.fillStyle = "#e93b3b"; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawDragGuide() {
+  if (!dragging) return;
+  const b = dragging.b;
+  const placed = x2val(b.x);
+  const ok = Math.abs(placed - b.v) < TOL;
+  // 竖直虚线引导
+  ctx.save();
+  ctx.setLineDash([8, 8]);
+  ctx.strokeStyle = ok ? "#2ea043" : "rgba(42,74,127,0.55)";
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(b.x, b.y + 42); ctx.lineTo(b.x, lineY); ctx.stroke();
+  ctx.setLineDash([]);
+  // 落点圆点
+  ctx.beginPath(); ctx.arc(b.x, lineY, 8, 0, 7);
+  ctx.fillStyle = ok ? "#2ea043" : "rgba(42,74,127,0.7)"; ctx.fill();
+  // 接近目标时在正确位置画光圈提示
+  if (ok) {
+    ctx.beginPath(); ctx.arc(val2x(b.v), lineY, 15, 0, 7);
+    ctx.strokeStyle = "rgba(46,160,67,0.9)"; ctx.lineWidth = 4; ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawSparks() {
+  for (const s of sparks) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, s.life);
+    ctx.fillStyle = s.col;
+    ctx.beginPath(); ctx.arc(s.x, s.y, 3.2, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawSky();
+  drawNumberLine();
+  drawPinned();
+  drawDragGuide();
+  if (cur) {
+    const r = 36;
+    drawBalloon(cur.x, cur.y, r, cur.color, String(cur.v), String(cur.v).length > 3 ? 20 : 23);
+    if (cur.state === "hover" && !dragging) {
+      // 呼吸光圈提示可以拖
+      ctx.save();
+      ctx.globalAlpha = 0.35 + 0.2 * Math.sin(tNow * 4);
+      ctx.beginPath(); ctx.arc(cur.x, cur.y, r + 12, 0, 7);
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+      ctx.restore();
+    }
+  }
+  drawSparks();
+}
+
+/* ================= 交互 ================= */
+function beginDrag(px, py) {
+  if (!cur || cur.state === "returning" || winPanel.style.display === "flex") return false;
+  if (Math.hypot(px - cur.x, py - cur.y) > 62) return false;
+  dragging = { b: cur, dx: px - cur.x, dy: py - cur.y };
+  cur.state = "drag";
+  hintEl.style.opacity = "0";
+  pop(700);
+  return true;
+}
+function moveDrag(px, py) {
+  if (!dragging) return;
+  const b = dragging.b;
+  b.x = Math.max(10, Math.min(W - 10, px - dragging.dx));
+  b.y = Math.max(50, Math.min(H - 20, py - dragging.dy));
+  const placed = x2val(b.x);
+  const ok = Math.abs(placed - b.v) < TOL;
+  setFeedback(`你放在 ${formatVal(placed)}${ok ? " ✓" : ""}`, ok ? true : null);
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (beginDrag(e.clientX, e.clientY)) canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointermove", e => {
+  moveDrag(e.clientX, e.clientY);
+});
+window.addEventListener("pointerup", () => {
+  if (dragging) endDrag();
+});
+canvas.addEventListener("pointercancel", () => {
+  if (dragging) endDrag();
+});
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type, slideTo) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine";
+    o.frequency.setValueAtTime(freq, actx.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, actx.currentTime + dur);
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+const ding = () => { tone(1318, 0.35, 0.14); setTimeout(() => tone(1760, 0.4, 0.1), 90); };
+const boing = () => tone(420, 0.28, 0.12, "triangle", 160);
+const crackle = () => tone(900 + Math.random() * 900, 0.07, 0.05, "square");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  step(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+resetGame();
+requestAnimationFrame(loop);
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3000);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

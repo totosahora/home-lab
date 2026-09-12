@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>小小电路：灯泡亮啦</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#bfe3ff; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(40,60,90,0.85); color:#ffd54a; padding:10px 24px;
+    border-radius:26px; font-size:20px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(40,60,90,0.88); color:#fff; padding:11px 24px;
+    border-radius:26px; font-size:17px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; user-select:none;
+  }
+  #bulbBtn {
+    position:absolute; right:18px; bottom:64px; z-index:10; display:none;
+    font-size:22px; font-weight:bold; padding:16px 26px;
+    border-radius:34px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.3); touch-action:manipulation;
+  }
+  #bulbBtn:active { transform:scale(1.07); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🔌 接好啦：0 / 4</div>
+<div id="hint">把电线头上的圈圈，拖到一样颜色的接线柱上！</div>
+<button id="bulbBtn">💡 再加一个灯泡</button>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const bulbBtn = document.getElementById("bulbBtn");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 视图 ================= */
+// 世界坐标固定 1280 x 800，整体缩放居中
+const WORLD_W = 1280, WORLD_H = 800;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / WORLD_W, H / WORLD_H);
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 场景数据 ================= */
+// 接线柱（大磁吸点）
+const POSTS = {
+  batP:   { x:170,  y:205, color:"#ff5252" },   // 电池正极
+  batN:   { x:170,  y:615, color:"#42a5f5" },   // 电池负极
+  bulb1A: { x:700,  y:430, color:"#ff9800" },   // 灯泡1 左
+  bulb1B: { x:820,  y:430, color:"#ffd54a" },   // 灯泡1 右
+  bulb2A: { x:960,  y:430, color:"#bdbdbd" },   // 灯泡2 左（短路跳线用）
+  bulb2B: { x:1080, y:430, color:"#ffd54a" }    // 灯泡2 右
+};
+const BULB1 = { x:760,  y:250, r:65 };
+const BULB2 = { x:1020, y:250, r:65 };
+const SWITCH = { x:620, y:640, postL:[540,640], postR:[700,640] };
+
+// 四个电线头（拖拽的圈圈）
+const ends = [
+  { id:"w1a", wire:0, x:330, y:705, home:[330,705], post:"batP",   connected:false },
+  { id:"w1b", wire:0, x:445, y:725, home:[445,725], post:"bulb1A", connected:false },
+  { id:"w2a", wire:1, x:845, y:725, home:[845,725], post:"bulb1B", connected:false },  // 串联时改接 bulb2B
+  { id:"w2b", wire:1, x:955, y:705, home:[955,705], post:"batN",   connected:false }
+];
+function targetPost(e) { return (e.id === "w2a" && twoBulbs) ? POSTS.bulb2B : POSTS[e.post]; }
+
+let twoBulbs = false;       // 是否串联了第二个灯泡
+let switchClosed = false;   // 开关
+let leverT = 0;             // 开关动画 0=断开 1=闭合
+let lit = false;            // 灯是否亮着
+let bright = 0;             // 当前亮度（平滑过渡）
+let celebrated = false;     // 第一次点亮庆祝过了吗
+let flowOffset = 0;         // 电流光点位置
+let confetti = [];
+let pulse = 0;
+
+function connectedCount() { return ends.filter(e => e.connected).length; }
+function allConnected() { return ends.every(e => e.connected); }
+
+/* ================= 电路逻辑 ================= */
+function refreshCircuit(reason) {
+  const nowLit = allConnected() && switchClosed;
+  if (nowLit && !lit) {
+    lit = true;
+    if (!celebrated) {
+      celebrated = true;
+      fanfare();
+      spawnConfetti();
+      showHint("🎉 灯亮啦！电跑了一圈！", 3000);
+      bulbBtn.style.display = "block";
+    } else {
+      pop(880); setTimeout(() => pop(1175), 100);
+      showHint("灯亮啦！");
+    }
+  } else if (!nowLit && lit) {
+    lit = false;
+    pop(220);
+    if (reason === "switch") showHint("开关打开了，电停下来啦");
+    else if (reason === "wire") showHint("电线松开了，灯灭啦");
+  }
+  updateScore();
+}
+
+function toggleSwitch() {
+  switchClosed = !switchClosed;
+  click();
+  if (!switchClosed && lit) { refreshCircuit("switch"); return; }
+  refreshCircuit("switch");
+  if (switchClosed && !allConnected()) showHint("还差电线没接好哦");
+}
+
+function addSecond() {
+  twoBulbs = true;
+  const e = ends[2];
+  if (e.connected) {   // 自动移到新灯泡的接线柱
+    const p = targetPost(e);
+    e.x = p.x; e.y = p.y;
+    pop(1000);
+  }
+  rebuildFlow();
+  refreshCircuit();
+  bulbBtn.textContent = "💡 拿走一个灯泡";
+  if (lit) showHint("电要分给两个灯泡，所以变暗啦！", 2800);
+  else if (!e.connected) showHint("把黄色圈圈连到新灯泡上！");
+}
+
+function removeSecond() {
+  twoBulbs = false;
+  const e = ends[2];
+  if (e.connected) {
+    const p = targetPost(e);
+    e.x = p.x; e.y = p.y;
+    pop(700);
+  }
+  rebuildFlow();
+  refreshCircuit();
+  bulbBtn.textContent = "💡 再加一个灯泡";
+  if (lit) showHint("又回到一个灯泡，更亮啦！");
+}
+
+bulbBtn.addEventListener("click", () => { twoBulbs ? removeSecond() : addSecond(); });
+
+/* ================= 电流路径 ================= */
+// 连通后光点沿这条路跑一整圈
+let flowPts = [], flowLen = 0, flowCum = [];
+function rebuildFlow() {
+  const A = POSTS.bulb1A, B1 = POSTS.bulb1B;
+  let pts = [];
+  pts = pts.concat(sampleCubic([POSTS.batP.x, POSTS.batP.y], [200, 60], [560, 80], [A.x, A.y], 28));
+  pts = pts.concat(bulbArc(BULB1));
+  let lastB = B1;
+  if (twoBulbs) {
+    pts = pts.concat(sampleLine([B1.x, B1.y], [POSTS.bulb2A.x, POSTS.bulb2A.y], 6));
+    pts = pts.concat(bulbArc(BULB2));
+    lastB = POSTS.bulb2B;
+  }
+  pts = pts.concat(sampleQuad([lastB.x, lastB.y], [(lastB.x + SWITCH.postR[0]) / 2, 730], SWITCH.postR, 16));
+  pts = pts.concat(sampleLine(SWITCH.postR, SWITCH.postL, 4));
+  pts = pts.concat(sampleQuad(SWITCH.postL, [355, 735], [POSTS.batN.x, POSTS.batN.y], 16));
+  pts = pts.concat(sampleLine([POSTS.batN.x, POSTS.batN.y], [POSTS.batP.x, POSTS.batP.y], 12));  // 穿过电池
+  flowPts = pts;
+  flowCum = [0];
+  for (let i = 1; i < pts.length; i++)
+    flowCum.push(flowCum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+  flowLen = flowCum[flowCum.length - 1] || 1;
+}
+function bulbArc(b) {   // 从左侧接线柱绕过灯泡到右侧
+  return sampleQuad([b.x - 60, 430], [b.x - 80, b.y + 10], [b.x, b.y - 60], 8)
+    .concat(sampleQuad([b.x, b.y - 60], [b.x + 80, b.y + 10], [b.x + 60, 430], 8));
+}
+function sampleCubic(p0, c1, c2, p1, n) {
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n, u = 1 - t;
+    pts.push([
+      u*u*u*p0[0] + 3*u*u*t*c1[0] + 3*u*t*t*c2[0] + t*t*t*p1[0],
+      u*u*u*p0[1] + 3*u*u*t*c1[1] + 3*u*t*t*c2[1] + t*t*t*p1[1]
+    ]);
+  }
+  return pts;
+}
+function sampleQuad(p0, c, p1, n) {
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n, u = 1 - t;
+    pts.push([u*u*p0[0] + 2*u*t*c[0] + t*t*p1[0], u*u*p0[1] + 2*u*t*c[1] + t*t*p1[1]]);
+  }
+  return pts;
+}
+function sampleLine(p0, p1, n) {
+  const pts = [];
+  for (let i = 0; i <= n; i++) pts.push([p0[0] + (p1[0] - p0[0]) * i / n, p0[1] + (p1[1] - p0[1]) * i / n]);
+  return pts;
+}
+function flowPointAt(s) {
+  s = ((s % flowLen) + flowLen) % flowLen;
+  let lo = 0, hi = flowCum.length - 1;
+  while (lo < hi - 1) { const mid = (lo + hi) >> 1; if (flowCum[mid] <= s) lo = mid; else hi = mid; }
+  const t = (s - flowCum[lo]) / ((flowCum[lo + 1] - flowCum[lo]) || 1);
+  return [
+    flowPts[lo][0] + (flowPts[lo + 1][0] - flowPts[lo][0]) * t,
+    flowPts[lo][1] + (flowPts[lo + 1][1] - flowPts[lo][1]) * t
+  ];
+}
+rebuildFlow();
+
+/* ================= 步进（光点/彩带/动画） ================= */
+function tick(dt) {
+  pulse += dt;
+  leverT += ((switchClosed ? 1 : 0) - leverT) * Math.min(1, dt * 10);
+  const targetBright = lit ? (twoBulbs ? 0.45 : 1) : 0;
+  bright += (targetBright - bright) * Math.min(1, dt * 6);
+  if (lit) flowOffset += 300 * dt;
+  for (const c of confetti) {
+    c.vy += 600 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += c.vr * dt;
+    c.life -= dt;
+  }
+  confetti = confetti.filter(c => c.life > 0 && c.y < WORLD_H + 40);
+}
+function spawnConfetti() {
+  const spots = twoBulbs ? [BULB1, BULB2] : [BULB1];
+  const colors = ["#ff5252", "#ffd54a", "#69f0ae", "#40c4ff", "#e040fb", "#ff9800"];
+  for (const b of spots)
+    for (let i = 0; i < 26; i++) {
+      const a = Math.random() * Math.PI * 2, sp = 150 + Math.random() * 330;
+      confetti.push({
+        x:b.x, y:b.y, vx:Math.cos(a) * sp, vy:Math.sin(a) * sp - 160,
+        rot:Math.random() * 7, vr:(Math.random() - 0.5) * 12,
+        size:8 + Math.random() * 7, color:colors[i % colors.length],
+        life:1.6 + Math.random() * 0.8
+      });
+    }
+}
+
+/* ================= 交互 ================= */
+let dragEnd = null, dragOff = [0, 0], hoverSnap = false;
+let downPos = null;
+
+canvas.addEventListener("pointerdown", e => {
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  downPos = [wx, wy];
+  for (const en of ends) {          // 先找电线头
+    if (Math.hypot(wx - en.x, wy - en.y) < 60) {
+      dragEnd = en;
+      dragOff = [en.x - wx, en.y - wy];
+      canvas.setPointerCapture(e.pointerId);
+      hintEl.style.opacity = "0";
+      return;
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragEnd) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  const nx = wx + dragOff[0], ny = wy + dragOff[1];
+  const p = targetPost(dragEnd);
+  if (dragEnd.connected) {           // 吸住的：拉远了才脱开
+    if (Math.hypot(nx - p.x, ny - p.y) > 62) {
+      dragEnd.connected = false;
+      pop(300);
+      refreshCircuit("wire");
+    } else {
+      dragEnd.x = p.x; dragEnd.y = p.y;
+      return;
+    }
+  }
+  dragEnd.x = Math.max(50, Math.min(WORLD_W - 50, nx));
+  dragEnd.y = Math.max(60, Math.min(WORLD_H - 45, ny));
+  hoverSnap = Math.hypot(dragEnd.x - p.x, dragEnd.y - p.y) < 78;   // 磁吸预告
+  if (hoverSnap) { dragEnd.x = p.x; dragEnd.y = p.y; }
+});
+window.addEventListener("pointerup", e => {
+  if (dragEnd) {
+    const p = targetPost(dragEnd);
+    if (Math.hypot(dragEnd.x - p.x, dragEnd.y - p.y) < 95) {
+      if (!dragEnd.connected) pop(1000 + Math.random() * 300);
+      dragEnd.connected = true;
+      dragEnd.x = p.x; dragEnd.y = p.y;
+      refreshCircuit();
+      if (allConnected() && !switchClosed && !lit) showHint("电线都接好啦！点一下开关试试");
+    }
+    dragEnd = null; hoverSnap = false;
+    return;
+  }
+  // 点开关（按下和松开几乎没移动才算点）
+  if (downPos) {
+    const [wx, wy] = toWorld(e.clientX, e.clientY);
+    if (Math.hypot(wx - downPos[0], wy - downPos[1]) < 18 &&
+        Math.hypot(wx - SWITCH.x, wy - (SWITCH.y - 30)) < 135) {
+      toggleSwitch();
+    }
+  }
+  downPos = null;
+});
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+function strokePts(pts, w, color) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  ctx.lineWidth = w; ctx.strokeStyle = color;
+  ctx.stroke();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+  g.addColorStop(0, "#bfe3ff"); g.addColorStop(0.62, "#e8f6ff");
+  g.addColorStop(0.62, "#f2d9a4"); g.addColorStop(1, "#e3c078");   // 下面是桌面
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  ctx.fillRect(0, WORLD_H * 0.62 - 3, WORLD_W, 3);
+}
+
+function drawPost(key, active) {
+  const p = POSTS[key];
+  const col = active ? p.color : "#b0bec5";
+  // 磁吸预告：发光环
+  if (hoverSnap && dragEnd && targetPost(dragEnd) === p) {
+    ctx.beginPath(); ctx.arc(p.x, p.y, 40 + Math.sin(pulse * 8) * 4, 0, 7);
+    ctx.strokeStyle = "rgba(255,213,74,0.9)"; ctx.lineWidth = 6; ctx.stroke();
+  }
+  ctx.beginPath(); ctx.arc(p.x, p.y, 30, 0, 7);
+  ctx.fillStyle = col; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.beginPath(); ctx.arc(p.x, p.y, 19, 0, 7);
+  ctx.fillStyle = "#eceff1"; ctx.fill();
+  ctx.beginPath(); ctx.arc(p.x - 5, p.y - 6, 6, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.fill();
+}
+
+function drawBattery() {
+  // 主体
+  const g = ctx.createLinearGradient(105, 260, 235, 560);
+  g.addColorStop(0, "#ffca28"); g.addColorStop(1, "#ff8f00");
+  ctx.fillStyle = g;
+  roundRect(105, 260, 130, 300, 24, true);
+  ctx.strokeStyle = "rgba(120,60,0,0.4)"; ctx.lineWidth = 4;
+  roundRect(105, 260, 130, 300, 24, false); ctx.stroke();
+  // 正极凸起
+  ctx.fillStyle = "#90a4ae";
+  roundRect(150, 242, 40, 20, 6, true);
+  // 文字与符号
+  ctx.fillStyle = "#5d4037";
+  ctx.font = "bold 38px 'PingFang SC',sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("电池", 170, 415);
+  ctx.fillStyle = "#c62828";
+  ctx.font = "bold 52px 'PingFang SC',sans-serif";
+  ctx.fillText("+", 170, 305);
+  ctx.fillStyle = "#1565c0";
+  ctx.fillText("−", 170, 525);
+  drawPost("batP", true);
+  drawPost("batN", true);
+}
+
+function drawBulb(b, br, on) {
+  // 光晕
+  if (br > 0.02) {
+    const R = 170 * (0.5 + 0.5 * br) * (1 + Math.sin(pulse * 3) * 0.05);
+    const g = ctx.createRadialGradient(b.x, b.y, 20, b.x, b.y, R);
+    g.addColorStop(0, `rgba(255,240,140,${0.65 * br})`);
+    g.addColorStop(1, "rgba(255,240,140,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(b.x, b.y, R, 0, 7); ctx.fill();
+  }
+  // 底部到接线柱的固定臂
+  ctx.strokeStyle = "#90a4ae"; ctx.lineWidth = 8; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(b.x - 25, b.y + 95); ctx.lineTo(b.x - 60, 430); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(b.x + 25, b.y + 95); ctx.lineTo(b.x + 60, 430); ctx.stroke();
+  // 灯头螺口
+  ctx.fillStyle = "#b0bec5";
+  ctx.beginPath();
+  ctx.moveTo(b.x - 34, b.y + 48); ctx.lineTo(b.x + 34, b.y + 48);
+  ctx.lineTo(b.x + 24, b.y + 98); ctx.lineTo(b.x - 24, b.y + 98);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "#78909c"; ctx.lineWidth = 3;
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.moveTo(b.x - 30 + i * 2, b.y + 60 + i * 12);
+    ctx.lineTo(b.x + 30 - i * 2, b.y + 60 + i * 12);
+    ctx.stroke();
+  }
+  // 玻璃泡
+  ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7);
+  const gg = ctx.createRadialGradient(b.x - 20, b.y - 24, 6, b.x, b.y, b.r);
+  if (br > 0.02) { gg.addColorStop(0, "#fffde7"); gg.addColorStop(1, `rgba(255,235,120,${0.35 + 0.6 * br})`); }
+  else { gg.addColorStop(0, "#f5f9fa"); gg.addColorStop(1, "#cfd8dc"); }
+  ctx.fillStyle = gg; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.22)"; ctx.lineWidth = 3; ctx.stroke();
+  // 灯丝
+  ctx.save();
+  ctx.strokeStyle = br > 0.02 ? "#ff9800" : "#78909c";
+  ctx.lineWidth = 4; ctx.lineCap = "round";
+  if (br > 0.02) { ctx.shadowColor = "#ffc107"; ctx.shadowBlur = 24 * br; }
+  ctx.beginPath();
+  ctx.moveTo(b.x - 18, b.y + 48); ctx.lineTo(b.x - 18, b.y + 12);
+  ctx.lineTo(b.x - 9, b.y - 2); ctx.lineTo(b.x, b.y + 12);
+  ctx.lineTo(b.x + 9, b.y - 2); ctx.lineTo(b.x + 18, b.y + 12);
+  ctx.lineTo(b.x + 18, b.y + 48);
+  ctx.stroke();
+  ctx.restore();
+  // 高光
+  ctx.beginPath(); ctx.arc(b.x - 24, b.y - 28, 13, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.65)"; ctx.fill();
+}
+
+function drawSwitch() {
+  // 底板
+  ctx.fillStyle = "#8d6e63";
+  roundRect(SWITCH.postL[0] - 45, SWITCH.y - 26, 250, 56, 14, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 3;
+  roundRect(SWITCH.postL[0] - 45, SWITCH.y - 26, 250, 56, 14, false); ctx.stroke();
+  // 两个金属脚
+  for (const p of [SWITCH.postL, SWITCH.postR]) {
+    ctx.beginPath(); ctx.arc(p[0], p[1], 15, 0, 7);
+    ctx.fillStyle = "#eceff1"; ctx.fill();
+    ctx.strokeStyle = "#78909c"; ctx.lineWidth = 3; ctx.stroke();
+  }
+  // 闸刀（闭合时搭到右脚）
+  const ang = -0.95 * (1 - leverT);   // 断开时翘起约 54°
+  const L = SWITCH.postL, ex = L[0] + Math.cos(ang) * 160, ey = L[1] + Math.sin(ang) * 160;
+  ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(L[0], L[1]); ctx.lineTo(ex, ey);
+  ctx.strokeStyle = "#ffb300"; ctx.lineWidth = 13; ctx.stroke();
+  ctx.beginPath(); ctx.arc(ex, ey, 15, 0, 7);
+  ctx.fillStyle = "#e53935"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.beginPath(); ctx.arc(L[0], L[1], 8, 0, 7);
+  ctx.fillStyle = "#5d4037"; ctx.fill();
+  // 文字
+  ctx.fillStyle = "#5d4037";
+  ctx.font = "bold 26px 'PingFang SC',sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("开关", SWITCH.x, SWITCH.y + 62);
+}
+
+// 电线：两个头都接好 → 沿固定路线；否则 → 自由下垂
+function drawWires() {
+  const [e1a, e1b, e2a, e2b] = ends;
+  // 未接的头画虚线指引到目标接线柱
+  ctx.save();
+  ctx.setLineDash([10, 12]);
+  ctx.lineWidth = 4;
+  for (const en of ends) {
+    if (!en.connected) {
+      const p = targetPost(en);
+      ctx.strokeStyle = p.color; ctx.globalAlpha = 0.55;
+      ctx.beginPath(); ctx.moveTo(en.x, en.y); ctx.lineTo(p.x, p.y); ctx.stroke();
+    }
+  }
+  ctx.restore();
+  // 红线（电池+ → 灯泡左）
+  if (e1a.connected && e1b.connected) {
+    const pts = sampleCubic([POSTS.batP.x, POSTS.batP.y], [200, 60], [560, 80], [POSTS.bulb1A.x, POSTS.bulb1A.y], 28);
+    strokePts(pts, 15, "#c62828"); strokePts(pts, 8, "#ef5350");
+  } else {
+    drawSagWire(e1a, e1b, "#c62828", "#ef5350");
+  }
+  // 蓝线（灯泡右 → 开关 → 电池−）
+  if (e2a.connected && e2b.connected) {
+    const lastB = twoBulbs ? POSTS.bulb2B : POSTS.bulb1B;
+    const p1 = sampleQuad([lastB.x, lastB.y], [(lastB.x + SWITCH.postR[0]) / 2, 730], SWITCH.postR, 16);
+    const p2 = sampleQuad(SWITCH.postL, [355, 735], [POSTS.batN.x, POSTS.batN.y], 16);
+    strokePts(p1, 15, "#1565c0"); strokePts(p1, 8, "#42a5f5");
+    strokePts(p2, 15, "#1565c0"); strokePts(p2, 8, "#42a5f5");
+  } else {
+    drawSagWire(e2a, e2b, "#1565c0", "#42a5f5");
+  }
+  // 串联跳线（灯泡1右 → 灯泡2左）
+  if (twoBulbs) {
+    const pts = sampleLine([POSTS.bulb1B.x, POSTS.bulb1B.y], [POSTS.bulb2A.x, POSTS.bulb2A.y], 6);
+    strokePts(pts, 13, "#6d4c41"); strokePts(pts, 7, "#a1887f");
+  }
+}
+function drawSagWire(ea, eb, outer, inner) {
+  const c = [(ea.x + eb.x) / 2, Math.max(ea.y, eb.y) + 85];
+  const pts = sampleQuad([ea.x, ea.y], c, [eb.x, eb.y], 16);
+  strokePts(pts, 15, outer); strokePts(pts, 8, inner);
+}
+
+function drawLugs() {
+  for (const en of ends) {
+    const col = targetPost(en).color;
+    ctx.beginPath(); ctx.arc(en.x, en.y, 25, 0, 7);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.beginPath(); ctx.arc(en.x, en.y, 11, 0, 7);
+    ctx.fillStyle = "#8d6e63"; ctx.fill();
+    ctx.beginPath(); ctx.arc(en.x - 7, en.y - 8, 5, 0, 7);
+    ctx.fillStyle = "rgba(255,255,255,0.7)"; ctx.fill();
+  }
+}
+
+function drawFlowDots() {
+  if (bright < 0.05) return;
+  const N = Math.floor(flowLen / 95);
+  ctx.save();
+  ctx.shadowColor = "#ffeb3b"; ctx.shadowBlur = 14;
+  ctx.fillStyle = "#fff176";
+  for (let i = 0; i < N; i++) {
+    const [x, y] = flowPointAt(flowOffset + i * 95);
+    ctx.beginPath(); ctx.arc(x, y, 7, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.size / 2, -c.size / 3, c.size, c.size * 0.66);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#bfe3ff";
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  drawBackground();
+  drawWires();
+  drawBattery();
+  drawBulb(BULB1, bright, true);
+  if (twoBulbs) drawBulb(BULB2, bright, true);
+  drawPost("bulb1A", true);
+  drawPost("bulb1B", !twoBulbs);
+  if (twoBulbs) { drawPost("bulb2A", false); drawPost("bulb2B", true); }
+  drawSwitch();
+  drawLugs();
+  drawFlowDots();
+  drawConfetti();
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  tick(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const click = () => tone(650, 0.06, 0.12, "square");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 2200);
+}
+hintEl.addEventListener("pointerdown", () => { hintEl.style.opacity = "0"; });
+function updateScore() {
+  scorebar.textContent = `🔌 接好啦：${connectedCount()} / 4` + (lit ? " · 💡 灯亮啦！" : "");
+}
+setTimeout(() => { hintEl.style.opacity = "0"; }, 6000);
+
+/* ================= 测试钩子（无头验证用） ================= */
+window.SC = {
+  ends, POSTS, BULB1, BULB2, tick, draw, toggleSwitch, addSecond, removeSecond,
+  targetPost, allConnected, lit: () => lit, bright: () => bright, isTwoBulbs: () => twoBulbs,
+  connectAll() {
+    for (const en of ends) { const p = targetPost(en); en.x = p.x; en.y = p.y; en.connected = true; }
+    refreshCircuit();
+  },
+  setSwitch(b) { if (b !== switchClosed) toggleSwitch(); }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>行星轨道实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#05070f; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(8,14,30,0.85); color:#8fd0ff; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(8,14,30,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #panel {
+    position:absolute; top:12px; left:12px; z-index:10;
+    background:rgba(8,14,30,0.8); border:1px solid rgba(120,160,255,0.25);
+    border-radius:14px; padding:10px 14px; color:#dfe8ff; font-size:14px;
+    display:flex; flex-direction:column; gap:8px; max-width:280px;
+  }
+  #panel .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  #panel button {
+    font-size:14px; padding:7px 12px; border-radius:16px;
+    border:1px solid rgba(255,255,255,0.25); background:rgba(60,90,180,0.35);
+    color:#fff; cursor:pointer;
+  }
+  #panel button:active { transform:scale(1.06); }
+  #panel input[type=range] { width:120px; accent-color:#ffb800; }
+  #massVal { color:#ffd54a; font-weight:bold; }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:38px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🪐 任务：让行星稳定绕恒星飞 3 圈 · 已完成 0 / 3 圈</div>
+<div id="panel">
+  <div class="row">
+    <button id="btnCircle">🟢 圆轨道</button>
+    <button id="btnEllipse">🟠 椭圆轨道</button>
+    <button id="btnEscape">🔴 逃逸</button>
+  </div>
+  <div class="row">
+    <span>恒星质量</span>
+    <input id="massSlider" type="range" min="0.4" max="2.2" step="0.1" value="1">
+    <span id="massVal">×1.0</span>
+  </div>
+  <div class="row">
+    <button id="btnReset">↩️ 重新放置行星</button>
+  </div>
+</div>
+<div id="hint">从行星向外拖出箭头：方向=初速度方向，长度=速度大小，松手发射！</div>
+<div id="winPanel">
+  <div class="msg">🎉 太棒了！<br>行星稳定运行了 3 圈！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 场景与视图 ================= */
+// 世界坐标：恒星在原点，y 轴向下（与屏幕一致），VIEW_R 为短边半屏可见半径
+const VIEW_R = 620;
+const STAR_R = 42;          // 恒星半径（坠入判定）
+const PLANET_R = 14;
+const BASE_GM = 240 * 80 * 80;   // GM 基准值：r=240 处圆轨道速度 = 80
+let GM = BASE_GM;                // 随恒星质量滑块变化
+const ESCAPE_R = 4200;           // 超出此距离视为逃逸
+const TIME_SCALE = 2.2;          // 时间加速，让轨道周期不至于太慢
+
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W, H) / 2 / VIEW_R;
+  view.ox = W / 2;
+  view.oy = H / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+// 背景星空（固定随机）
+const bgStars = [];
+for (let i = 0; i < 160; i++) {
+  bgStars.push({ x: Math.random() * 2 - 1, y: Math.random() * 2 - 1,
+                 r: 0.6 + Math.random() * 1.6, a: 0.25 + Math.random() * 0.6 });
+}
+
+/* ================= 游戏状态 ================= */
+let planet = { x:250, y:0, vx:0, vy:0 };
+let trail = [];            // 轨迹点 [{x,y}]
+let state = "aim";         // aim | fly | won
+let laps = 0;              // 已完成圈数
+let angleAcc = 0;          // 累计绕恒星扫过的角度（弧度）
+let prevAngle = 0;
+let prevVr = 0;            // 上一帧径向速度符号（用于近日点/远日点提示）
+let periHinted = false, apoHinted = false;
+
+function resetGame() {
+  planet = { x:250, y:0, vx:0, vy:0 };
+  trail = [];
+  state = "aim";
+  laps = 0; angleAcc = 0; prevVr = 0;
+  periHinted = false; apoHinted = false;
+  winPanel.style.display = "none";
+  updateScore();
+}
+
+function orbitInfo(x, y, vx, vy) {
+  // 由当前状态计算轨道要素：比能量 E、角动量 L、离心率 e、近星距 rp
+  const r = Math.hypot(x, y);
+  const v2 = vx * vx + vy * vy;
+  const E = v2 / 2 - GM / r;
+  const L = x * vy - y * vx;
+  const e = Math.sqrt(Math.max(0, 1 + 2 * E * L * L / (GM * GM)));
+  let rp;
+  if (E < 0) { const a = -GM / (2 * E); rp = a * (1 - e); }
+  else rp = L * L / (GM * (1 + e));     // 抛物线/双曲线的近星距
+  let type;
+  if (rp < STAR_R + 4) type = "crash";
+  else if (E < 0) type = e < 0.03 ? "circle" : "ellipse";
+  else if (E < GM / r * 0.02) type = "parabola";
+  else type = "hyperbola";
+  return { E, L, e, rp, type, bound: E < 0 };
+}
+const TYPE_TEXT = {
+  circle:"接近圆形轨道 ✅", ellipse:"椭圆轨道（束缚）✅",
+  parabola:"抛物线（临界逃逸）", hyperbola:"双曲线（逃逸）", crash:"正在坠落…"
+};
+
+function updateScore() {
+  let t = "待发射";
+  if (state === "fly" || state === "won") {
+    const info = orbitInfo(planet.x, planet.y, planet.vx, planet.vy);
+    t = TYPE_TEXT[info.type];
+  }
+  scorebar.textContent = `🪐 任务：稳定绕恒星 3 圈 · 已完成 ${laps} / 3 圈 · ${t}`;
+}
+resetGame();
+
+/* ================= 物理 ================= */
+// 真实引力：a = -GM/r² · r̂，半隐式欧拉 + 子步进（辛积分，轨道长期稳定）
+function physics(dt) {
+  if (state !== "fly") return;
+  const p = planet;
+  const r = Math.hypot(p.x, p.y);
+  const a = GM / (r * r);
+  p.vx -= a * p.x / r * dt;
+  p.vy -= a * p.y / r * dt;
+  p.x += p.vx * dt;
+  p.y += p.vy * dt;
+
+  // 圈数统计：仅束缚轨道（E<0）累计扫过角度
+  const info = orbitInfo(p.x, p.y, p.vx, p.vy);
+  const ang = Math.atan2(p.y, p.x);
+  if (info.bound) {
+    let d = ang - prevAngle;
+    while (d > Math.PI) d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    angleAcc += d;
+    const newLaps = Math.floor(Math.abs(angleAcc) / (2 * Math.PI));
+    if (newLaps > laps) {
+      laps = newLaps;
+      if (laps >= 3) { winGame(); return; }
+      pop(660 + laps * 120);
+      showHint(`✅ 第 ${laps} 圈完成！`);
+    }
+  }
+  prevAngle = ang;
+
+  // 近日点 / 远日点提示（开普勒直觉：径向速度变号处）
+  const vr = (p.x * p.vx + p.y * p.vy) / (r || 1);
+  if (prevVr < 0 && vr >= 0 && !periHinted && info.bound) {
+    periHinted = true; showHint("📍 近日点：引力最强，速度最快！"); pop(990);
+  }
+  if (prevVr > 0 && vr <= 0 && !apoHinted && info.bound) {
+    apoHinted = true; showHint("📍 远日点：距离最远，速度最慢"); pop(550);
+  }
+  prevVr = vr;
+
+  // 轨迹
+  const last = trail[trail.length - 1];
+  if (!last || Math.hypot(p.x - last.x, p.y - last.y) > 3) {
+    trail.push({ x:p.x, y:p.y });
+    if (trail.length > 6000) trail.splice(0, 1000);
+  }
+
+  // 坠日 / 逃逸
+  const nr = Math.hypot(p.x, p.y);
+  if (nr < STAR_R + 4) {
+    crashTone();
+    showHint("☀️ 行星坠入恒星了！初速度太小或方向太直，再试一次");
+    respawn();
+  } else if (nr > ESCAPE_R) {
+    escapeTone();
+    showHint(info.type === "parabola"
+      ? "🌠 沿抛物线飞走了（刚好达到逃逸速度）"
+      : "🌠 沿双曲线飞走了（超过逃逸速度），试试减小初速度");
+    respawn();
+  }
+  updateScore();
+}
+
+function respawn() {
+  planet = { x:250, y:0, vx:0, vy:0 };
+  trail = [];
+  state = "aim";
+  laps = 0; angleAcc = 0; prevVr = 0;
+  periHinted = false; apoHinted = false;
+  updateScore();
+}
+
+function stepFrame(dtRaw) {
+  const dt = Math.min(0.033, dtRaw) * TIME_SCALE;
+  const steps = 12;   // 子步进保证近日点高速区积分精度
+  for (let i = 0; i < steps; i++) physics(dt / steps);
+}
+
+function winGame() {
+  state = "won";
+  updateScore();
+  fanfare();
+  setTimeout(() => { winPanel.style.display = "flex"; }, 600);
+}
+
+/* ================= 预设发射 ================= */
+function applyPreset(kind) {
+  const conf = { circle:{ r:250, k:1.0 }, ellipse:{ r:320, k:0.72 }, escape:{ r:250, k:1.55 } }[kind];
+  const vc = Math.sqrt(GM / conf.r);         // 该半径处的圆轨道速度
+  planet = { x:conf.r, y:0, vx:0, vy:-vc * conf.k };   // 切向速度
+  trail = [];
+  state = "fly";
+  laps = 0; angleAcc = 0; prevVr = 0;
+  prevAngle = Math.atan2(planet.y, planet.x);
+  periHinted = false; apoHinted = false;
+  whoosh(0.8);
+  if (kind === "circle") showHint("🟢 圆轨道：切向速度 = √(GM/r)");
+  if (kind === "ellipse") showHint("🟠 椭圆轨道：速度略低于圆轨道，被引力拉回");
+  if (kind === "escape") showHint("🔴 超过逃逸速度 √2·√(GM/r)，一去不复返！");
+  updateScore();
+}
+
+/* ================= 交互：拖箭头发射 / 拖动行星 ================= */
+let dragging = null;   // {mode:"aim"|"move"}
+const DRAG_SPEED_K = 0.85;    // 拖拽长度 → 速度 的换算系数
+const MAX_SPEED = 300;
+
+canvas.addEventListener("pointerdown", e => {
+  if (state !== "aim" || winPanel.style.display === "flex") return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  if (Math.hypot(wx - planet.x, wy - planet.y) < PLANET_R * 2.6) {
+    dragging = { mode:"move" };                    // 点住行星：换位置
+  } else {
+    dragging = { mode:"aim" };                     // 其它位置：拖速度箭头
+    aimTo(wx, wy);
+  }
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  if (dragging.mode === "move") {
+    const r = Math.hypot(wx, wy);
+    if (r > STAR_R + PLANET_R + 30) { planet.x = wx; planet.y = wy; }
+  } else {
+    aimTo(wx, wy);
+  }
+});
+window.addEventListener("pointerup", () => {
+  if (!dragging) return;
+  if (dragging.mode === "aim") {
+    const sp = Math.hypot(planet.vx, planet.vy);
+    if (sp > 4) {                                  // 松手发射
+      state = "fly";
+      laps = 0; angleAcc = 0; prevVr = 0;
+      prevAngle = Math.atan2(planet.y, planet.x);
+      periHinted = false; apoHinted = false;
+      whoosh(Math.min(1, sp / MAX_SPEED));
+      updateScore();
+    }
+  }
+  dragging = null;
+});
+
+function aimTo(wx, wy) {
+  let vx = (wx - planet.x) * DRAG_SPEED_K;
+  let vy = (wy - planet.y) * DRAG_SPEED_K;
+  const sp = Math.hypot(vx, vy);
+  if (sp > MAX_SPEED) { vx *= MAX_SPEED / sp; vy *= MAX_SPEED / sp; }
+  planet.vx = vx; planet.vy = vy;
+}
+
+document.getElementById("btnCircle").addEventListener("click", () => applyPreset("circle"));
+document.getElementById("btnEllipse").addEventListener("click", () => applyPreset("ellipse"));
+document.getElementById("btnEscape").addEventListener("click", () => applyPreset("escape"));
+document.getElementById("btnReset").addEventListener("click", () => { respawn(); pop(660); });
+document.getElementById("massSlider").addEventListener("input", e => {
+  const f = parseFloat(e.target.value);
+  GM = BASE_GM * f;
+  document.getElementById("massVal").textContent = "×" + f.toFixed(1);
+  pop(440 + f * 220);
+  showHint(f > 1 ? "恒星变重了：同样位置引力更强" : "恒星变轻了：同样位置引力更弱");
+});
+
+/* ================= 绘制 ================= */
+function arrow(x0, y0, x1, y1, color, lw) {
+  const dx = x1 - x0, dy = y1 - y0;
+  const L = Math.hypot(dx, dy);
+  if (L < 4) return;
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw;
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  const ux = dx / L, uy = dy / L, hl = 16 + lw * 2;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 - ux * hl - uy * hl * 0.45, y1 - uy * hl + ux * hl * 0.45);
+  ctx.lineTo(x1 - ux * hl + uy * hl * 0.45, y1 - uy * hl - ux * hl * 0.45);
+  ctx.closePath(); ctx.fill();
+}
+
+function drawBackground() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#05070f";
+  ctx.fillRect(0, 0, W, H);
+  const half = Math.min(W, H) / 2;
+  for (const s of bgStars) {
+    ctx.globalAlpha = s.a;
+    ctx.fillStyle = "#cfe0ff";
+    ctx.beginPath();
+    ctx.arc(W / 2 + s.x * half, H / 2 + s.y * half, s.r, 0, 7);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawStar() {
+  // 光晕
+  const g = ctx.createRadialGradient(0, 0, STAR_R * 0.3, 0, 0, STAR_R * 3.4);
+  g.addColorStop(0, "rgba(255,220,120,0.85)");
+  g.addColorStop(0.35, "rgba(255,160,60,0.35)");
+  g.addColorStop(1, "rgba(255,140,40,0)");
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0, 0, STAR_R * 3.4, 0, 7); ctx.fill();
+  // 本体
+  const g2 = ctx.createRadialGradient(-STAR_R * 0.3, -STAR_R * 0.3, 2, 0, 0, STAR_R);
+  g2.addColorStop(0, "#fff6c8"); g2.addColorStop(0.6, "#ffcf4d"); g2.addColorStop(1, "#ff9020");
+  ctx.fillStyle = g2;
+  ctx.beginPath(); ctx.arc(0, 0, STAR_R, 0, 7); ctx.fill();
+}
+
+// 由当前状态预测整条轨道圆锥曲线（开普勒轨道：r(θ)=p/(1+e·cos(θ-θ0))）
+function predictOrbit(x, y, vx, vy) {
+  const info = orbitInfo(x, y, vx, vy);
+  if (Math.abs(info.L) < 1e-6) return null;      // 径直坠落，无曲线可画
+  const r = Math.hypot(x, y);
+  // 离心率矢量 e_vec = ((v²-GM/r)·r_vec - (r·v)·v_vec) / GM
+  const rv = x * vx + y * vy;
+  const k = (vx * vx + vy * vy - GM / r) / GM;
+  const ex = k * x - rv * vx / GM, ey = k * y - rv * vy / GM;
+  const th0 = Math.atan2(ey, ex);
+  const p = info.L * info.L / GM;
+  const pts = [];
+  if (info.E < 0) {                              // 椭圆：画整圈
+    for (let i = 0; i <= 240; i++) {
+      const th = th0 + i / 240 * 2 * Math.PI;
+      const rr = p / (1 + info.e * Math.cos(th - th0));
+      pts.push([rr * Math.cos(th), rr * Math.sin(th)]);
+    }
+  } else {                                       // 双曲线/抛物线：画当前分支
+    const thMax = Math.acos(Math.max(-1, Math.min(1, -1 / info.e)));
+    for (let i = 0; i <= 200; i++) {
+      const th = th0 - thMax * 0.92 + i / 200 * thMax * 1.84;
+      const den = 1 + info.e * Math.cos(th - th0);
+      if (den <= 0.02) continue;
+      const rr = p / den;
+      if (rr > 5000) continue;
+      pts.push([rr * Math.cos(th), rr * Math.sin(th)]);
+    }
+  }
+  return pts;
+}
+
+function drawPredict() {
+  // 瞄准中或飞行中都画出预测轨道
+  let pts = null, color = null;
+  if (state === "aim" && dragging && dragging.mode === "aim") {
+    pts = predictOrbit(planet.x, planet.y, planet.vx, planet.vy);
+    color = "rgba(255,255,255,0.75)";
+  } else if (state === "fly") {
+    pts = predictOrbit(planet.x, planet.y, planet.vx, planet.vy);
+    color = "rgba(140,180,255,0.28)";
+  }
+  if (!pts || pts.length < 2) return;
+  ctx.save();
+  ctx.setLineDash([10, 10]);
+  ctx.strokeStyle = color; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  if (state !== "fly") ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawTrail() {
+  if (trail.length < 2) return;
+  ctx.strokeStyle = "rgba(255,190,80,0.55)";
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(trail[0].x, trail[0].y);
+  for (let i = 1; i < trail.length; i++) ctx.lineTo(trail[i].x, trail[i].y);
+  ctx.stroke();
+}
+
+function drawPlanet() {
+  const p = planet;
+  const g = ctx.createRadialGradient(p.x - 5, p.y - 6, 2, p.x, p.y, PLANET_R);
+  g.addColorStop(0, "#9fd0ff"); g.addColorStop(1, "#2050b0");
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(p.x, p.y, PLANET_R, 0, 7); ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 1.5; ctx.stroke();
+}
+
+function drawVectors() {
+  const p = planet;
+  if (state === "fly" || state === "won") {
+    const r = Math.hypot(p.x, p.y);
+    const sp = Math.hypot(p.vx, p.vy);
+    // 速度矢量（绿）：近日点长、远日点短
+    const VS = 1.3;
+    arrow(p.x, p.y, p.x + p.vx * VS, p.y + p.vy * VS, "#4ce65a", 3);
+    ctx.fillStyle = "#4ce65a";
+    ctx.font = "bold 22px sans-serif";
+    ctx.fillText(`v = ${sp.toFixed(0)}`, p.x + p.vx * VS + 10, p.y + p.vy * VS + 6);
+    // 引力矢量（红）：越靠近恒星越长（开方缩放，避免近日点箭头穿过恒星）
+    const a = GM / (r * r);
+    const gl = Math.min(300, Math.sqrt(a) * 18);
+    arrow(p.x, p.y, p.x - p.x / r * gl, p.y - p.y / r * gl, "#ff5252", 3);
+    ctx.fillStyle = "#ff5252";
+    ctx.fillText("引力", p.x - p.x / r * gl + 10, p.y - p.y / r * gl - 8);
+  } else if (state === "aim") {
+    // 瞄准：初速度箭头 + 预测结果文字
+    if (dragging && dragging.mode === "aim") {
+      const sp = Math.hypot(p.vx, p.vy);
+      arrow(p.x, p.y, p.x + p.vx / DRAG_SPEED_K, p.y + p.vy / DRAG_SPEED_K, "#4ce65a", 4);
+      const info = orbitInfo(p.x, p.y, p.vx, p.vy);
+      ctx.font = "bold 24px sans-serif";
+      ctx.fillStyle = info.type === "crash" ? "#ff8a65" :
+        (info.type === "hyperbola" || info.type === "parabola") ? "#ffd54a" : "#4ce65a";
+      const label = { circle:"预计：圆形轨道 ✅", ellipse:"预计：椭圆轨道 ✅",
+        parabola:"预计：抛物线，刚好逃逸", hyperbola:"预计：双曲线，逃逸！",
+        crash:"预计：坠入恒星 ☀️" }[info.type];
+      ctx.fillText(`v = ${sp.toFixed(0)}  ${label}`, p.x + 30, p.y - 30);
+    }
+    // 参考：当前位置的圆轨道（虚线圈 + 参考速度）
+    const r = Math.hypot(p.x, p.y);
+    ctx.save();
+    ctx.setLineDash([6, 10]);
+    ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.font = "20px sans-serif";
+    ctx.fillText(`此处圆轨道速度 ≈ ${Math.sqrt(GM / r).toFixed(0)}（沿切线方向）`, p.x + 26, p.y + 34);
+  }
+}
+
+function draw() {
+  drawBackground();
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  drawStar();
+  drawPredict();
+  drawTrail();
+  drawPlanet();
+  drawVectors();
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  stepFrame((now - lastT) / 1000);
+  lastT = now;
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const whoosh = p => tone(280 + 420 * p, 0.16, 0.1, "triangle");
+const crashTone = () => { tone(160, 0.4, 0.16, "sawtooth"); setTimeout(() => tone(90, 0.5, 0.14, "sawtooth"), 120); };
+const escapeTone = () => { tone(500, 0.25, 0.1, "triangle"); setTimeout(() => tone(340, 0.3, 0.09, "triangle"), 160); };
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

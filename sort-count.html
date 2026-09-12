@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>分类计数小能手</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#3a2a1a; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(30,20,10,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #toolbar {
+    position:absolute; top:12px; right:12px; z-index:10; display:flex; gap:8px;
+  }
+  #toolbar button {
+    font-size:16px; font-weight:bold; padding:10px 16px;
+    border-radius:22px; border:none; background:rgba(255,244,220,0.92); color:#5a3d00;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.35);
+  }
+  #toolbar button:active { transform:scale(1.06); }
+  #toolbar button.on { background:#ffd54a; }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(30,20,10,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #resultPanel {
+    position:absolute; left:0; right:0; bottom:0; z-index:20; display:none;
+    align-items:center; justify-content:center; gap:16px;
+    padding:16px; background:rgba(20,12,6,0.55);
+  }
+  #resultPanel .msg { font-size:26px; font-weight:bold; color:#ffd54a; text-shadow:0 2px 6px rgba(0,0,0,0.6); }
+  #resultPanel button {
+    font-size:20px; font-weight:bold; padding:12px 26px;
+    border-radius:28px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #resultPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">已放好 0 / 20</div>
+<div id="toolbar">
+  <button id="btnKind" class="on">🍎 按种类分</button>
+  <button id="btnColor">🎨 按颜色分</button>
+  <button id="btnRestart">🔄 重新开始</button>
+</div>
+<div id="hint">把水果拖到对应的篮子里：苹果找苹果篮！</div>
+<div id="resultPanel">
+  <div class="msg">📊 计数结果</div>
+  <button id="btnAgain">再玩一次</button>
+  <button id="btnSwitch">换种分法</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const resultPanel = document.getElementById("resultPanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+const KINDS = [
+  { id:"apple",  name:"苹果", nat:"#e0483e" },
+  { id:"banana", name:"香蕉", nat:"#f4c52f" },
+  { id:"grape",  name:"葡萄", nat:"#9b59c9" },
+  { id:"orange", name:"橙子", nat:"#f08c28" },
+];
+const COLORS = [
+  { id:"red",    name:"红色", css:"#e0483e" },
+  { id:"yellow", name:"黄色", css:"#f4c52f" },
+  { id:"purple", name:"紫色", css:"#9b59c9" },
+];
+const BLOCK_H = 26;          // 像素柱每层高度
+let items = [];              // {kind,color,colorCss,r,x,y,state,anim,wiggle}
+let baskets = [];            // {key,name,css,kind,x,w,top,items[]}
+let mode = "kind";           // kind | color
+let state = "play";          // play | result
+let resultT0 = 0;
+let selected = null;         // 篮子里的块 {bi, idx}（显示 ✕ 手柄）
+let drag = null;             // {item, dx, dy, sx, sy, moved}
+
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function makeItems() {
+  // 20 个水果：4 种 × 5 个；颜色 红×8 黄×7 紫×5；大小两种
+  const colorPool = shuffle([].concat(
+    Array(8).fill("red"), Array(7).fill("yellow"), Array(5).fill("purple")));
+  items = [];
+  let ci = 0;
+  for (const k of KINDS) {
+    for (let i = 0; i < 5; i++) {
+      const cid = colorPool[ci++];
+      const c = COLORS.find(c => c.id === cid);
+      items.push({
+        kind: k.id, kindName: k.name,
+        color: c.id, colorCss: c.css,
+        r: Math.random() < 0.5 ? 24 : 33,   // 大小不同
+        x: 0, y: 0, state: "loose", anim: null, wiggle: 0
+      });
+    }
+  }
+  shuffle(items);
+  scatter();
+}
+
+function scatter() {
+  // 5 列 × 4 行网格加抖动，保证撒得开
+  const area = playArea();
+  const cols = 5, rows = 4;
+  const cw = area.w / cols, ch = area.h / rows;
+  items.forEach((it, i) => {
+    if (it.state !== "loose") return;
+    const c = i % cols, r = Math.floor(i / cols);
+    it.x = area.x + cw * (c + 0.5) + (Math.random() - 0.5) * cw * 0.5;
+    it.y = area.y + ch * (r + 0.5) + (Math.random() - 0.5) * ch * 0.4;
+    it.x = Math.max(area.x + 36, Math.min(area.x + area.w - 36, it.x));
+    it.y = Math.max(area.y + 36, Math.min(area.y + area.h - 36, it.y));
+  });
+}
+
+function playArea() {
+  // 桌面可撒水果的区域：避开顶部按钮和底部篮子+像素柱
+  const top = 70;
+  const bottom = H - 24 - 78 - 8 * BLOCK_H - 30;
+  return { x: 20, y: top, w: W - 40, h: Math.max(120, bottom - top) };
+}
+
+function makeBaskets() {
+  baskets = [];
+  if (mode === "kind") {
+    for (const k of KINDS)
+      baskets.push({ key:k.id, name:k.name, css:k.nat, kind:k.id, x:0, w:0, top:0, items:[] });
+  } else {
+    for (const c of COLORS)
+      baskets.push({ key:c.id, name:c.name, css:c.css, kind:null, x:0, w:0, top:0, items:[] });
+  }
+  layout();
+}
+
+function layout() {
+  if (!baskets.length || !W) return;
+  const n = baskets.length, margin = 28, gap = 20;
+  const bw = Math.min(190, (W - margin * 2 - gap * (n - 1)) / n);
+  const totalW = bw * n + gap * (n - 1);
+  let x = (W - totalW) / 2 + bw / 2;
+  for (const b of baskets) {
+    b.x = x; b.w = bw; b.top = H - 24 - 78;
+    x += bw + gap;
+  }
+  // 窗口变化后把散落的水果收回到桌面内
+  const area = playArea();
+  for (const it of items) {
+    if (it.state === "loose" || it.state === "back") {
+      it.x = Math.max(area.x + 30, Math.min(area.x + area.w - 30, it.x));
+      it.y = Math.max(area.y + 30, Math.min(area.y + area.h - 30, it.y));
+    }
+  }
+}
+
+function placedCount() { return baskets.reduce((s, b) => s + b.items.length, 0); }
+function updateScore() { scorebar.textContent = `已放好 ${placedCount()} / 20`; }
+
+function resetGame() {
+  for (const it of items) { it.state = "loose"; it.anim = null; }
+  for (const b of baskets) b.items = [];
+  scatter();
+  selected = null; drag = null;
+  state = "play";
+  resultPanel.style.display = "none";
+  updateScore();
+  showHint(mode === "kind" ? "把水果拖到对应的篮子里：苹果找苹果篮！"
+                           : "现在按颜色分：红色水果进红篮子！");
+}
+
+function setMode(m) {
+  mode = m;
+  document.getElementById("btnKind").classList.toggle("on", m === "kind");
+  document.getElementById("btnColor").classList.toggle("on", m === "color");
+  makeBaskets();
+  resetGame();
+}
+
+resize();
+makeItems();
+makeBaskets();
+updateScore();
+
+/* ================= 动画（飞入/弹回） ================= */
+function flyToBasket(it, b) {
+  const idx = b.items.length;
+  it.state = "fly";
+  it.anim = {
+    sx: it.x, sy: it.y,
+    tx: b.x, ty: b.top - 8 - (idx + 0.5) * BLOCK_H + 2,
+    t0: performance.now(), dur: 260, bi: baskets.indexOf(b)
+  };
+}
+function bounceBack(it, sx, sy) {
+  it.state = "back";
+  it.anim = { sx: it.x, sy: it.y, tx: sx, ty: sy, t0: performance.now(), dur: 320 };
+}
+function stepAnims(now) {
+  for (const it of items) {
+    if (!it.anim) continue;
+    const a = it.anim;
+    let t = Math.min(1, (now - a.t0) / a.dur);
+    const e = it.state === "back" ? 1 - Math.pow(1 - t, 3) : t * (2 - t); // easeOut
+    it.x = a.sx + (a.tx - a.sx) * e;
+    it.y = a.sy + (a.ty - a.sy) * e;
+    if (t >= 1) {
+      if (it.state === "fly") {
+        const b = baskets[a.bi];
+        b.items.push(it);
+        it.state = "basket";
+        pop(420 + placedCount() * 25);
+        updateScore();
+        checkComplete();
+      } else {
+        it.state = "loose";
+      }
+      it.anim = null;
+    }
+  }
+}
+function checkComplete() {
+  if (placedCount() === items.length && state === "play") {
+    state = "wait";
+    setTimeout(() => {
+      if (placedCount() !== items.length) { state = "play"; return; }
+      state = "result";
+      resultT0 = performance.now();
+      resultPanel.style.display = "flex";
+      fanfare();
+    }, 550);
+  }
+}
+
+/* ================= 交互 ================= */
+function looseAt(px, py) {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.state !== "loose") continue;
+    if (Math.hypot(px - it.x, py - it.y) < it.r + 10) return it;
+  }
+  return null;
+}
+function blockAt(px, py) {
+  for (let bi = 0; bi < baskets.length; bi++) {
+    const b = baskets[bi];
+    for (let i = 0; i < b.items.length; i++) {
+      const by = b.top - 8 - (i + 0.5) * BLOCK_H;
+      if (Math.abs(px - b.x) < Math.min(b.w * 0.66, 96) / 2 + 6 &&
+          Math.abs(py - by) < BLOCK_H / 2 + 4) return { bi, idx: i };
+    }
+  }
+  return null;
+}
+function basketAt(px, py) {
+  for (const b of baskets) {
+    if (Math.abs(px - b.x) < b.w / 2 + 30 &&
+        py > b.top - 8 * BLOCK_H - 60 && py < H) return b;
+  }
+  return null;
+}
+function handlePos() {
+  // 选中块的红色 ✕ 手柄位置
+  const b = baskets[selected.bi];
+  const by = b.top - 8 - (selected.idx + 0.5) * BLOCK_H;
+  return [b.x + Math.min(b.w * 0.66, 96) / 2 + 16, by - 14];
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (state !== "play") return;
+  const px = e.clientX, py = e.clientY;
+  // 1. 点到 ✕ 手柄：把块拿出篮子
+  if (selected) {
+    const [hx, hy] = handlePos();
+    if (Math.hypot(px - hx, py - hy) < 20) {
+      const b = baskets[selected.bi];
+      const it = b.items.splice(selected.idx, 1)[0];
+      const area = playArea();
+      it.state = "loose";
+      it.x = Math.max(area.x + 40, Math.min(area.x + area.w - 40, b.x));
+      it.y = area.y + area.h - 40;
+      selected = null;
+      updateScore();
+      pop(300);
+      showHint("拿出来啦，再想想它该去哪？");
+      return;
+    }
+  }
+  // 2. 点到篮子里的块：选中显示手柄
+  const blk = blockAt(px, py);
+  if (blk) {
+    selected = (selected && selected.bi === blk.bi && selected.idx === blk.idx) ? null : blk;
+    pop(700);
+    return;
+  }
+  selected = null;
+  // 3. 点到桌上的水果：开始拖拽
+  const it = looseAt(px, py);
+  if (it) {
+    drag = { item: it, dx: px - it.x, dy: py - it.y, sx: it.x, sy: it.y, moved: 0 };
+    // 提到最上层
+    items.splice(items.indexOf(it), 1);
+    items.push(it);
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const it = drag.item;
+  it.x = e.clientX - drag.dx;
+  it.y = e.clientY - drag.dy;
+  drag.moved = Math.max(drag.moved, Math.hypot(it.x - drag.sx, it.y - drag.sy));
+});
+function endDrag(e) {
+  if (!drag) return;
+  const it = drag.item;
+  const sx = drag.sx, sy = drag.sy, moved = drag.moved;
+  drag = null;
+  if (state !== "play") return;
+  const b = basketAt(it.x, it.y);
+  if (b) {
+    const ok = mode === "kind" ? b.key === it.kind : b.key === it.color;
+    if (ok) {
+      flyToBasket(it, b);
+    } else {
+      // 放错篮子：轻轻弹回原位，无惩罚
+      bounceBack(it, sx, sy);
+      boing();
+      showHint("它不属于这里哦 😊");
+    }
+  } else if (moved < 8) {
+    // 只是轻点：水果扭一扭，报出它的名字
+    it.x = sx; it.y = sy;
+    it.wiggle = performance.now();
+    pop(600);
+    showHint(`${it.kindName}！把它拖进对的篮子吧`);
+  }
+  // 否则原地放下
+}
+window.addEventListener("pointerup", endDrag);
+window.addEventListener("pointercancel", e => { if (drag) { bounceBack(drag.item, drag.sx, drag.sy); drag = null; } });
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+// 用形状画水果，颜色随物品（这样颜色分类才看得出）
+function drawFruitShape(kind, css, x, y, r) {
+  ctx.save();
+  ctx.translate(x, y);
+  const outline = "rgba(60,30,10,0.35)";
+  if (kind === "banana") {
+    // 弯月牙
+    ctx.beginPath();
+    ctx.arc(0, -r * 0.55, r * 0.95, Math.PI * 0.22, Math.PI * 0.88);
+    ctx.strokeStyle = css; ctx.lineWidth = r * 0.52; ctx.lineCap = "round"; ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(0, -r * 0.55, r * 0.95, Math.PI * 0.22, Math.PI * 0.88);
+    ctx.strokeStyle = outline; ctx.lineWidth = r * 0.1; ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.beginPath(); ctx.arc(-r * 0.5, r * 0.05, r * 0.1, 0, 7); ctx.fill();
+  } else if (kind === "grape") {
+    // 一串圆粒
+    ctx.fillStyle = css; ctx.strokeStyle = outline; ctx.lineWidth = Math.max(1.5, r * 0.06);
+    for (const [ox, oy] of [[-0.45,-0.3],[0,-0.42],[0.45,-0.3],[-0.23,0.12],[0.23,0.12],[0,0.5]]) {
+      ctx.beginPath(); ctx.arc(ox * r, oy * r, r * 0.33, 0, 7); ctx.fill(); ctx.stroke();
+    }
+    ctx.strokeStyle = "#6d4a2a"; ctx.lineWidth = Math.max(2, r * 0.09);
+    ctx.beginPath(); ctx.moveTo(0, -r * 0.7); ctx.lineTo(0, -r * 0.45); ctx.stroke();
+  } else {
+    // 苹果 / 橙子：圆圆的身体
+    ctx.beginPath(); ctx.arc(0, 0, r * 0.9, 0, 7);
+    ctx.fillStyle = css; ctx.fill();
+    ctx.strokeStyle = outline; ctx.lineWidth = Math.max(2, r * 0.07); ctx.stroke();
+    // 果柄和叶子
+    ctx.strokeStyle = "#6d4a2a"; ctx.lineWidth = Math.max(2, r * 0.09); ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(0, -r * 0.82); ctx.quadraticCurveTo(r * 0.08, -r * 1.05, r * 0.18, -r * 1.1); ctx.stroke();
+    ctx.fillStyle = "#4d9b4d";
+    ctx.beginPath(); ctx.ellipse(r * 0.38, -r * 0.95, r * 0.26, r * 0.12, -0.5, 0, 7); ctx.fill();
+    if (kind === "orange") {
+      // 橙子表皮小点点
+      ctx.fillStyle = "rgba(120,60,0,0.25)";
+      for (const [ox, oy] of [[-0.3,0.1],[0.25,-0.2],[0.1,0.4]]) {
+        ctx.beginPath(); ctx.arc(ox * r, oy * r, r * 0.07, 0, 7); ctx.fill();
+      }
+    }
+    // 高光
+    ctx.fillStyle = "rgba(255,255,255,0.4)";
+    ctx.beginPath(); ctx.arc(-r * 0.32, -r * 0.32, r * 0.2, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawTable() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#8a6136"); g.addColorStop(1, "#6b4826");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = "rgba(60,38,16,0.35)"; ctx.lineWidth = 3;
+  for (let y = 90; y < H; y += 110) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+  // 底部篮子区衬一块浅色桌布
+  const top = baskets.length ? baskets[0].top - 8 * BLOCK_H - 46 : H - 340;
+  ctx.fillStyle = "rgba(255,240,214,0.18)";
+  roundRect(14, top, W - 28, H - top - 8, 18, true);
+}
+
+function drawBasket(b, now) {
+  const top = b.top, bot = H - 24, h = bot - top;
+  // 像素柱：每放对 1 个，柱高 +1 层
+  const bw2 = Math.min(b.w * 0.66, 96);
+  b.items.forEach((it, i) => {
+    const bx = b.x - bw2 / 2, by = top - 8 - (i + 1) * BLOCK_H + 2;
+    ctx.fillStyle = it.colorCss;
+    roundRect(bx, by, bw2, BLOCK_H - 4, 6, true);
+    ctx.strokeStyle = "rgba(60,30,10,0.3)"; ctx.lineWidth = 2;
+    roundRect(bx, by, bw2, BLOCK_H - 4, 6, false); ctx.stroke();
+    drawFruitShape(it.kind, it.colorCss, b.x - bw2 / 2 + 14, by + (BLOCK_H - 4) / 2, 9);
+    // 选中块高亮
+    if (selected && selected.bi === baskets.indexOf(b) && selected.idx === i) {
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 3;
+      roundRect(bx - 2, by - 2, bw2 + 4, BLOCK_H, 7, false); ctx.stroke();
+    }
+  });
+  // 拖拽悬停时发光提示
+  if (drag && basketAt(drag.item.x, drag.item.y) === b) {
+    const ok = mode === "kind" ? b.key === drag.item.kind : b.key === drag.item.color;
+    ctx.strokeStyle = ok ? "rgba(80,220,100,0.9)" : "rgba(255,120,90,0.8)";
+    ctx.lineWidth = 5;
+    roundRect(b.x - b.w / 2 - 8, top - 8, b.w + 16, h + 12, 16, false); ctx.stroke();
+  }
+  // 篮身（梯形编织篮）
+  const g = ctx.createLinearGradient(0, top, 0, bot);
+  g.addColorStop(0, "#c98d4e"); g.addColorStop(1, "#a06a34");
+  ctx.beginPath();
+  ctx.moveTo(b.x - b.w / 2, top);
+  ctx.lineTo(b.x + b.w / 2, top);
+  ctx.lineTo(b.x + b.w * 0.42, bot);
+  ctx.lineTo(b.x - b.w * 0.42, bot);
+  ctx.closePath();
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(70,40,12,0.5)"; ctx.lineWidth = 3; ctx.stroke();
+  // 编织纹
+  ctx.strokeStyle = "rgba(90,55,20,0.35)"; ctx.lineWidth = 2;
+  for (let i = 1; i < 4; i++) {
+    const yy = top + h * i / 4, ww = b.w / 2 - (b.w / 2 - b.w * 0.42) * i / 4;
+    ctx.beginPath(); ctx.moveTo(b.x - ww, yy); ctx.lineTo(b.x + ww, yy); ctx.stroke();
+  }
+  // 标签：图标 + 名称
+  const iconCss = b.kind ? b.css : b.css;
+  if (b.kind) drawFruitShape(b.kind, iconCss, b.x, top + h * 0.32, 15);
+  else {
+    ctx.beginPath(); ctx.arc(b.x, top + h * 0.32, 13, 0, 7);
+    ctx.fillStyle = b.css; ctx.fill();
+    ctx.strokeStyle = "rgba(60,30,10,0.4)"; ctx.lineWidth = 2; ctx.stroke();
+  }
+  ctx.fillStyle = "#fff8ea";
+  ctx.font = "bold 20px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(b.name, b.x, top + h * 0.68);
+  // 计数牌
+  ctx.fillStyle = "rgba(30,18,8,0.75)";
+  roundRect(b.x + b.w / 2 - 34, top - 20, 40, 30, 10, true);
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 19px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.fillText(String(b.items.length), b.x + b.w / 2 - 14, top - 5);
+}
+
+function drawItem(it, now) {
+  if (it.state === "basket") return;
+  ctx.save();
+  ctx.translate(it.x, it.y);
+  let scale = 1, rot = 0;
+  if (drag && drag.item === it) { scale = 1.18; rot = 0.1; }
+  if (it.wiggle && now - it.wiggle < 500) {
+    rot = Math.sin((now - it.wiggle) / 40) * 0.18 * (1 - (now - it.wiggle) / 500);
+  }
+  // 影子
+  ctx.fillStyle = "rgba(0,0,0,0.22)";
+  ctx.beginPath(); ctx.ellipse(3, it.r * 0.85, it.r * 0.8, it.r * 0.28, 0, 0, 7); ctx.fill();
+  ctx.rotate(rot); ctx.scale(scale, scale);
+  drawFruitShape(it.kind, it.colorCss, 0, 0, it.r);
+  ctx.restore();
+}
+
+function drawHandle() {
+  if (!selected) return;
+  const [hx, hy] = handlePos();
+  ctx.beginPath(); ctx.arc(hx, hy, 15, 0, 7);
+  ctx.fillStyle = "#e84040"; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 3.5; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(hx - 5, hy - 5); ctx.lineTo(hx + 5, hy + 5);
+  ctx.moveTo(hx + 5, hy - 5); ctx.lineTo(hx - 5, hy + 5);
+  ctx.stroke();
+}
+
+/* ================= 计数结果（活的柱状图） ================= */
+function drawResult(now) {
+  ctx.fillStyle = "rgba(24,15,8,0.92)";
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 42px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("📊 计数结果", W / 2, H * 0.13);
+  ctx.fillStyle = "#fff2d8";
+  ctx.font = "20px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.fillText(mode === "kind" ? "每种水果有几个？" : "每种颜色有几个？", W / 2, H * 0.13 + 42);
+
+  const n = baskets.length;
+  const maxCount = Math.max(...baskets.map(b => b.items.length), 1);
+  const baseY = H * 0.72, maxH = H * 0.38;
+  const barW = Math.min(120, (W - 140) / n - 36);
+  const gap = (Math.min(W - 120, n * barW + (n - 1) * 60) - n * barW) / (n - 1 || 1);
+  const totalW = n * barW + (n - 1) * gap;
+  let x = W / 2 - totalW / 2;
+  const grow = 1 - Math.pow(1 - Math.min(1, (now - resultT0) / 1300), 3);
+  for (const b of baskets) {
+    const h = maxH * (b.items.length / maxCount) * grow;
+    // 柱子
+    const g = ctx.createLinearGradient(0, baseY - h, 0, baseY);
+    g.addColorStop(0, b.css); g.addColorStop(1, "rgba(255,255,255,0.25)");
+    ctx.fillStyle = b.css;
+    roundRect(x, baseY - h, barW, h, 8, true);
+    ctx.fillStyle = "rgba(255,255,255,0.25)";
+    roundRect(x, baseY - h, barW, Math.min(h, 14), 8, true);
+    // 数量
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 30px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.fillText(String(b.items.length), x + barW / 2, baseY - h - 24);
+    // 皇冠：最高的柱子
+    if (b.items.length === maxCount && grow >= 1) {
+      ctx.font = "44px sans-serif";
+      ctx.fillText("👑", x + barW / 2, baseY - h - 62);
+    }
+    // 标签
+    ctx.fillStyle = "#ffe9bd";
+    ctx.font = "bold 22px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.fillText(b.name, x + barW / 2, baseY + 28);
+    if (b.kind) drawFruitShape(b.kind, b.css, x + barW / 2, baseY + 62, 15);
+    else {
+      ctx.beginPath(); ctx.arc(x + barW / 2, baseY + 60, 12, 0, 7);
+      ctx.fillStyle = b.css; ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+    }
+    x += barW + gap;
+  }
+}
+
+function draw(now) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawTable();
+  if (state === "result") { drawResult(now); return; }
+  for (const b of baskets) drawBasket(b, now);
+  for (const it of items) drawItem(it, now);
+  drawHandle();
+}
+
+/* ================= 主循环 ================= */
+function loop(now) {
+  stepAnims(now);
+  draw(now);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function audio() {
+  actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+  if (actx.state === "suspended") actx.resume();
+  return actx;
+}
+function tone(freq, dur, vol, type) {
+  try {
+    const a = audio();
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(); o.stop(a.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.16);
+function boing() {   // 放错篮子的轻轻弹回音
+  try {
+    const a = audio();
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(320, a.currentTime);
+    o.frequency.exponentialRampToValueAtTime(90, a.currentTime + 0.28);
+    g.gain.setValueAtTime(0.14, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + 0.3);
+    o.connect(g); g.connect(a.destination);
+    o.start(); o.stop(a.currentTime + 0.32);
+  } catch (e) {}
+}
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 140)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2400);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+document.getElementById("btnKind").addEventListener("click", () => { setMode("kind"); pop(880); });
+document.getElementById("btnColor").addEventListener("click", () => { setMode("color"); pop(880); });
+document.getElementById("btnRestart").addEventListener("click", () => { resetGame(); pop(880); });
+document.getElementById("btnAgain").addEventListener("click", () => { resetGame(); pop(880); });
+document.getElementById("btnSwitch").addEventListener("click", () => { setMode(mode === "kind" ? "color" : "kind"); pop(880); });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

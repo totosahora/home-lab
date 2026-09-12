@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>过滤与蒸发小实验</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#cfe9f5; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,80,0.82); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; max-width:94vw; overflow:hidden; text-overflow:ellipsis;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,80,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:94vw; overflow:hidden; text-overflow:ellipsis;
+  }
+  #resetBtn {
+    position:absolute; top:12px; right:12px; z-index:10;
+    font-size:18px; font-weight:bold; padding:10px 20px;
+    border-radius:24px; border:none; background:#ff8a65; color:#fff;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.25);
+  }
+  #fireBtn {
+    position:absolute; top:70px; right:12px; z-index:10; display:none;
+    font-size:22px; font-weight:bold; padding:14px 26px;
+    border-radius:30px; border:none; background:#ff5722; color:#fff;
+    cursor:pointer; box-shadow:0 4px 12px rgba(255,87,34,0.5);
+    animation:glow 1s infinite alternate;
+  }
+  @keyframes glow { from { box-shadow:0 0 6px rgba(255,87,34,0.5);} to { box-shadow:0 0 22px rgba(255,87,34,0.95);} }
+  #resetBtn:active, #fireBtn:active { transform:scale(1.06); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.45);
+  }
+  #winPanel .msg {
+    font-size:34px; font-weight:bold; color:#ffd54a; line-height:1.5;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; padding:0 20px;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🧪 第①步：过滤 —— 把沙子拦住</div>
+<button id="resetBtn">🔄 重置</button>
+<button id="fireBtn">🔥 点火</button>
+<div id="hint">一杯水里混了沙子和盐，怎么把它们分开？先把滤纸拖进漏斗！</div>
+<div id="winPanel">
+  <div class="msg">🧂 分离成功！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const fireBtn = document.getElementById("fireBtn");
+let W = 0, H = 0, DPR = 1;
+let tSim = 0;            // 模拟时钟（秒），闪烁/动画都用它
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+// 确定性伪随机（摆沙粒/盐晶用，刷新不跳动）
+function hash(i) { const x = Math.sin(i * 127.1 + 13.7) * 43758.5453; return x - Math.floor(x); }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function lerp(a, b, k) { return a + (b - a) * k; }
+
+/* ================= 场景数据 ================= */
+// 屏幕坐标直接布局。benchY 以下是木实验台。
+let benchY = 0, fr = 50;
+let funnel = {};         // {x, topY, coneTipY, stemTipY, fh}
+let mixB = {};           // 混悬液烧杯 {x,y(bottom中心),w,h,angle,homeX,homeY}
+let recvB = {};          // 承接烧杯（第②步变成滤液烧杯）
+let paper = {};          // 滤纸 {x,y,r,placed}
+let dish = {};           // 蒸发皿 {x,y,w,h,onLamp}
+let lamp = {};           // 酒精灯 {x,y(底),bodyH,wickY}
+let stand = {};          // 铁架台 {x}
+const SAND_N = 30;       // 沙粒总数
+const SALT_N = 14;       // 盐晶总数
+
+// 沙粒在滤纸锥内的相对位置（t=沿锥深度 0顶1尖, s=横向 -1..1）
+const sandSpots = [];
+for (let i = 0; i < SAND_N; i++)
+  sandSpots.push({ t: 0.42 + 0.55 * hash(i * 2), s: hash(i * 2 + 1) * 2 - 1, r: 2.2 + 1.4 * hash(i * 3 + 5) });
+// 沙粒在烧杯底部的相对位置（局部坐标：原点底中心，y 向上为负）
+const mixSandSpots = [];
+for (let i = 0; i < SAND_N; i++)
+  mixSandSpots.push({ sx: (hash(i * 7 + 1) - 0.5), sy: 0.03 + 0.13 * hash(i * 7 + 2), r: 2.2 + 1.4 * hash(i * 7 + 3) });
+// 盐晶在蒸发皿底部的相对位置
+const saltSpots = [];
+for (let i = 0; i < SALT_N; i++)
+  saltSpots.push({ dx: (hash(i * 11 + 1) - 0.5) * 0.62, dy: 0.06 + 0.5 * hash(i * 11 + 2), sz: 3 + 2.6 * hash(i * 11 + 3), rot: hash(i * 11 + 4) * 3 });
+
+function layout() {
+  benchY = H * 0.80;
+  fr = clamp(Math.min(W, H) * 0.115, 40, 76);
+  // 漏斗与铁架台（中右）
+  const fx = W * 0.60;
+  const rbw = fr * 2.0, rbh = fr * 2.4;
+  const rbTop = benchY - rbh;
+  const stemTipY = rbTop - fr * 0.55;
+  const coneTipY = stemTipY - fr * 0.45;
+  const fh = fr * 1.15;
+  funnel = { x: fx, topY: coneTipY - fh, coneTipY, stemTipY, fh, r: fr };
+  stand = { x: fx + fr * 2.4 };
+  // 混悬液烧杯（左侧）
+  const keepMix = mixB.dragging || mixB.pouring;
+  const mx = mixB.x, my = mixB.y;
+  mixB = Object.assign(mixB, { w: rbw, h: rbh, homeX: W * 0.18, homeY: benchY });
+  if (!keepMix) { mixB.x = mixB.homeX; mixB.y = mixB.homeY; } else { mixB.x = mx; mixB.y = my; }
+  // 承接烧杯：第①步在漏斗正下方；第②步变成滤液烧杯（free），家在左侧
+  recvB = Object.assign(recvB, { w: rbw, h: rbh, homeY: benchY });
+  if (!recvB.free) { recvB.homeX = fx; recvB.x = fx; recvB.y = benchY; }
+  else if (!(drag && drag.obj === recvB) && !recvB.pouring) { recvB.x = recvB.homeX; recvB.y = recvB.homeY; }
+  // 滤纸（台上）
+  paper = Object.assign(paper, { r: fr * 0.82, homeX: W * 0.38, homeY: benchY - fr * 0.8 });
+  if (!paper.placed && !(drag && drag.obj === paper)) { paper.x = paper.homeX; paper.y = paper.homeY; }
+  // 蒸发皿与酒精灯（第②步）
+  dish = Object.assign(dish, { w: fr * 2.7, h: fr * 0.9, homeX: W * 0.42, homeY: benchY });
+  if (!dish.onLamp && !(drag && drag.obj === dish) && !dish.pouring) { dish.x = dish.homeX; dish.y = dish.homeY; }
+  lamp = { x: W * 0.68, y: benchY, bodyH: fr * 1.55, w: fr * 1.35 };
+  lamp.wickY = lamp.y - lamp.bodyH - fr * 0.16;
+  dishLampX = lamp.x;
+  dishLampY = lamp.wickY - fr * 0.95;   // 皿底在火焰上方
+}
+let dishLampX = 0, dishLampY = 0;
+
+/* ================= 游戏状态 ================= */
+// paper → pour1ready → pouring1 → step1cheer → pour2ready → pouring2 → placedish → heatReady → heating → crystals → done
+let phase = "paper";
+let drag = null;          // {obj, dx, dy, pid}
+let pourT = 0, pourP = 0; // 倾倒计时与进度
+let pourFrom = {};        // 倾倒起始位置
+let cheerT = 0;
+let heatT = 0;            // 加热计时
+let crysT = 0;            // 析晶计时
+let drips = [];           // 下滴水滴 {x,y,vy}
+let steam = [];           // 蒸汽粒子 {x,y,vy,r,life,maxLife}
+let bubbles = [];         // 水中气泡 {x,y,vy,r,life}
+let sparkles = [];        // 闪光 {x,y,t0}
+let confetti = [];        // 庆祝彩纸 {x,y,vx,vy,rot,vr,color}
+let dripTimer = 0, steamTimer = 0, bubbleTimer = 0, sizzleTimer = 0;
+let lastCrystalCount = 0;
+
+function resetGame() {
+  phase = "paper"; drag = null;
+  pourT = 0; pourP = 0; cheerT = 0; heatT = 0; crysT = 0;
+  drips = []; steam = []; bubbles = []; sparkles = []; confetti = [];
+  lastCrystalCount = 0;
+  paper.placed = false; paper.dragging = false;
+  mixB.dragging = false; mixB.pouring = false; mixB.angle = 0;
+  recvB.dragging = false; recvB.pouring = false; recvB.angle = 0; recvB.free = false; recvB.returning = false;
+  dish.onLamp = false; dish.dragging = false; dish.pouring = false;
+  winPanel.style.display = "none";
+  fireBtn.style.display = "none";
+  layout();
+  scorebar.textContent = "🧪 第①步：过滤 —— 把沙子拦住";
+  showHint("一杯水里混了沙子和盐，怎么分开？先把滤纸 📄 拖进漏斗！", 4000);
+}
+
+/* ================= 流程动作 ================= */
+function placePaper() {
+  paper.placed = true;
+  pop(660);
+  scorebar.textContent = "🧪 第①步：过滤 —— 倒入混悬液";
+  showHint("滤纸放好了！把装混悬液的烧杯拖到漏斗上方，慢慢倒进去", 4000);
+  if (phase === "paper") phase = "pour1ready";
+}
+
+// 倾倒时杯子的落位：让杯嘴（右上角）正好对准目标点
+function pourAnchor(b, theta, tx, ty) {
+  const c = Math.cos(theta), s = Math.sin(theta);
+  const offX = (b.w / 2) * c + b.h * 0.98 * s;
+  const offY = (b.w / 2) * s - b.h * 0.98 * c;
+  return { x: tx - offX, y: ty - offY };
+}
+
+function startPour1() {
+  phase = "pouring1"; pourT = 0; pourP = 0;
+  mixB.pouring = true;
+  pourFrom = { x: mixB.x, y: mixB.y };
+  showHint("慢慢倒……沙子被滤纸拦住，清水滴进下面的烧杯 💧", 4500);
+  tone(220, 0.3, 0.08, "triangle");
+}
+function finishPour1() {
+  mixB.pouring = false; mixB.angle = 0;
+  phase = "step1cheer"; cheerT = 0;
+  pop(880);
+  scorebar.textContent = "✅ 过滤完成：沙子留在滤纸上，清水流进烧杯";
+  showHint("🎉 沙子被拦住啦！接下来把盐从水里“变”出来", 2600);
+  fanfare();
+}
+function setupStep2() {
+  phase = "pour2ready";
+  recvB.free = true;                 // 滤液烧杯解放出来，滑到左侧
+  recvB.homeX = W * 0.18; recvB.homeY = benchY;
+  recvB.returning = true;
+  scorebar.textContent = "🧪 第②步：蒸发 —— 把盐“变”出来";
+  showHint("把烧杯里的清水倒进蒸发皿", 4000);
+}
+function startPour2() {
+  phase = "pouring2"; pourT = 0; pourP = 0;
+  recvB.pouring = true;
+  pourFrom = { x: recvB.x, y: recvB.y };
+  showHint("把清水倒进蒸发皿……", 2500);
+  tone(220, 0.3, 0.08, "triangle");
+}
+function finishPour2() {
+  recvB.pouring = false; recvB.angle = 0;
+  phase = "placedish";
+  pop(700);
+  scorebar.textContent = "🧪 第②步：蒸发 —— 把蒸发皿放到酒精灯上";
+  showHint("把蒸发皿拖到酒精灯上方 🔥", 4000);
+}
+function placeDishOnLamp() {
+  dish.onLamp = true;
+  phase = "heatReady";
+  pop(760);
+  scorebar.textContent = "🧪 第②步：蒸发 —— 准备加热";
+  showHint("点击右上角【🔥 点火】开始加热，看看水去哪了！", 4000);
+  fireBtn.style.display = "block";
+}
+function ignite() {
+  if (phase !== "heatReady") return;
+  phase = "heating"; heatT = 0;
+  fireBtn.style.display = "none";
+  tone(180, 0.25, 0.12, "sawtooth");
+  pop(500);
+  scorebar.textContent = "🧪 第②步：蒸发 —— 水在变少……";
+  showHint("水受热变成水蒸气飞走了……💨", 4000);
+}
+function startCrystals() {
+  phase = "crystals"; crysT = 0; lastCrystalCount = 0;
+  scorebar.textContent = "✨ 看！皿底析出了白色的盐";
+  showHint("水跑光了，盐留下来啦！✨", 3000);
+}
+function finishAll() {
+  phase = "done";
+  scorebar.textContent = "🎉 分离成功：沙子用过滤，盐用蒸发！";
+  winPanel.querySelector(".msg").innerHTML =
+    "🧂 分离成功！<br><span style='font-size:22px;color:#fff'>沙子用【过滤】拦住，盐用【蒸发】留下——<br>两种办法分开混合物！</span>";
+  winPanel.style.display = "flex";
+  fanfare();
+  // 彩纸庆祝
+  const colors = ["#ff5252", "#ffd54a", "#4fc3f7", "#81c784", "#ba68c8", "#ff8a65"];
+  for (let i = 0; i < 80; i++)
+    confetti.push({
+      x: Math.random() * W, y: -20 - Math.random() * H * 0.5,
+      vx: (Math.random() - 0.5) * 80, vy: 120 + Math.random() * 160,
+      rot: Math.random() * 6, vr: (Math.random() - 0.5) * 6,
+      color: colors[i % colors.length]
+    });
+}
+
+/* ================= 动画更新 ================= */
+function updateSim(dt) {
+  tSim += dt;
+  // —— 拖拽物回家缓动 ——
+  for (const o of [mixB, recvB, paper, dish]) {
+    if (o.returning) {
+      o.x = lerp(o.x, o.homeX, Math.min(1, dt * 9));
+      o.y = lerp(o.y, o.homeY, Math.min(1, dt * 9));
+      if (Math.hypot(o.x - o.homeX, o.y - o.homeY) < 3) { o.x = o.homeX; o.y = o.homeY; o.returning = false; }
+    }
+  }
+  // —— 第①步倾倒 ——
+  if (phase === "pouring1") {
+    pourT += dt;
+    const tgt = pourAnchor(mixB, 1.85, funnel.x, funnel.topY - fr * 0.35);
+    if (pourT < 0.5) {                    // 举杯倾斜
+      const k = pourT / 0.5;
+      mixB.x = lerp(pourFrom.x, tgt.x, k); mixB.y = lerp(pourFrom.y, tgt.y, k);
+      mixB.angle = 1.85 * k;
+    } else if (pourT < 4.5) {             // 倒水 4 秒
+      mixB.x = tgt.x; mixB.y = tgt.y; mixB.angle = 1.85;
+      pourP = (pourT - 0.5) / 4;
+      dripTimer -= dt;
+      if (dripTimer <= 0) {               // 漏斗尖滴水
+        dripTimer = 0.13;
+        drips.push({ x: funnel.x, y: funnel.stemTipY, vy: 60 });
+        drip();
+      }
+    } else if (pourT < 5.2) {             // 放回
+      const k = (pourT - 4.5) / 0.7;
+      mixB.x = lerp(tgt.x, mixB.homeX, k); mixB.y = lerp(tgt.y, mixB.homeY, k);
+      mixB.angle = 1.85 * (1 - k);
+      pourP = 1;
+    } else finishPour1();
+  }
+  // —— 庆祝后进入第②步 ——
+  if (phase === "step1cheer") {
+    cheerT += dt;
+    if (cheerT > 2.0) setupStep2();
+  }
+  // —— 第②步倾倒 ——
+  if (phase === "pouring2") {
+    pourT += dt;
+    const tgt = pourAnchor(recvB, 1.85, dish.x, dish.y - dish.h - fr * 0.9);
+    if (pourT < 0.5) {
+      const k = pourT / 0.5;
+      recvB.x = lerp(pourFrom.x, tgt.x, k); recvB.y = lerp(pourFrom.y, tgt.y, k);
+      recvB.angle = 1.85 * k;
+    } else if (pourT < 3.0) {
+      recvB.x = tgt.x; recvB.y = tgt.y; recvB.angle = 1.85;
+      pourP = (pourT - 0.5) / 2.5;
+    } else if (pourT < 3.7) {
+      const k = (pourT - 3.0) / 0.7;
+      recvB.x = lerp(tgt.x, recvB.homeX, k); recvB.y = lerp(tgt.y, recvB.homeY, k);
+      recvB.angle = 1.85 * (1 - k);
+      pourP = 1;
+    } else finishPour2();
+  }
+  // —— 加热蒸发 ——
+  if (phase === "heating") {
+    heatT += dt;
+    const wl = dishWater();
+    if (wl > 0.02) {
+      steamTimer -= dt;                    // 蒸汽粒子
+      if (steamTimer <= 0) {
+        steamTimer = 0.07;
+        const dx = dish.x + (Math.random() - 0.5) * dish.w * 0.6;
+        steam.push({ x: dx, y: dish.y - dish.h - 4, vy: -55 - Math.random() * 40, r: 5 + Math.random() * 6, life: 1.4, maxLife: 1.4 });
+      }
+      bubbleTimer -= dt;                   // 水中气泡
+      if (bubbleTimer <= 0) {
+        bubbleTimer = 0.12;
+        bubbles.push({ x: dish.x + (Math.random() - 0.5) * dish.w * 0.45, y: dish.y - 4, vy: -26 - Math.random() * 20, r: 1.5 + Math.random() * 2.5, life: 1 });
+      }
+    }
+    sizzleTimer -= dt;                     // 滋滋声
+    if (sizzleTimer <= 0) { sizzleTimer = 0.45; sizzle(); }
+    if (heatT >= 7) startCrystals();
+  }
+  // —— 析晶 ——
+  if (phase === "crystals") {
+    crysT += dt;
+    const n = Math.min(SALT_N, Math.floor(crysT / 1.8 * SALT_N));
+    if (n > lastCrystalCount) {            // 每出现一颗盐晶闪一下
+      for (let i = lastCrystalCount; i < n; i++) {
+        const s = saltSpots[i];
+        sparkles.push({ x: dish.x + s.dx * dish.w, y: dish.y - s.dy * dish.h - 4, t0: tSim });
+        pop(1200 + i * 60);
+      }
+      lastCrystalCount = n;
+    }
+    if (crysT >= 2.6) finishAll();
+  }
+  // —— 粒子更新 ——
+  const surfY = benchY - recvFill() * (recvB.h - 8) - 6;
+  for (const d of drips) { d.vy += 900 * dt; d.y += d.vy * dt; }
+  drips = drips.filter(d => d.y < surfY);
+  for (const s of steam) { s.y += s.vy * dt; s.x += Math.sin(tSim * 3 + s.r) * 14 * dt; s.life -= dt; s.r += 6 * dt; }
+  steam = steam.filter(s => s.life > 0);
+  for (const b of bubbles) { b.y += b.vy * dt; b.life -= dt * 0.8; }
+  bubbles = bubbles.filter(b => b.life > 0 && b.y > dish.y - dish.h);
+  sparkles = sparkles.filter(s => tSim - s.t0 < 0.7);
+  for (const c of confetti) { c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt; }
+}
+
+// 各容器当前水量（比例）
+function mixWater()  { return phase === "pouring1" || phase === "step1cheer" ? 0.7 * (1 - pourP) : (phase === "paper" || phase === "pour1ready" ? 0.7 : 0); }
+function sandLeft()  { return (phase === "paper" || phase === "pour1ready") ? SAND_N : Math.round(SAND_N * (1 - pourP)); }
+function sandOnPaper() { return (phase === "paper" || phase === "pour1ready") ? 0 : Math.min(SAND_N, Math.floor(pourP * SAND_N) + (phase === "pouring1" || pourP >= 1 ? 0 : 0)); }
+function recvFill() {
+  if (phase === "paper" || phase === "pour1ready") return 0;
+  if (phase === "pouring1" || phase === "step1cheer") return 0.62 * pourP;
+  if (phase === "pouring2") return 0.62 * (1 - pourP);
+  if (phase === "pour2ready") return 0.62;
+  return 0;
+}
+function dishWater() {
+  if (phase === "pouring2") return 0.6 * pourP;
+  if (phase === "placedish" || phase === "heatReady") return 0.6;
+  if (phase === "heating") return Math.max(0, 0.6 * (1 - heatT / 7));
+  return 0;
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawRoom() {
+  // 墙面
+  const g = ctx.createLinearGradient(0, 0, 0, benchY);
+  g.addColorStop(0, "#dff2fa"); g.addColorStop(1, "#c2e2f0");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, benchY);
+  // 木实验台
+  const g2 = ctx.createLinearGradient(0, benchY, 0, H);
+  g2.addColorStop(0, "#d9a355"); g2.addColorStop(1, "#b8813d");
+  ctx.fillStyle = g2; ctx.fillRect(0, benchY, W, H - benchY);
+  ctx.fillStyle = "rgba(120,80,30,0.35)"; ctx.fillRect(0, benchY, W, 5);
+}
+
+function drawLabel(text, x, y, color) {
+  ctx.font = "bold 14px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillStyle = color || "#5a4632";
+  ctx.fillText(text, x, y);
+}
+
+// 通用烧杯：底部中心 (b.x, b.y)，绕该点转 b.angle
+function drawBeaker(b, fillFrac, waterColor, sandCount, label) {
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.rotate(b.angle || 0);
+  const w = b.w, h = b.h;
+  // 玻璃
+  ctx.beginPath();
+  ctx.moveTo(-w / 2, -h); ctx.lineTo(-w / 2, -10);
+  ctx.quadraticCurveTo(-w / 2, 0, -w / 2 + 10, 0);
+  ctx.lineTo(w / 2 - 10, 0);
+  ctx.quadraticCurveTo(w / 2, 0, w / 2, -10);
+  ctx.lineTo(w / 2, -h);
+  ctx.strokeStyle = "rgba(90,110,130,0.9)"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.30)"; ctx.fill();
+  // 水（裁剪到杯内）
+  if (fillFrac > 0.005) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(-w / 2 + 3, -h, w - 6, h - 2); ctx.clip();
+    const wh = fillFrac * (h - 8);
+    ctx.fillStyle = waterColor;
+    ctx.fillRect(-w / 2, -wh - 4, w, wh + 4);
+    // 水面线
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.fillRect(-w / 2, -wh - 4, w, 3);
+    ctx.restore();
+  }
+  // 杯底沙粒
+  for (let i = 0; i < sandCount && i < mixSandSpots.length; i++) {
+    const s = mixSandSpots[i];
+    ctx.beginPath();
+    ctx.arc(s.sx * (w - 18), -s.sy * h, s.r, 0, 7);
+    ctx.fillStyle = i % 2 ? "#a5672a" : "#c98a3e";
+    ctx.fill();
+  }
+  ctx.restore();
+  if (label) drawLabel(label, b.x, b.y + 22);
+}
+
+// 倾倒的水流
+function drawStream(b, tx, ty) {
+  const a = b.angle || 0, c = Math.cos(a), s = Math.sin(a);
+  const lx = b.x + (b.w / 2) * c + b.h * 0.98 * s;
+  const ly = b.y + (b.w / 2) * s - b.h * 0.98 * c;
+  const wob = Math.sin(tSim * 28) * 4;
+  ctx.save();
+  ctx.strokeStyle = "rgba(140,200,255,0.85)"; ctx.lineWidth = 6; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(lx, ly);
+  ctx.quadraticCurveTo((lx + tx) / 2 + wob, (ly + ty) / 2, tx, ty);
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(lx, ly);
+  ctx.quadraticCurveTo((lx + tx) / 2 + wob, (ly + ty) / 2, tx, ty);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawFunnel() {
+  const { x, topY, coneTipY, stemTipY, r } = funnel;
+  // 铁架台
+  ctx.strokeStyle = "#7a7a7a"; ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(stand.x, benchY); ctx.lineTo(stand.x, topY - r * 0.3); ctx.stroke();
+  ctx.fillStyle = "#666";
+  roundRect(stand.x - r * 0.9, benchY - 10, r * 1.8, 12, 5, true);
+  // 铁圈
+  ctx.strokeStyle = "#888"; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(stand.x, topY + r * 0.35); ctx.lineTo(x + r * 0.8, topY + r * 0.35); ctx.stroke();
+  // 漏斗玻璃（锥 + 管）
+  ctx.beginPath();
+  ctx.moveTo(x - r, topY); ctx.lineTo(x, coneTipY); ctx.lineTo(x + r, topY); ctx.closePath();
+  ctx.fillStyle = "rgba(230,244,255,0.55)"; ctx.fill();
+  ctx.strokeStyle = "rgba(90,110,130,0.9)"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x - 6, coneTipY); ctx.lineTo(x - 6, stemTipY);
+  ctx.moveTo(x + 6, coneTipY); ctx.lineTo(x + 6, stemTipY);
+  ctx.stroke();
+  // 滤纸（放进漏斗后）
+  if (paper.placed) {
+    const pr = r * 0.88, pTop = topY + r * 0.06, pTip = coneTipY - r * 0.16;
+    ctx.beginPath();
+    ctx.moveTo(x - pr, pTop); ctx.lineTo(x, pTip); ctx.lineTo(x + pr, pTop); ctx.closePath();
+    ctx.fillStyle = "#fff6d8"; ctx.fill();
+    ctx.strokeStyle = "#d9c48a"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, pTop); ctx.lineTo(x, pTip);   // 折痕
+    ctx.strokeStyle = "rgba(190,160,90,0.6)"; ctx.stroke();
+    // 纸上的沙粒堆积
+    const n = sandOnPaper();
+    for (let i = 0; i < n; i++) {
+      const s = sandSpots[i];
+      const gy = pTop + s.t * (pTip - pTop);
+      const spread = pr * s.t * 0.7;
+      ctx.beginPath();
+      ctx.arc(x + s.s * spread, gy, s.r, 0, 7);
+      ctx.fillStyle = i % 2 ? "#a5672a" : "#c98a3e";
+      ctx.fill();
+    }
+  }
+  drawLabel("漏斗", x + r * 0.4, topY - r * 0.28);
+}
+
+// 未放置的滤纸（锥形纸图标）
+function drawPaperIcon() {
+  if (paper.placed) return;
+  const { x, y, r } = paper;
+  ctx.save();
+  if (drag && drag.obj === paper) { ctx.shadowColor = "rgba(255,213,74,0.9)"; ctx.shadowBlur = 18; }
+  ctx.beginPath();
+  ctx.moveTo(x - r, y - r * 0.55); ctx.lineTo(x, y + r * 0.75); ctx.lineTo(x + r, y - r * 0.55); ctx.closePath();
+  ctx.fillStyle = "#fff6d8"; ctx.fill();
+  ctx.strokeStyle = "#d9c48a"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x, y - r * 0.55); ctx.lineTo(x, y + r * 0.75);
+  ctx.strokeStyle = "rgba(190,160,90,0.6)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.restore();
+  drawLabel("滤纸", x, y + r * 1.15);
+}
+
+// 蒸发皿：浅碗，f=水量比例
+function drawDish() {
+  const d = dish;
+  const f = dishWater();
+  ctx.save();
+  ctx.translate(d.x, d.y);
+  if (drag && drag.obj === d) { ctx.shadowColor = "rgba(255,213,74,0.9)"; ctx.shadowBlur = 18; }
+  const wT = d.w / 2, wB = d.w * 0.31, h = d.h;
+  // 碗内水
+  if (f > 0.005) {
+    const wh = f * h;
+    const k = wh / h;                        // 当前水面处的半宽
+    const ww = wB + (wT - wB) * k;
+    ctx.beginPath();
+    ctx.moveTo(-wB, 0); ctx.lineTo(-ww, -wh); ctx.lineTo(ww, -wh); ctx.lineTo(wB, 0);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(64,150,240,0.62)"; ctx.fill();
+    // 水面线
+    ctx.strokeStyle = "rgba(30,110,210,0.9)"; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(-ww, -wh); ctx.lineTo(ww, -wh); ctx.stroke();
+  }
+  ctx.restore();
+  // 盐晶
+  const cn = phase === "crystals" ? lastCrystalCount : (phase === "done" ? SALT_N : 0);
+  ctx.save();
+  ctx.translate(d.x, d.y);
+  for (let i = 0; i < cn; i++) {
+    const s = saltSpots[i];
+    ctx.save();
+    ctx.translate(s.dx * d.w, -s.dy * d.h * 0.4 - 3);
+    ctx.rotate(s.rot);
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "#cfd8dc"; ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(0, -s.sz); ctx.lineTo(s.sz * 0.8, 0); ctx.lineTo(0, s.sz); ctx.lineTo(-s.sz * 0.8, 0);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
+  // 碗体（画在水上面，陶瓷）
+  ctx.save();
+  ctx.translate(d.x, d.y);
+  if (drag && drag.obj === d) { ctx.shadowColor = "rgba(255,213,74,0.9)"; ctx.shadowBlur = 18; }
+  ctx.beginPath();
+  ctx.moveTo(-wT, -h); ctx.lineTo(-wB, 0); ctx.lineTo(wB, 0); ctx.lineTo(wT, -h);
+  ctx.strokeStyle = "#8d9aae"; ctx.lineWidth = 3.5; ctx.lineJoin = "round"; ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-wT, -h); ctx.lineTo(wT, -h);
+  ctx.strokeStyle = "#aab8c8"; ctx.lineWidth = 4; ctx.stroke();
+  ctx.restore();
+  if (!d.onLamp) drawLabel("蒸发皿", d.x, d.y + 22);
+}
+
+function drawLamp() {
+  const lx = lamp.x, ly = lamp.y;
+  const lit = phase === "heating" || phase === "crystals" || phase === "done";
+  // 灯身（酒精灯玻璃瓶）
+  ctx.save();
+  ctx.translate(lx, ly);
+  ctx.beginPath();
+  ctx.moveTo(-lamp.w / 2, 0);
+  ctx.quadraticCurveTo(-lamp.w / 2 - 6, -lamp.bodyH * 0.7, -lamp.w * 0.16, -lamp.bodyH);
+  ctx.lineTo(lamp.w * 0.16, -lamp.bodyH);
+  ctx.quadraticCurveTo(lamp.w / 2 + 6, -lamp.bodyH * 0.7, lamp.w / 2, 0);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(230,244,255,0.6)"; ctx.fill();
+  ctx.strokeStyle = "rgba(90,110,130,0.9)"; ctx.lineWidth = 3; ctx.stroke();
+  // 酒精
+  ctx.fillStyle = "rgba(140,200,255,0.45)";
+  ctx.beginPath();
+  ctx.moveTo(-lamp.w / 2 + 3, 0);
+  ctx.quadraticCurveTo(-lamp.w / 2 - 3, -lamp.bodyH * 0.5, -lamp.w * 0.3, -lamp.bodyH * 0.55);
+  ctx.lineTo(lamp.w * 0.3, -lamp.bodyH * 0.55);
+  ctx.quadraticCurveTo(lamp.w / 2 + 3, -lamp.bodyH * 0.5, lamp.w / 2 - 3, 0);
+  ctx.closePath(); ctx.fill();
+  // 灯芯管
+  ctx.fillStyle = "#9aa7b5";
+  roundRect(-lamp.w * 0.14, -lamp.bodyH - fr * 0.16, lamp.w * 0.28, fr * 0.2, 4, true);
+  ctx.restore();
+  // 火焰
+  if (lit) {
+    const fx0 = lx, fy0 = lamp.wickY;
+    const flick = 1 + Math.sin(tSim * 17) * 0.08 + Math.sin(tSim * 31) * 0.05;
+    const fh2 = fr * 0.95 * flick;
+    // 光晕
+    const g = ctx.createRadialGradient(fx0, fy0 - fh2 * 0.4, 4, fx0, fy0 - fh2 * 0.4, fh2 * 1.6);
+    g.addColorStop(0, "rgba(255,160,40,0.35)"); g.addColorStop(1, "rgba(255,160,40,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(fx0, fy0 - fh2 * 0.4, fh2 * 1.6, 0, 7); ctx.fill();
+    // 外焰
+    ctx.beginPath();
+    ctx.moveTo(fx0 - fr * 0.3, fy0);
+    ctx.quadraticCurveTo(fx0 - fr * 0.32, fy0 - fh2 * 0.6, fx0 + Math.sin(tSim * 13) * 3, fy0 - fh2);
+    ctx.quadraticCurveTo(fx0 + fr * 0.32, fy0 - fh2 * 0.6, fx0 + fr * 0.3, fy0);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(255,140,30,0.9)"; ctx.fill();
+    // 内焰（蓝）
+    ctx.beginPath();
+    ctx.moveTo(fx0 - fr * 0.14, fy0);
+    ctx.quadraticCurveTo(fx0 - fr * 0.15, fy0 - fh2 * 0.35, fx0, fy0 - fh2 * 0.55);
+    ctx.quadraticCurveTo(fx0 + fr * 0.15, fy0 - fh2 * 0.35, fx0 + fr * 0.14, fy0);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(90,160,255,0.85)"; ctx.fill();
+  }
+  drawLabel("酒精灯", lx, ly + 22);
+}
+
+function drawParticles() {
+  // 下滴水滴
+  for (const d of drips) {
+    ctx.beginPath(); ctx.arc(d.x, d.y, 4, 0, 7);
+    ctx.fillStyle = "rgba(120,190,255,0.9)"; ctx.fill();
+  }
+  // 蒸汽
+  for (const s of steam) {
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 7);
+    ctx.fillStyle = `rgba(255,255,255,${0.55 * (s.life / s.maxLife)})`;
+    ctx.fill();
+  }
+  // 水中气泡
+  for (const b of bubbles) {
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7);
+    ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  // 闪光星星
+  for (const s of sparkles) {
+    const k = (tSim - s.t0) / 0.7, a = 1 - k, rr = 6 + k * 12;
+    ctx.save();
+    ctx.translate(s.x, s.y); ctx.rotate(k * 1.5);
+    ctx.strokeStyle = `rgba(255,235,120,${a})`; ctx.lineWidth = 2.5; ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(-rr, 0); ctx.lineTo(rr, 0);
+    ctx.moveTo(0, -rr); ctx.lineTo(0, rr);
+    ctx.stroke();
+    ctx.restore();
+  }
+  // 彩纸
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+}
+
+// 拖拽时目标区域虚线光圈
+function drawDropZones() {
+  if (!drag) return;
+  let zone = null;
+  if (drag.obj === paper && phase === "paper")
+    zone = { x: funnel.x, y: funnel.topY + funnel.fh * 0.35, r: funnel.r * 1.15 };
+  else if (drag.obj === mixB && (phase === "paper" || phase === "pour1ready"))
+    zone = { x: funnel.x, y: funnel.topY - fr * 0.6, r: fr * 1.5 };
+  else if (drag.obj === recvB && phase === "pour2ready")
+    zone = { x: dish.x, y: dish.y - dish.h - fr * 0.7, r: fr * 1.4 };
+  else if (drag.obj === dish && phase === "placedish")
+    zone = { x: dishLampX, y: dishLampY - dish.h * 0.5, r: fr * 1.3 };
+  if (!zone) return;
+  const pulse = 1 + Math.sin(tSim * 6) * 0.08;
+  ctx.save();
+  ctx.setLineDash([10, 8]);
+  ctx.strokeStyle = "rgba(255,180,0,0.95)"; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.arc(zone.x, zone.y, zone.r * pulse, 0, 7); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+// 加热时的“水分”计量条：把看不见的水量画出来
+function drawWaterGauge() {
+  if (phase !== "heating" && phase !== "crystals") return;
+  const gx = lamp.x + fr * 1.9, gh = fr * 1.9, gy = benchY - gh;
+  const f = dishWater() / 0.6;
+  ctx.save();
+  ctx.fillStyle = "rgba(20,50,80,0.75)";
+  roundRect(gx - 26, gy - 34, 52, gh + 58, 12, true);
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 14px 'PingFang SC','Microsoft YaHei',sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("水分", gx, gy - 14);
+  ctx.fillStyle = "rgba(255,255,255,0.25)";
+  roundRect(gx - 10, gy, 20, gh, 8, true);
+  if (f > 0.005) {
+    ctx.fillStyle = "#4fc3f7";
+    roundRect(gx - 10, gy + gh * (1 - f), 20, gh * f, 8, true);
+  }
+  ctx.fillStyle = "#4fc3f7";
+  ctx.fillText("💧", gx, gy + gh + 18);
+  ctx.restore();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawRoom();
+  const step1 = phase === "paper" || phase === "pour1ready" || phase === "pouring1" || phase === "step1cheer";
+  if (step1) {
+    drawFunnel();
+    drawBeaker(recvB, recvFill(), "rgba(120,190,255,0.5)", 0, "承接烧杯");
+    if (!mixB.pouring) drawBeaker(mixB, mixWater(), "rgba(190,165,110,0.55)", sandLeft(), "混悬液（沙+盐+水）");
+    drawPaperIcon();
+    if (mixB.pouring) {   // 倾倒中的杯子画最上层
+      if (pourT > 0.5 && pourT < 4.5) drawStream(mixB, funnel.x, funnel.topY + 4);
+      drawBeaker(mixB, mixWater(), "rgba(190,165,110,0.55)", sandLeft(), null);
+    }
+  } else {
+    drawLamp();
+    drawDish();
+    if (!recvB.pouring) drawBeaker(recvB, recvFill(), "rgba(120,190,255,0.5)", 0, "滤液（盐水）");
+    if (recvB.pouring) {
+      if (pourT > 0.5 && pourT < 3.0) drawStream(recvB, dish.x, dish.y - dish.h + 2);
+      drawBeaker(recvB, recvFill(), "rgba(120,190,255,0.5)", 0, null);
+    }
+    drawWaterGauge();
+  }
+  drawDropZones();
+  drawParticles();
+}
+
+/* ================= 交互 ================= */
+function hitObj(o, x, y, padR) {
+  const hw = (o.w || o.r * 2) / 2 + padR, hh = (o.h || o.r * 2) / 2 + padR;
+  const cy = o.y - (o.h ? o.h / 2 : 0);
+  return Math.abs(x - o.x) < hw && Math.abs(y - cy) < hh;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  unlockAudio();
+  if (winPanel.style.display === "flex") return;
+  const x = e.clientX, y = e.clientY;
+  let obj = null;
+  // 按当前步骤允许拖拽的东西
+  if ((phase === "paper" || phase === "pour1ready")) {
+    if (!paper.placed && hitObj(paper, x, y, 26)) obj = paper;
+    else if (hitObj(mixB, x, y, 26)) obj = mixB;
+  } else if (phase === "pour2ready" || phase === "placedish") {
+    if (recvFill() > 0.01 && hitObj(recvB, x, y, 26)) obj = recvB;
+    else if (!dish.onLamp && hitObj(dish, x, y, 26)) obj = dish;
+  }
+  if (obj) {
+    drag = { obj, dx: obj.x - x, dy: obj.y - y, pid: e.pointerId };
+    obj.returning = false;
+    canvas.setPointerCapture(e.pointerId);
+    pop(520);
+  } else if (phase === "heatReady") {
+    showHint("点右上角的【🔥 点火】按钮开始加热！", 2500);
+  }
+  hintEl.style.opacity = "0";
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag || e.pointerId !== drag.pid) return;
+  drag.obj.x = e.clientX + drag.dx;
+  drag.obj.y = e.clientY + drag.dy;
+});
+window.addEventListener("pointerup", e => {
+  if (!drag || e.pointerId !== drag.pid) return;
+  const o = drag.obj; drag = null;
+  // 滤纸 → 漏斗
+  if (o === paper && phase === "paper") {
+    if (Math.hypot(o.x - funnel.x, o.y - (funnel.topY + funnel.fh * 0.35)) < funnel.r * 1.3) { placePaper(); return; }
+  }
+  // 混悬液烧杯 → 漏斗上方
+  if (o === mixB && (phase === "paper" || phase === "pour1ready")) {
+    if (Math.hypot(o.x - funnel.x, o.y - (funnel.topY - fr * 0.6)) < fr * 1.6) {
+      if (!paper.placed) { showHint("先在漏斗里放好滤纸，不然沙子会漏下去哦 📄", 3000); pop(300); }
+      else { startPour1(); return; }
+    }
+  }
+  // 滤液烧杯 → 蒸发皿上方
+  if (o === recvB && phase === "pour2ready") {
+    if (Math.hypot(o.x - dish.x, o.y - (dish.y - dish.h - fr * 0.7)) < fr * 1.5) { startPour2(); return; }
+  }
+  // 蒸发皿 → 酒精灯
+  if (o === dish && (phase === "pour2ready" || phase === "placedish")) {
+    if (Math.hypot(o.x - dishLampX, o.y - (dishLampY - dish.h * 0.5)) < fr * 1.4) {
+      if (phase !== "placedish") { showHint("先把清水倒进蒸发皿哦 💧", 2500); pop(300); }
+      else { placeDishOnLamp(); return; }
+    }
+  }
+  // 没放对：滑回原位
+  o.returning = true;
+  pop(320);
+});
+
+fireBtn.addEventListener("click", () => { unlockAudio(); ignite(); });
+document.getElementById("resetBtn").addEventListener("click", () => { resetGame(); pop(880); });
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  updateSim(dt);
+  // 蒸发皿在灯上时跟随灯位
+  if (dish.onLamp) { dish.x = dishLampX; dish.y = dishLampY; }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function unlockAudio() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === "suspended") actx.resume();
+  } catch (e) {}
+}
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const drip = () => tone(850 + Math.random() * 250, 0.07, 0.05);
+const sizzle = () => tone(2200 + Math.random() * 1600, 0.08, 0.02, "square");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 1800);
+}
+
+resize();
+resetGame();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

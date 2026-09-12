@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>规律珠珠项链</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#fdf0e4; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(90,50,20,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(90,50,20,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #diffBar {
+    position:absolute; top:12px; right:12px; z-index:10;
+    display:flex; gap:8px;
+  }
+  #diffBar button {
+    font-size:16px; font-weight:bold; padding:10px 16px;
+    border-radius:22px; border:3px solid rgba(90,50,20,0.35);
+    background:rgba(255,255,255,0.75); color:#7a4a1e; cursor:pointer;
+  }
+  #diffBar button.on {
+    background:#ffb300; border-color:#e65100; color:#4e2600;
+    box-shadow:0 3px 8px rgba(0,0,0,0.2);
+  }
+  #diffBar button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">第 1 串 · ⭐ 0</div>
+<div id="diffBar">
+  <button data-d="ab" class="on">简单 AB</button>
+  <button data-d="aab">中等 AAB</button>
+  <button data-d="abc">挑战 ABC</button>
+</div>
+<div id="hint">看看珠子的规律，把下面的珠子拖到空位上补完项链！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+const SHAPES = ["circle", "triangle", "square", "star"];
+const COLORS = [
+  { fill:"#ff5252", dark:"#c62828" },  // 红
+  { fill:"#ffd54a", dark:"#c79500" },  // 黄
+  { fill:"#42a5f5", dark:"#1565c0" },  // 蓝
+  { fill:"#66bb6a", dark:"#2e7d32" },  // 绿
+  { fill:"#ab47bc", dark:"#6a1b9a" },  // 紫
+  { fill:"#ffa726", dark:"#e65100" },  // 橙
+];
+// 一颗珠子的“花色”：形状 + 颜色下标
+function sameType(a, b) { return a.shape === b.shape && a.color === b.color; }
+
+const DIFFS = {
+  ab:  { unitLen:2, kind:"ab"  },
+  aab: { unitLen:3, kind:"aab" },
+  abc: { unitLen:3, kind:"abc" },
+};
+let difficulty = "ab";
+
+let seq = [];        // 整串珠子的花色（含空位应有的答案）
+let shown = 0;       // 前面已给出的珠子数
+let slots = [];      // 空位 {x,y,r, expected, bead, popT}
+let tray = [];       // 备选珠子 {type, x,y, homeX,homeY, r, used, goHome, vx,vy}
+let beadsPos = [];   // 已给出珠子的位置 {x,y}
+let beadR = 26, beadY = 0, trayY = 0;
+let completed = 0, stars = 0;
+let mode = "play";   // play | celebrate
+let confetti = [];   // 庆祝彩纸 {x,y,vx,vy,color,rot,vr,life}
+let starFx = null;   // 得星动画 {t}
+let drag = null;     // 正在拖的珠子 {bead, dx, dy}
+
+function rnd(n) { return Math.floor(Math.random() * n); }
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = rnd(i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+// 选 n 种形状不同、颜色也不同的花色，方便孩子辨认
+function distinctTypes(n) {
+  const si = shuffle(SHAPES.map((_, i) => i)).slice(0, n);
+  const ci = shuffle(COLORS.map((_, i) => i)).slice(0, n);
+  return si.map((s, k) => ({ shape: SHAPES[s], color: ci[k] }));
+}
+
+/* ================= 生成规律 ================= */
+function newNecklace() {
+  const kind = DIFFS[difficulty].kind;
+  let unit;
+  if (kind === "ab") {
+    const t = distinctTypes(2);
+    unit = [t[0], t[1]];
+  } else if (kind === "aab") {
+    const t = distinctTypes(2);
+    unit = [t[0], t[0], t[1]];
+  } else {
+    const t = distinctTypes(3);
+    unit = [t[0], t[1], t[2]];
+  }
+  shown = 6 + rnd(3);                       // 给出 6~8 颗
+  const fill = 2 + (Math.random() < 0.5 ? 1 : 0);  // 留 2~3 个空位
+  seq = [];
+  for (let i = 0; i < shown + fill; i++) seq.push(unit[i % unit.length]);
+  // 空位
+  slots = seq.slice(shown).map(t => ({ x:0, y:0, r:0, expected:t, bead:null, popT:0 }));
+  // 备选珠子：每个空位对应一颗正确珠子 + 若干干扰珠
+  const needed = slots.map(s => s.expected);
+  tray = needed.map(t => newTrayBead(t));
+  const nDis = Math.max(2, 5 - fill);
+  let guard = 0;
+  while (tray.length < needed.length + nDis && guard++ < 60) {
+    const t = { shape: SHAPES[rnd(SHAPES.length)], color: rnd(COLORS.length) };
+    if (needed.some(n => sameType(n, t))) continue;   // 干扰珠不撞答案，保证每空位只有一颗对的
+    tray.push(newTrayBead(t));
+  }
+  shuffle(tray);
+  mode = "play";
+  drag = null;
+  layout();
+  updateScore();
+}
+function newTrayBead(t) {
+  return { type:t, x:0, y:0, homeX:0, homeY:0, r:beadR, used:false, goHome:false, vx:0, vy:0 };
+}
+function updateScore() {
+  scorebar.textContent = `第 ${completed + 1} 串 · ⭐ ${stars}`;
+}
+
+/* ================= 布局 ================= */
+function layout() {
+  if (!seq.length) return;
+  const n = seq.length;
+  const spacing = Math.min(88, (W - 80) / n);
+  beadR = Math.max(15, Math.min(32, spacing * 0.36));
+  beadY = H * 0.36;
+  trayY = H * 0.72;
+  const x0 = W / 2 - (n - 1) * spacing / 2;
+  beadsPos = [];
+  for (let i = 0; i < shown; i++) beadsPos.push({ x:x0 + i * spacing, y:beadY });
+  slots.forEach((s, k) => {
+    s.x = x0 + (shown + k) * spacing; s.y = beadY; s.r = beadR;
+    if (s.bead) { s.bead.x = s.x; s.bead.y = s.y; }
+  });
+  const ts = Math.min(96, (W - 120) / tray.length);
+  const tx0 = W / 2 - (tray.length - 1) * ts / 2;
+  tray.forEach((b, k) => {
+    b.homeX = tx0 + k * ts; b.homeY = trayY;
+    b.r = Math.max(18, Math.min(34, ts * 0.36));
+    // 拖拽中或弹回途中的珠子不接管位置
+    if (!b.used && b !== (drag && drag.bead) && !b.goHome) {
+      b.x = b.homeX; b.y = b.homeY;
+    }
+  });
+}
+
+/* ================= 交互（拖拽） ================= */
+function ptr(e) { return [e.clientX, e.clientY]; }
+
+canvas.addEventListener("pointerdown", e => {
+  if (mode !== "play") return;
+  const [px, py] = ptr(e);
+  // 从最上层开始找备选珠子（大触控热区）
+  for (let i = tray.length - 1; i >= 0; i--) {
+    const b = tray[i];
+    if (b.used || b.goHome) continue;
+    if (Math.hypot(px - b.x, py - b.y) < b.r * 1.5) {
+      drag = { bead:b, dx:px - b.x, dy:py - b.y };
+      tray.splice(i, 1); tray.push(b);   // 提到最上层
+      canvas.setPointerCapture(e.pointerId);
+      pop(700);
+      hintEl.style.opacity = "0";
+      return;
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const [px, py] = ptr(e);
+  drag.bead.x = px - drag.dx;
+  drag.bead.y = py - drag.dy;
+});
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  const b = drag.bead;
+  drag = null;
+  // 找最近的空位
+  let best = null, bestD = 1e9;
+  for (const s of slots) {
+    if (s.bead) continue;
+    const d = Math.hypot(b.x - s.x, b.y - s.y);
+    if (d < bestD) { bestD = d; best = s; }
+  }
+  if (best && bestD < s_dropDist(best, b)) {
+    if (sameType(b.type, best.expected)) {
+      // 放对：锁入空位
+      best.bead = b;
+      b.used = true;
+      b.x = best.x; b.y = best.y;
+      best.popT = performance.now();
+      ding();
+      if (slots.every(s => s.bead)) finishNecklace();
+      else showHint("对啦！继续～");
+    } else {
+      // 放错：轻轻弹回，无惩罚
+      b.goHome = true;
+      boing();
+      showHint("这颗不对哦，再看看前面的规律～");
+    }
+  } else {
+    b.goHome = true;   // 没放到空位上，回原地
+  }
+});
+function s_dropDist(s, b) { return s.r + b.r + 22; }
+
+function finishNecklace() {
+  completed++;
+  let msg = "🎉 项链补完啦！真棒！";
+  if (completed % 5 === 0) {
+    stars++;
+    starFx = { t: 0 };
+    msg = "⭐ 完成 5 串，奖励一颗星星！";
+    starSound();
+  } else {
+    fanfare();
+  }
+  spawnConfetti();
+  showHint(msg);
+  updateScore();
+  mode = "celebrate";
+  setTimeout(newNecklace, 1500);   // 庆祝后自动出下一串，无限续玩
+}
+
+/* ================= 动画更新 ================= */
+function update(dt) {
+  // 弹回动画：弹簧回家
+  for (const b of tray) {
+    if (!b.goHome) continue;
+    const k = 90, damp = 12;
+    b.vx += ((b.homeX - b.x) * k - b.vx * damp) * dt;
+    b.vy += ((b.homeY - b.y) * k - b.vy * damp) * dt;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    if (Math.hypot(b.homeX - b.x, b.homeY - b.y) < 2 && Math.hypot(b.vx, b.vy) < 30) {
+      b.x = b.homeX; b.y = b.homeY; b.vx = b.vy = 0; b.goHome = false;
+    }
+  }
+  // 彩纸
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.vy += 620 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += c.vr * dt;
+    c.life -= dt;
+    if (c.life <= 0 || c.y > H + 30) confetti.splice(i, 1);
+  }
+  if (starFx) {
+    starFx.t += dt;
+    if (starFx.t > 1.6) starFx = null;
+  }
+}
+function spawnConfetti() {
+  const cx = W / 2, cy = beadY;
+  for (let i = 0; i < 90; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 320;
+    confetti.push({
+      x:cx + (Math.random() - 0.5) * 200, y:cy,
+      vx:Math.cos(a) * sp, vy:Math.sin(a) * sp - 260,
+      color:COLORS[rnd(COLORS.length)].fill,
+      rot:Math.random() * 7, vr:(Math.random() - 0.5) * 12,
+      life:1.4 + Math.random() * 0.8,
+    });
+  }
+}
+
+/* ================= 绘制 ================= */
+function drawShape(x, y, r, type, scale) {
+  const c = COLORS[type.color];
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(scale, scale);
+  ctx.beginPath();
+  if (type.shape === "circle") {
+    ctx.arc(0, 0, r, 0, 7);
+  } else if (type.shape === "triangle") {
+    ctx.moveTo(0, -r); ctx.lineTo(r * 0.9, r * 0.72); ctx.lineTo(-r * 0.9, r * 0.72);
+    ctx.closePath();
+  } else if (type.shape === "square") {
+    roundPath(-r * 0.82, -r * 0.82, r * 1.64, r * 1.64, r * 0.3);
+  } else {  // star
+    for (let i = 0; i < 10; i++) {
+      const rr = i % 2 === 0 ? r : r * 0.45;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+      i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+  }
+  ctx.fillStyle = c.fill;
+  ctx.fill();
+  ctx.lineWidth = Math.max(2, r * 0.12);
+  ctx.strokeStyle = c.dark;
+  ctx.stroke();
+  // 高光
+  ctx.beginPath();
+  ctx.arc(-r * 0.3, -r * 0.35, r * 0.22, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  ctx.fill();
+  ctx.restore();
+}
+function roundPath(x, y, w, h, r) {
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawString() {
+  // 项链绳：过所有珠子中心的下垂曲线
+  const pts = beadsPos.concat(slots.map(s => ({ x:s.x, y:s.y })));
+  if (pts.length < 2) return;
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x - beadR * 1.6, pts[0].y - beadR * 2.2);
+  ctx.lineTo(pts[0].x, pts[0].y);
+  for (let i = 0; i < pts.length - 1; i++) {
+    const mx = (pts[i].x + pts[i + 1].x) / 2;
+    const my = (pts[i].y + pts[i + 1].y) / 2 + 8;
+    ctx.quadraticCurveTo(mx, my, pts[i + 1].x, pts[i + 1].y);
+  }
+  const last = pts[pts.length - 1];
+  ctx.lineTo(last.x + beadR * 1.6, last.y - beadR * 2.2);
+  ctx.strokeStyle = "rgba(150,90,40,0.55)";
+  ctx.lineWidth = 4;
+  ctx.stroke();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 背景：柔和的奶油色渐变 + 淡淡圆点
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#fff6e8"); g.addColorStop(1, "#ffe3ec");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "rgba(255,180,120,0.10)";
+  for (let i = 0; i < 14; i++) {
+    const dx = (i * 197.3) % (W + 120) - 60;
+    const dy = (i * 131.7) % (H + 120) - 60;
+    ctx.beginPath(); ctx.arc(dx, dy, 34 + (i % 4) * 12, 0, 7); ctx.fill();
+  }
+  // 标题
+  ctx.textAlign = "center";
+  ctx.fillStyle = "rgba(122,74,30,0.85)";
+  ctx.font = `bold ${Math.min(30, W / 22)}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.fillText("🧵 规律珠珠项链", W / 2, H * 0.13);
+
+  drawString();
+  // 已给出的珠子（轻轻上下浮动）
+  const t = performance.now() / 1000;
+  beadsPos.forEach((p, i) => {
+    drawShape(p.x, p.y + Math.sin(t * 2 + i * 0.7) * 2.5, beadR, seq[i], 1);
+  });
+  // 空位 / 锁入的珠子
+  for (const s of slots) {
+    if (s.bead) {
+      const e = Math.min(1, (performance.now() - s.popT) / 300);
+      const sc = 1 + 0.35 * Math.sin(e * Math.PI);   // 叮一下放大回弹
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.r * 1.25, 0, 7);
+      ctx.fillStyle = "rgba(255,213,74,0.35)"; ctx.fill();   // 金色光圈
+      drawShape(s.x, s.y, s.r, s.bead.type, sc);
+    } else {
+      ctx.save();
+      ctx.setLineDash([8, 7]);
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 7);
+      ctx.strokeStyle = "rgba(122,74,30,0.55)"; ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(122,74,30,0.45)";
+      ctx.font = `bold ${s.r}px "PingFang SC",sans-serif`;
+      ctx.fillText("?", s.x, s.y + s.r * 0.36);
+      ctx.restore();
+    }
+  }
+  // 备选珠子托盘
+  const pad = 26;
+  const xs = tray.map(b => b.homeX);
+  if (xs.length) {
+    const x0 = Math.min(...xs) - 60, x1 = Math.max(...xs) + 60;
+    ctx.beginPath();
+    roundPath(x0 - pad, trayY - 58, (x1 - x0) + pad * 2, 116, 26);
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(122,74,30,0.25)"; ctx.lineWidth = 3; ctx.stroke();
+  }
+  ctx.fillStyle = "rgba(122,74,30,0.7)";
+  ctx.font = `bold ${Math.min(20, W / 32)}px "PingFang SC",sans-serif`;
+  ctx.fillText("👇 从这里选珠子", W / 2, trayY + 92);
+  // 备选珠子（被拖的最后画，带阴影放大）
+  for (const b of tray) {
+    if (b.used || b === (drag && drag.bead)) continue;
+    drawShape(b.x, b.y, b.r, b.type, 1);
+  }
+  if (drag) {
+    const b = drag.bead;
+    ctx.save();
+    ctx.beginPath(); ctx.arc(b.x, b.y + 6, b.r * 0.9, 0, 7);
+    ctx.fillStyle = "rgba(0,0,0,0.15)"; ctx.fill();
+    ctx.restore();
+    drawShape(b.x, b.y, b.r, b.type, 1.15);
+  }
+  // 彩纸
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-6, -4, 12, 8);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+  // 得星动画：大星星从中间冒出来后飞向顶部
+  if (starFx) {
+    const e = starFx.t / 1.6;
+    const up = e < 0.5 ? e / 0.5 : 1;                    // 前半段放大出现
+    const fly = e < 0.5 ? 0 : (e - 0.5) / 0.5;           // 后半段飞走
+    const sx = W / 2;
+    const sy = H * 0.45 + (24 - H * 0.45) * fly;
+    const sc = (0.4 + 0.8 * up) * (1 - 0.5 * fly);
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.scale(sc, sc);
+    ctx.font = `bold 90px "PingFang SC",sans-serif`;
+    ctx.textAlign = "center";
+    ctx.fillText("⭐", 0, 30);
+    ctx.restore();
+  }
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+function ding() { tone(880, 0.12, 0.14); setTimeout(() => tone(1319, 0.22, 0.12), 70); }
+function boing() { tone(240, 0.18, 0.07, "triangle"); }
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+function starSound() { [523, 659, 784, 1047, 1319, 1568].forEach((f, i) => setTimeout(() => pop(f), i * 110)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2000);
+}
+document.querySelectorAll("#diffBar button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    difficulty = btn.dataset.d;
+    document.querySelectorAll("#diffBar button").forEach(b => b.classList.toggle("on", b === btn));
+    newNecklace();
+    pop(880);
+    showHint("换难度啦，看看新规律！");
+  });
+});
+
+newNecklace();
+resize();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

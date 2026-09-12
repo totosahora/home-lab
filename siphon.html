@@ -1,0 +1,1050 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>虹吸与水位</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #tabs {
+    position:absolute; top:12px; left:12px; z-index:20; display:flex; gap:10px;
+  }
+  .tab {
+    font-size:20px; font-weight:bold; padding:12px 24px;
+    border-radius:28px; border:3px solid #4a9fe0; background:#eaf6ff; color:#1a5fb4;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.15); user-select:none;
+  }
+  .tab.active { background:#3f9ff0; color:#fff; transform:scale(1.05); }
+  .tab:active { transform:scale(1.1); }
+  #resetBtn {
+    font-size:20px; font-weight:bold; padding:12px 20px;
+    border-radius:28px; border:3px solid #7ec850; background:#e8f7d8; color:#3a7a1a;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.15); user-select:none;
+  }
+  #resetBtn:active { transform:scale(1.08); }
+  #scorebar {
+    position:absolute; top:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,100,0.85); color:#bfe6ff; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,100,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:88%; text-align:center;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="tabs">
+  <button id="tabU" class="tab active">🫗 连通器</button>
+  <button id="tabS" class="tab">🧪 虹吸实验</button>
+  <button id="resetBtn">🔄 重新开始</button>
+</div>
+<div id="scorebar"></div>
+<div id="hint"></div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const tabU = document.getElementById("tabU");
+const tabS = document.getElementById("tabS");
+let W = 0, H = 0, DPR = 1;
+let mode = "utube";        // utube 连通器 | siphon 虹吸
+let time = 0;              // 全局动画时间（秒）
+
+const ease = t => t * t * (3 - 2 * t);
+
+/* ================= 布局 ================= */
+let tableY = 0;
+// U 形连通管几何
+const U = { cxL:0, cxR:0, armW:46, wall:7, yTop:0, chanBot:0, chanH:64, cellH:42 };
+// 虹吸杯子几何
+const S = { cupW:176, cupH:230, wall:7, cxL:0, cxR:0, top:0 };
+
+function layout() {
+  const oldChanBot = U.chanBot;
+  tableY = Math.round(H * 0.84);
+  // U 形管
+  const gap = Math.max(110, Math.min(W * 0.17, 210));
+  U.cxL = W / 2 - gap; U.cxR = W / 2 + gap;
+  U.yTop = Math.max(160, H * 0.26);
+  U.chanBot = tableY - 8;
+  // 杯子
+  S.cupH = Math.max(190, Math.min(250, tableY - 180));
+  S.cxL = W * 0.27; S.cxR = W * 0.73;
+  S.top = tableY - S.cupH;
+  // 道具回家位置
+  kettle.homeX = W - 120; kettle.homeY = Math.max(120, H * 0.15);
+  pump.homeX = Math.max(100, W * 0.08); pump.homeY = tableY - 52;
+  hose.dockX = W / 2; hose.dockY = tableY - 42;
+  if (!kettle.dragging && kettle.retT >= 1) { kettle.x = kettle.homeX; kettle.y = kettle.homeY; }
+  if (pump.mode === "home") { pump.x = pump.homeX; pump.y = pump.homeY; }
+  // 窗口变化时保持水位格数不变（跟着管底平移），并夹在管内
+  if (oldChanBot) lvlY += U.chanBot - oldChanBot;
+  lvlY = Math.max(U.yTop + 30, Math.min(U.chanBot - 10, lvlY));
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 连通器：场景数据 ================= */
+let lvlY = 0;              // 水面高度（两边共用一个 lvlY：这就是连通器原理）
+let droplets = [];         // 水壶倒出的水滴 {x, y, vx, vy, arm}
+let ripples = [];          // 水面涟漪 {x, y, t}
+let uBubbles = [];         // 管内小气泡 {x, y, r, vy}
+let glints = [];           // 水面高光粒子 {arm, off, sp}
+let pourAcc = 0;
+let pouredThisDrag = false;
+let lastGlug = 0, lastSplash = 0, lastEqualHint = -10;
+
+const kettle = { x:0, y:0, homeX:0, homeY:0, dragging:false, tilt:0, retT:1, fromX:0, fromY:0, offX:0, offY:0 };
+
+function resetUtube() {
+  lvlY = U.chanBot - 2.4 * U.cellH;
+  droplets = []; ripples = []; uBubbles = [];
+  glints = [];
+  for (const arm of [0, 1])
+    for (let i = 0; i < 7; i++)
+      glints.push({ arm, off: (Math.random() * 2 - 1) * U.armW / 2, sp: 14 + Math.random() * 22 });
+  kettle.x = kettle.homeX; kettle.y = kettle.homeY;
+  kettle.dragging = false; kettle.tilt = 0; kettle.retT = 1;
+}
+
+// 壶嘴尖（随倾斜旋转）
+function spoutTip() {
+  const a = kettle.tilt, bx = -70, by = 2;
+  const c = Math.cos(a), s = Math.sin(a);
+  return [kettle.x + bx * c - by * s, kettle.y + bx * s + by * c];
+}
+function addWater(px) {
+  lvlY = Math.max(U.yTop + 30, lvlY - px);   // 水面上升（y 变小），别溢出
+}
+
+/* ================= 连通器：物理 ================= */
+function utubeStep(dt) {
+  // 水壶回家动画
+  if (!kettle.dragging && kettle.retT < 1) {
+    kettle.retT = Math.min(1, kettle.retT + dt / 0.35);
+    const e = ease(kettle.retT);
+    kettle.x = kettle.fromX + (kettle.homeX - kettle.fromX) * e;
+    kettle.y = kettle.fromY + (kettle.homeY - kettle.fromY) * e;
+  }
+  // 倒水判定：壶嘴在某个管口上方 → 自动倾斜倒水
+  let pouring = false, pourArm = 0;
+  if (kettle.dragging) {
+    const [tx, ty] = spoutTip();
+    for (const cx of [U.cxL, U.cxR]) {
+      if (Math.abs(tx - cx) < U.armW / 2 + 18 && ty < U.yTop + 130 && ty > U.yTop - 220) {
+        pouring = true; pourArm = cx;
+      }
+    }
+  }
+  kettle.tilt += ((pouring ? -0.85 : 0) - kettle.tilt) * Math.min(1, dt * 8);
+  if (pouring) {
+    pouredThisDrag = true;
+    pourAcc += dt;
+    while (pourAcc > 0.028) {
+      pourAcc -= 0.028;
+      const [tx, ty] = spoutTip();
+      droplets.push({ x:tx, y:ty, vx:(Math.random() * 2 - 1) * 24, vy:60, arm:pourArm });
+    }
+    if (time - lastGlug > 0.13) { lastGlug = time; glug(); }
+  }
+  // 水滴下落，落进管子 → 水面上升 + 涟漪
+  for (let i = droplets.length - 1; i >= 0; i--) {
+    const d = droplets[i];
+    d.vy += 1900 * dt; d.x += d.vx * dt; d.y += d.vy * dt;
+    if (d.y >= lvlY && Math.abs(d.x - d.arm) < U.armW / 2) {
+      droplets.splice(i, 1);
+      addWater(1.5);
+      ripples.push({ x:d.x, y:lvlY, t:0 });
+      if (time - lastSplash > 0.12) { lastSplash = time; splash(); }
+    } else if (d.y > tableY + 6) {
+      droplets.splice(i, 1);
+    }
+  }
+  // 涟漪扩散
+  for (let i = ripples.length - 1; i >= 0; i--) {
+    ripples[i].t += dt;
+    if (ripples[i].t > 0.7) ripples.splice(i, 1);
+  }
+  // 气泡从底部升起
+  if (Math.random() < dt * 2.2 && uBubbles.length < 12) {
+    const cx = Math.random() < 0.5 ? U.cxL : U.cxR;
+    uBubbles.push({ x:cx + (Math.random() * 2 - 1) * U.armW * 0.3, y:U.chanBot - 10, r:2 + Math.random() * 3, vy:26 + Math.random() * 30 });
+  }
+  for (let i = uBubbles.length - 1; i >= 0; i--) {
+    const b = uBubbles[i];
+    b.y -= b.vy * dt;
+    if (b.y < lvlY + 6) uBubbles.splice(i, 1);
+  }
+  // 水面高光漂移
+  for (const g of glints) {
+    g.off += g.sp * dt;
+    if (g.off > U.armW / 2) g.off = -U.armW / 2;
+  }
+}
+
+/* ================= 虹吸：场景数据 ================= */
+let fL = 0.78, fR = 0.2;   // 两杯水位（0~1）
+let flowing = false;       // 虹吸正在进行
+let hasFlowed = false;     // 本轮是否真的流过（流完才庆祝）
+let flowAcc = 0;
+let flowParts = [];        // 软管里的流动粒子 {t, dir}
+let streams = [];          // 水泵喷出的水柱粒子 {x, y, vy, cup}
+let cupRipples = [];       // 杯面涟漪 {cup, x, t}
+let sBubbles = [[], []];   // 两杯里的气泡
+let hosePress = null;      // 软管按下信息 {x0, y0, moved}
+
+const hose = { mode:"dock", filled:false, filling:false, fillT:0,
+               dockX:0, dockY:0, dragX:0, dragY:0, selected:false,
+               retT:1, fromX:0, fromY:0 };
+const pump = { x:0, y:0, homeX:0, homeY:0, mode:"home", cup:0, t:0, startF:0, fromX:0, fromY:0, offX:0, offY:0 };
+
+function resetSiphon() {
+  fL = 0.78; fR = 0.2;
+  flowing = false; hasFlowed = false;
+  flowParts = []; streams = []; cupRipples = []; sBubbles = [[], []];
+  hose.mode = "dock"; hose.filled = false; hose.filling = false; hose.fillT = 0;
+  hose.selected = false; hose.retT = 1; hosePress = null;
+  pump.mode = "home"; pump.x = pump.homeX; pump.y = pump.homeY;
+}
+function getCupF(i) { return i === 0 ? fL : fR; }
+function setCupF(i, v) { if (i === 0) fL = v; else fR = v; }
+function cupCx(i) { return i === 0 ? S.cxL : S.cxR; }
+function cupSurfY(f) {
+  const top = S.top + 16, bot = tableY - S.wall - 4;
+  return bot - f * (bot - top);
+}
+function cupMouth(i) { return [cupCx(i), S.top + 20]; }
+
+/* ---- 软管形状（三种状态共用一个采样函数） ---- */
+function bezier3(ax, ay, c1x, c1y, c2x, c2y, bx, by, t) {
+  const u = 1 - t;
+  return [u*u*u*ax + 3*u*u*t*c1x + 3*u*t*t*c2x + t*t*t*bx,
+          u*u*u*ay + 3*u*u*t*c1y + 3*u*t*t*c2y + t*t*t*by];
+}
+function hosePoint(t) {
+  if (hose.mode === "bridge") {
+    const [ax, ay] = cupMouth(0), [bx, by] = cupMouth(1);
+    const apexY = S.top - 66;
+    return bezier3(ax, ay, ax, apexY, bx, apexY, bx, by, t);
+  }
+  if (hose.mode === "drag" || hose.mode === "return") {
+    const ax = hose.dragX - 95, ay = hose.dragY + 58;
+    const bx = hose.dragX + 95, by = hose.dragY + 58;
+    const apexY = hose.dragY - 44;
+    return bezier3(ax, ay, ax, apexY, bx, apexY, bx, by, t);
+  }
+  // dock：盘在桌面上
+  const x = hose.dockX - 85 + 170 * t;
+  const y = hose.dockY + Math.sin(t * Math.PI * 2.2) * 16;
+  return [x, y];
+}
+function hoseHit(x, y) {
+  for (let i = 0; i <= 24; i++) {
+    const [px, py] = hosePoint(i / 24);
+    if (Math.hypot(x - px, y - py) < 32) return true;
+  }
+  return false;
+}
+function hoseHandlePos() {   // 架好后 ✕ 手柄在软管最高处上方
+  return [(S.cxL + S.cxR) / 2, S.top - 66 - 38];
+}
+
+/* ================= 虹吸：物理 ================= */
+function siphonStep(dt) {
+  // 软管回家动画
+  if (hose.mode === "return") {
+    hose.retT = Math.min(1, hose.retT + dt / 0.3);
+    const e = ease(hose.retT);
+    hose.dragX = hose.fromX + (hose.dockX - hose.fromX) * e;
+    hose.dragY = hose.fromY + (hose.dockY - hose.fromY) * e;
+    if (hose.retT >= 1) hose.mode = "dock";
+  }
+  // 灌水动画
+  if (hose.filling) {
+    hose.fillT = Math.min(1, hose.fillT + dt / 0.6);
+    if (time - lastGlug > 0.15) { lastGlug = time; glug(); }
+    if (hose.fillT >= 1) { hose.filled = true; hose.filling = false; pop(660); }
+  }
+  // 水泵
+  if (pump.mode === "pumping") {
+    pump.t += dt;
+    const k = Math.min(1, pump.t / 0.9);
+    setCupF(pump.cup, Math.min(0.95, pump.startF + 0.3 * ease(k)));
+    if (Math.random() < 0.6)
+      streams.push({ x:pump.x + 40, y:pump.y + 44, vy:80, cup:pump.cup });
+    if (time - lastGlug > 0.16) { lastGlug = time; glug(); }
+    if (k >= 1) {
+      pump.mode = "return"; pump.t = 0;
+      pump.fromX = pump.x; pump.fromY = pump.y;
+    }
+  } else if (pump.mode === "return") {
+    pump.t = Math.min(1, pump.t + dt / 0.4);
+    const e = ease(pump.t);
+    pump.x = pump.fromX + (pump.homeX - pump.fromX) * e;
+    pump.y = pump.fromY + (pump.homeY - pump.fromY) * e;
+    if (pump.t >= 1) pump.mode = "home";
+  }
+  // 水泵水柱粒子
+  for (let i = streams.length - 1; i >= 0; i--) {
+    const s = streams[i];
+    s.vy += 1900 * dt; s.y += s.vy * dt;
+    if (s.y >= cupSurfY(getCupF(s.cup))) {
+      streams.splice(i, 1);
+      cupRipples.push({ cup:s.cup, x:s.x, t:0 });
+    }
+  }
+  // 虹吸流动：高处 → 低处，速度随水位差变化
+  const diff = fL - fR;
+  flowing = false;
+  if (hose.mode === "bridge" && hose.filled && Math.abs(diff) > 0.004) {
+    flowing = true; hasFlowed = true;
+    const rate = 0.55 * Math.abs(diff) + 0.02;
+    const df = Math.min(rate * dt, Math.abs(diff) / 2);
+    if (diff > 0) { fL -= df; fR += df; } else { fL += df; fR -= df; }
+    const dir = diff > 0 ? 1 : -1;   // 1 = 左杯 → 右杯
+    flowAcc += dt * (1.2 + 6 * Math.abs(diff));
+    while (flowAcc > 0.09 && flowParts.length < 120) {
+      flowAcc -= 0.09;
+      flowParts.push({ t: dir > 0 ? 0.02 : 0.98, dir });
+    }
+    if (time - lastGlug > 0.35) { lastGlug = time; glug(); }
+  }
+  // 流动粒子沿软管走，落进低处的杯子
+  for (let i = flowParts.length - 1; i >= 0; i--) {
+    const p = flowParts[i];
+    p.t += p.dir * dt * 0.85;
+    if (p.t <= 0 || p.t >= 1) {
+      flowParts.splice(i, 1);
+      const cup = p.dir > 0 ? 1 : 0;
+      cupRipples.push({ cup, x:cupMouth(cup)[0], t:0 });
+      if (time - lastSplash > 0.3) { lastSplash = time; splash(); }
+    }
+  }
+  // 持平：庆祝一次
+  if (hose.mode === "bridge" && hose.filled && Math.abs(fL - fR) <= 0.006 && hasFlowed) {
+    fL = fR = (fL + fR) / 2;
+    hasFlowed = false;
+    fanfare(); confetti();
+    showHint("🎉 两边水面一样高啦！虹吸把水从高处送到了低处！");
+  }
+  // 杯面涟漪
+  for (let i = cupRipples.length - 1; i >= 0; i--) {
+    cupRipples[i].t += dt;
+    if (cupRipples[i].t > 0.7) cupRipples.splice(i, 1);
+  }
+  // 杯内气泡
+  for (let c = 0; c < 2; c++) {
+    if (Math.random() < dt * 1.6 && sBubbles[c].length < 8 && getCupF(c) > 0.06) {
+      sBubbles[c].push({ x:cupCx(c) + (Math.random() * 2 - 1) * S.cupW * 0.32,
+                         y:tableY - S.wall - 10, r:2 + Math.random() * 3, vy:24 + Math.random() * 26 });
+    }
+    for (let i = sBubbles[c].length - 1; i >= 0; i--) {
+      const b = sBubbles[c][i];
+      b.y -= b.vy * dt;
+      if (b.y < cupSurfY(getCupF(c)) + 6) sBubbles[c].splice(i, 1);
+    }
+  }
+}
+
+/* ================= 交互 ================= */
+canvas.addEventListener("pointerdown", e => {
+  hintEl.style.opacity = "0";
+  const x = e.clientX, y = e.clientY;
+  if (mode === "utube") {
+    if (Math.hypot(x - kettle.x, y - kettle.y) < 80) {
+      kettle.dragging = true; kettle.retT = 1; pouredThisDrag = false;
+      kettle.offX = x - kettle.x; kettle.offY = y - kettle.y;
+      canvas.setPointerCapture(e.pointerId);
+      pop(700);
+    } else {
+      // 点水面：涟漪反馈
+      for (const cx of [U.cxL, U.cxR]) {
+        if (Math.abs(x - cx) < U.armW && Math.abs(y - lvlY) < 50) {
+          ripples.push({ x, y:lvlY, t:0 }); pop(500);
+        }
+      }
+    }
+  } else {
+    // ✕ 手柄：把软管拿下来
+    if (hose.selected && hose.mode === "bridge") {
+      const [hx, hy] = hoseHandlePos();
+      if (Math.hypot(x - hx, y - hy) < 26) { removeHose(); return; }
+    }
+    // 拖水泵
+    if (pump.mode === "home" && Math.hypot(x - pump.x, y - pump.y) < 64) {
+      pump.mode = "drag";
+      pump.offX = x - pump.x; pump.offY = y - pump.y;
+      canvas.setPointerCapture(e.pointerId);
+      pop(700);
+      return;
+    }
+    // 软管（点按灌水 / 拖拽）
+    if (hoseHit(x, y)) {
+      hosePress = { x0:x, y0:y, moved:false };
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
+    hose.selected = false;
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  const x = e.clientX, y = e.clientY;
+  if (mode === "utube") {
+    if (kettle.dragging) {
+      kettle.x = Math.max(40, Math.min(W - 40, x - kettle.offX));
+      kettle.y = Math.max(80, Math.min(tableY - 40, y - kettle.offY));
+    }
+  } else {
+    if (pump.mode === "drag") { pump.x = x - pump.offX; pump.y = y - pump.offY; }
+    if (hosePress) {
+      if (!hosePress.moved && Math.hypot(x - hosePress.x0, y - hosePress.y0) > 10) {
+        hosePress.moved = true;
+        if (hose.mode === "bridge") {   // 从杯子上拿起来
+          hose.mode = "drag"; hasFlowed = false; flowParts = [];
+        }
+        if (hose.mode === "dock") hose.mode = "drag";
+        hose.selected = false;
+        hose.dragX = x; hose.dragY = y;
+      }
+      if (hosePress.moved) { hose.dragX = x; hose.dragY = y; }
+    }
+  }
+});
+canvas.addEventListener("pointerup", e => {
+  const x = e.clientX, y = e.clientY;
+  if (mode === "utube") {
+    if (kettle.dragging) {
+      kettle.dragging = false;
+      kettle.retT = 0; kettle.fromX = kettle.x; kettle.fromY = kettle.y;
+      if (pouredThisDrag && time - lastEqualHint > 4) {
+        lastEqualHint = time;
+        showHint("看！不管往哪边倒水，两边水面总是一样高！");
+        pop(660);
+      }
+    }
+  } else {
+    if (pump.mode === "drag") {
+      const cup = cupOver(pump.x, pump.y);
+      if (cup >= 0 && getCupF(cup) > 0.92) {
+        showHint("杯子满啦，装不下啦！"); pop(240); pumpGoHome();
+      } else if (cup >= 0) {
+        pump.mode = "pumping"; pump.cup = cup; pump.t = 0;
+        pump.startF = getCupF(cup);
+        pump.x = cupCx(cup) - 20; pump.y = S.top - 86;
+        glug();
+      } else {
+        pumpGoHome();
+      }
+    }
+    if (hosePress) {
+      if (hosePress.moved) {
+        // 试试架在两个杯子上
+        const a = hosePoint(0), b = hosePoint(1);
+        const mL = cupMouth(0), mR = cupMouth(1);
+        const ok = (Math.hypot(a[0]-mL[0], a[1]-mL[1]) < 115 && Math.hypot(b[0]-mR[0], b[1]-mR[1]) < 115)
+                || (Math.hypot(a[0]-mR[0], a[1]-mR[1]) < 115 && Math.hypot(b[0]-mL[0], b[1]-mL[1]) < 115);
+        if (ok) {
+          hose.mode = "bridge"; hose.selected = false; pop(880);
+          if (!hose.filled) showHint("软管是空的哦，点一下软管装满水！");
+          else if (Math.abs(fL - fR) > 0.02) showHint("虹吸开始啦！看，水从高处流向低处！");
+          else showHint("两边一样高，水不会动。拖水泵给一边加点水试试！");
+        } else {
+          hose.mode = "return"; hose.retT = 0;
+          hose.fromX = hose.dragX; hose.fromY = hose.dragY;
+          pop(240);
+        }
+      } else {
+        // 轻点软管：灌水 / 选中 / 倒空
+        if (!hose.filled && !hose.filling) {
+          hose.filling = true; glug();
+          showHint("咕噜咕噜……软管装满水啦！");
+        } else if (hose.mode === "bridge") {
+          hose.selected = !hose.selected; pop(880);
+        } else {
+          hose.filled = false; hose.fillT = 0; hose.filling = false;
+          pop(300); showHint("软管倒空了，再点一下重新装满");
+        }
+      }
+      hosePress = null;
+    }
+  }
+});
+canvas.addEventListener("pointercancel", () => {
+  if (kettle.dragging) {
+    kettle.dragging = false; kettle.retT = 0;
+    kettle.fromX = kettle.x; kettle.fromY = kettle.y;
+  }
+  if (pump.mode === "drag") pumpGoHome();
+  if (hosePress && hosePress.moved && hose.mode === "drag") {
+    hose.mode = "return"; hose.retT = 0;
+    hose.fromX = hose.dragX; hose.fromY = hose.dragY;
+  }
+  hosePress = null;
+});
+function pumpGoHome() {
+  pump.mode = "return"; pump.t = 0;
+  pump.fromX = pump.x; pump.fromY = pump.y;
+}
+function cupOver(x, y) {
+  for (let i = 0; i < 2; i++) {
+    if (Math.abs(x - cupCx(i)) < S.cupW / 2 + 24 && y > S.top - 170 && y < tableY + 10) return i;
+  }
+  return -1;
+}
+function removeHose() {
+  hose.mode = "return"; hose.retT = 0;
+  hose.dragX = (S.cxL + S.cxR) / 2; hose.dragY = S.top - 20;
+  hose.fromX = hose.dragX; hose.fromY = hose.dragY;
+  hose.filled = false; hose.fillT = 0; hose.filling = false;
+  hose.selected = false; hasFlowed = false; flowParts = [];
+  pop(240);
+  showHint("软管放回架子啦，再玩一次吧！");
+}
+
+/* ================= 模式切换 ================= */
+function setMode(m) {
+  mode = m;
+  kettle.dragging = false; hosePress = null; hose.selected = false;
+  tabU.classList.toggle("active", m === "utube");
+  tabS.classList.toggle("active", m === "siphon");
+  hintEl.style.opacity = "1";
+  hintEl.textContent = m === "utube"
+    ? "把水壶拖到管口上方，往任意一边倒水试试！"
+    : "先点一下软管装满水，再把软管拖到两个杯子上！";
+}
+tabU.addEventListener("click", () => { setMode("utube"); pop(700); });
+tabS.addEventListener("click", () => { setMode("siphon"); pop(700); });
+document.getElementById("resetBtn").addEventListener("click", () => {
+  if (mode === "utube") resetUtube(); else resetSiphon();
+  pop(880); showHint("重新开始啦！");
+});
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+function chip(x, y, text, fg, bg) {
+  ctx.font = "bold 16px sans-serif";
+  const tw = ctx.measureText(text).width;
+  ctx.fillStyle = bg || "rgba(255,255,255,0.92)";
+  roundRect(x - tw / 2 - 10, y - 16, tw + 20, 32, 16, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.15)"; ctx.lineWidth = 2;
+  roundRect(x - tw / 2 - 10, y - 16, tw + 20, 32, 16, false); ctx.stroke();
+  ctx.fillStyle = fg || "#1a5fb4";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(text, x, y + 1);
+  ctx.textBaseline = "alphabetic";
+}
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#bfe6ff"); g.addColorStop(0.75, "#e8f7ff"); g.addColorStop(1, "#e8f7ff");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 太阳
+  ctx.beginPath(); ctx.arc(W - 90, 78, 40, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  // 木桌
+  ctx.fillStyle = "#c69a6b"; ctx.fillRect(0, tableY, W, H - tableY);
+  ctx.fillStyle = "rgba(0,0,0,0.08)"; ctx.fillRect(0, tableY, W, 4);
+}
+function waveY(x) { return lvlY + Math.sin(x * 0.09 + time * 3.2) * 2.2; }
+
+function tubePath() {
+  ctx.beginPath();
+  ctx.moveTo(U.cxL, U.yTop - 6);
+  ctx.lineTo(U.cxL, U.chanBot - U.chanH / 2);
+  ctx.lineTo(U.cxR, U.chanBot - U.chanH / 2);
+  ctx.lineTo(U.cxR, U.yTop - 6);
+}
+
+/* ---- 连通器 ---- */
+function drawUtube() {
+  drawBackground();
+  ctx.fillStyle = "rgba(30,80,130,0.75)";
+  ctx.font = "bold 21px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("U 形连通管：底部相连通，两边水面总是一样高", W / 2, 116);
+
+  // 刻度尺（把水位画成看得见的数字）
+  const rulerX = U.cxL - U.armW / 2 - U.wall - 52;
+  ctx.strokeStyle = "rgba(30,80,130,0.6)"; ctx.lineWidth = 2;
+  ctx.fillStyle = "rgba(30,80,130,0.8)";
+  ctx.font = "bold 13px sans-serif"; ctx.textAlign = "right";
+  ctx.beginPath(); ctx.moveTo(rulerX, U.yTop - 4); ctx.lineTo(rulerX, U.chanBot); ctx.stroke();
+  for (let i = 0; ; i++) {
+    const y = U.chanBot - i * U.cellH;
+    if (y < U.yTop) break;
+    ctx.beginPath(); ctx.moveTo(rulerX, y); ctx.lineTo(rulerX + 8, y); ctx.stroke();
+    if (i > 0) ctx.fillText(i, rulerX - 5, y + 4);
+  }
+  ctx.save();
+  ctx.translate(rulerX - 24, (U.yTop + U.chanBot) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "center";
+  ctx.fillText("水位（格）", 0, 0);
+  ctx.restore();
+
+  // 玻璃管（深色描边 + 半透明玻璃）
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  tubePath();
+  ctx.strokeStyle = "rgba(90,140,180,0.85)"; ctx.lineWidth = U.armW + U.wall * 2 + 5; ctx.stroke();
+  tubePath();
+  ctx.strokeStyle = "rgba(228,243,252,0.6)"; ctx.lineWidth = U.armW + U.wall * 2; ctx.stroke();
+  // 水（裁剪到水面以下）
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, lvlY, W, H - lvlY); ctx.clip();
+  tubePath();
+  const g = ctx.createLinearGradient(0, lvlY, 0, U.chanBot);
+  g.addColorStop(0, "#5db9f0"); g.addColorStop(1, "#2f7fe9");
+  ctx.strokeStyle = g; ctx.lineWidth = U.armW; ctx.stroke();
+  ctx.restore();
+  // 管口沿
+  for (const cx of [U.cxL, U.cxR]) {
+    ctx.beginPath(); ctx.ellipse(cx, U.yTop - 4, U.armW / 2 + U.wall, 8, 0, 0, 7);
+    ctx.fillStyle = "rgba(228,243,252,0.75)"; ctx.fill();
+    ctx.strokeStyle = "rgba(90,140,180,0.85)"; ctx.lineWidth = 2.5; ctx.stroke();
+  }
+  // 波浪水面线 + 高光粒子
+  for (const cx of [U.cxL, U.cxR]) {
+    ctx.beginPath();
+    for (let dx = -U.armW / 2; dx <= U.armW / 2; dx += 4) {
+      const x = cx + dx;
+      dx === -U.armW / 2 ? ctx.moveTo(x, waveY(x)) : ctx.lineTo(x, waveY(x));
+    }
+    ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 2.5; ctx.stroke();
+  }
+  ctx.fillStyle = "rgba(255,255,255,0.65)";
+  for (const gl of glints) {
+    const cx = gl.arm === 0 ? U.cxL : U.cxR;
+    ctx.beginPath();
+    ctx.ellipse(cx + gl.off, waveY(cx + gl.off) - 2, 5, 1.8, 0, 0, 7);
+    ctx.fill();
+  }
+  // 气泡
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  for (const b of uBubbles) { ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill(); }
+  // 涟漪
+  for (const r of ripples) {
+    const rr = 4 + r.t * 46;
+    ctx.beginPath();
+    ctx.ellipse(r.x, r.y, rr, rr * 0.3, 0, 0, 7);
+    ctx.strokeStyle = `rgba(255,255,255,${0.8 * (1 - r.t / 0.7)})`;
+    ctx.lineWidth = 2.5; ctx.stroke();
+  }
+  // 下落水滴
+  ctx.fillStyle = "#4aa8ec";
+  for (const d of droplets) { ctx.beginPath(); ctx.arc(d.x, d.y, 4, 0, 7); ctx.fill(); }
+
+  // 等高标准线（管外两段虚线 + 小三角）
+  ctx.strokeStyle = "rgba(47,127,233,0.6)"; ctx.lineWidth = 2.5;
+  ctx.setLineDash([10, 8]);
+  ctx.beginPath();
+  ctx.moveTo(U.cxL - U.armW / 2 - U.wall - 44, lvlY); ctx.lineTo(U.cxL - U.armW / 2 - 3, lvlY);
+  ctx.moveTo(U.cxR + U.armW / 2 + 3, lvlY); ctx.lineTo(U.cxR + U.armW / 2 + U.wall + 44, lvlY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "rgba(47,127,233,0.75)";
+  for (const cx of [U.cxL, U.cxR]) {
+    const sx = cx + (cx === U.cxL ? -U.armW / 2 - 6 : U.armW / 2 + 6);
+    ctx.beginPath();
+    ctx.moveTo(sx, lvlY - 7); ctx.lineTo(sx + (cx === U.cxL ? -12 : 12), lvlY); ctx.lineTo(sx, lvlY + 7);
+    ctx.closePath(); ctx.fill();
+  }
+  chip(U.cxR + U.armW / 2 + U.wall + 96, lvlY - 26, "两边一样高 ✓");
+
+  drawKettle();
+}
+function drawKettle() {
+  ctx.save();
+  ctx.translate(kettle.x, kettle.y);
+  ctx.rotate(kettle.tilt);
+  // 壶嘴
+  ctx.beginPath();
+  ctx.moveTo(-38, -12); ctx.lineTo(-72, -2); ctx.lineTo(-38, 18);
+  ctx.closePath();
+  ctx.fillStyle = "#e8a33d"; ctx.fill();
+  ctx.strokeStyle = "rgba(120,70,10,0.5)"; ctx.lineWidth = 2.5; ctx.stroke();
+  // 壶身
+  const g = ctx.createLinearGradient(0, -36, 0, 36);
+  g.addColorStop(0, "#f7bd55"); g.addColorStop(1, "#dd9328");
+  ctx.fillStyle = g;
+  roundRect(-46, -36, 92, 72, 20, true);
+  ctx.strokeStyle = "rgba(120,70,10,0.5)"; ctx.lineWidth = 2.5;
+  roundRect(-46, -36, 92, 72, 20, false); ctx.stroke();
+  // 壶盖
+  ctx.fillStyle = "#c67f22";
+  roundRect(-20, -48, 40, 14, 7, true);
+  ctx.beginPath(); ctx.arc(0, -50, 5, 0, 7); ctx.fill();
+  // 把手
+  ctx.beginPath(); ctx.arc(50, 0, 21, -1.25, 1.25);
+  ctx.strokeStyle = "#c67f22"; ctx.lineWidth = 9; ctx.stroke();
+  // 笑脸
+  ctx.fillStyle = "rgba(90,50,5,0.8)";
+  ctx.beginPath(); ctx.arc(-12, -6, 4, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(14, -6, 4, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(1, 6, 10, 0.15 * Math.PI, 0.85 * Math.PI);
+  ctx.lineWidth = 3.5; ctx.strokeStyle = "rgba(90,50,5,0.8)"; ctx.stroke();
+  ctx.restore();
+  // 名字标签
+  ctx.fillStyle = "rgba(90,50,5,0.65)";
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("水壶", kettle.x, kettle.y + 62);
+}
+
+/* ---- 虹吸 ---- */
+function drawCup(i) {
+  const cx = cupCx(i), w = S.cupW, wall = S.wall;
+  const x0 = cx - w / 2, y0 = S.top, y1 = tableY;
+  const f = getCupF(i), surfY = cupSurfY(f);
+  // 玻璃底衬
+  ctx.fillStyle = "rgba(228,243,252,0.35)";
+  ctx.beginPath();
+  ctx.moveTo(x0, y0); ctx.lineTo(x0, y1); ctx.lineTo(x0 + w, y1); ctx.lineTo(x0 + w, y0);
+  ctx.closePath(); ctx.fill();
+  // 水
+  if (f > 0.005) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x0 + wall, y0, w - 2 * wall, y1 - wall - y0);
+    ctx.clip();
+    const g = ctx.createLinearGradient(0, surfY, 0, y1);
+    g.addColorStop(0, "#5db9f0"); g.addColorStop(1, "#2f7fe9");
+    ctx.fillStyle = g;
+    ctx.fillRect(x0 + wall, surfY, w - 2 * wall, y1 - surfY);
+    ctx.restore();
+    // 波浪水面
+    ctx.beginPath();
+    for (let dx = -w / 2 + wall; dx <= w / 2 - wall; dx += 5) {
+      const x = cx + dx;
+      const y = surfY + Math.sin(x * 0.07 + time * 3 + i * 2) * 2;
+      dx === -w / 2 + wall ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 2.5; ctx.stroke();
+  }
+  // 气泡
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  for (const b of sBubbles[i]) { ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill(); }
+  // 杯面涟漪
+  for (const r of cupRipples) {
+    if (r.cup !== i) continue;
+    const rr = 4 + r.t * 40;
+    ctx.beginPath();
+    ctx.ellipse(r.x, surfY, rr, rr * 0.28, 0, 0, 7);
+    ctx.strokeStyle = `rgba(255,255,255,${0.8 * (1 - r.t / 0.7)})`;
+    ctx.lineWidth = 2.5; ctx.stroke();
+  }
+  // 玻璃壁（U 形描边）
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(x0, y0); ctx.lineTo(x0, y1); ctx.lineTo(x0 + w, y1); ctx.lineTo(x0 + w, y0);
+  ctx.strokeStyle = "rgba(90,140,180,0.9)"; ctx.lineWidth = wall * 2 + 4; ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x0, y0); ctx.lineTo(x0, y1); ctx.lineTo(x0 + w, y1); ctx.lineTo(x0 + w, y0);
+  ctx.strokeStyle = "rgba(228,243,252,0.55)"; ctx.lineWidth = wall * 2; ctx.stroke();
+  // 刻度（每格一道）
+  ctx.strokeStyle = "rgba(30,80,130,0.5)"; ctx.lineWidth = 2;
+  ctx.fillStyle = "rgba(30,80,130,0.7)";
+  ctx.font = "bold 12px sans-serif"; ctx.textAlign = "left";
+  for (let k = 1; k <= 7; k++) {
+    const y = cupSurfY(k / 8);
+    ctx.beginPath(); ctx.moveTo(x0 + wall + 2, y); ctx.lineTo(x0 + wall + 12, y); ctx.stroke();
+    if (k % 2 === 0) ctx.fillText(k, x0 + wall + 16, y + 4);
+  }
+  // 杯名
+  ctx.fillStyle = "rgba(30,80,130,0.75)";
+  ctx.font = "bold 17px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(i === 0 ? "高水位杯" : "低水位杯", cx, y1 + 26);
+  // 拖软管靠近时高亮杯口
+  if (hosePress && hosePress.moved) {
+    const [mx, my] = cupMouth(i);
+    const nearA = Math.hypot(hose.dragX - 95 - mx, hose.dragY + 58 - my) < 130;
+    const nearB = Math.hypot(hose.dragX + 95 - mx, hose.dragY + 58 - my) < 130;
+    if (nearA || nearB) {
+      ctx.beginPath(); ctx.arc(mx, my, 26, 0, 7);
+      ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 6; ctx.stroke();
+    }
+  }
+  // 拖水泵靠近时高亮杯子
+  if (pump.mode === "drag" && cupOver(pump.x, pump.y) === i) {
+    ctx.beginPath();
+    ctx.moveTo(x0 - 8, y0 - 8); ctx.lineTo(x0 - 8, y1 + 8); ctx.lineTo(x0 + w + 8, y1 + 8); ctx.lineTo(x0 + w + 8, y0 - 8);
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 5; ctx.stroke();
+  }
+}
+
+function drawHose() {
+  const N = 40;
+  const path = () => {
+    ctx.beginPath();
+    for (let i = 0; i <= N; i++) {
+      const [x, y] = hosePoint(i / N);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+  };
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  // 外壁
+  path(); ctx.strokeStyle = "rgba(120,70,10,0.6)"; ctx.lineWidth = 30; ctx.stroke();
+  path(); ctx.strokeStyle = "#f0a83c"; ctx.lineWidth = 26; ctx.stroke();
+  // 管内空气（空管时浅色内芯）
+  path(); ctx.strokeStyle = "rgba(255,244,214,0.85)"; ctx.lineWidth = 16; ctx.stroke();
+  // 管内的水
+  if (hose.fillT > 0) {
+    ctx.save();
+    ctx.globalAlpha = hose.fillT;
+    path(); ctx.strokeStyle = "#3f9ff0"; ctx.lineWidth = 16; ctx.stroke();
+    ctx.restore();
+  }
+  // 端头握把
+  for (const t of [0, 1]) {
+    const [x, y] = hosePoint(t);
+    ctx.beginPath(); ctx.arc(x, y, 13, 0, 7);
+    ctx.fillStyle = "#c67f22"; ctx.fill();
+    ctx.strokeStyle = "rgba(120,70,10,0.6)"; ctx.lineWidth = 2.5; ctx.stroke();
+  }
+  // 流动粒子（显示水流方向）
+  if (flowing) {
+    ctx.fillStyle = "#eaf6ff";
+    for (const p of flowParts) {
+      const [x, y] = hosePoint(p.t);
+      ctx.beginPath(); ctx.arc(x, y, 4.5, 0, 7); ctx.fill();
+    }
+    // 方向箭头
+    const dir = fL > fR ? 1 : -1;
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
+    for (const t0 of [0.22, 0.5, 0.78]) {
+      const [x1, y1] = hosePoint(t0 - 0.012), [x2, y2] = hosePoint(t0 + 0.012);
+      let vx = x2 - x1, vy = y2 - y1;
+      const L = Math.hypot(vx, vy) || 1;
+      vx = vx / L * dir; vy = vy / L * dir;
+      const [ax, ay] = hosePoint(t0);
+      ctx.beginPath();
+      ctx.moveTo(ax + vx * 10, ay + vy * 10);
+      ctx.lineTo(ax - vx * 6 - vy * 6, ay - vy * 6 + vx * 6);
+      ctx.lineTo(ax - vx * 6 + vy * 6, ay - vy * 6 - vx * 6);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+  // ✕ 手柄（选中架好的软管时）
+  if (hose.selected && hose.mode === "bridge") {
+    const [hx, hy] = hoseHandlePos();
+    ctx.beginPath(); ctx.arc(hx, hy, 17, 0, 7);
+    ctx.fillStyle = "#e93b3b"; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 20px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("✕", hx, hy + 1);
+    ctx.textBaseline = "alphabetic";
+  }
+  // 架子上时的标签
+  if (hose.mode === "dock") {
+    ctx.fillStyle = "rgba(120,70,10,0.75)";
+    ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(hose.filled ? "软管（已装水）" : "软管（点我装水）", hose.dockX, hose.dockY + 44);
+  }
+}
+
+function drawPump() {
+  ctx.save();
+  ctx.translate(pump.x, pump.y);
+  const handleOff = pump.mode === "pumping" ? Math.sin(pump.t * 14) * 8 : 0;
+  // 喷嘴
+  ctx.beginPath();
+  ctx.moveTo(18, 24); ctx.lineTo(40, 24); ctx.lineTo(40, 44); ctx.lineTo(30, 44); ctx.lineTo(30, 34); ctx.lineTo(18, 34);
+  ctx.closePath();
+  ctx.fillStyle = "#c0392b"; ctx.fill();
+  // 缸体
+  const g = ctx.createLinearGradient(-22, 0, 22, 0);
+  g.addColorStop(0, "#ff7a6b"); g.addColorStop(1, "#e94b4b");
+  ctx.fillStyle = g;
+  roundRect(-22, -8, 44, 58, 10, true);
+  ctx.strokeStyle = "rgba(120,20,10,0.5)"; ctx.lineWidth = 2.5;
+  roundRect(-22, -8, 44, 58, 10, false); ctx.stroke();
+  // 手柄
+  ctx.fillStyle = "#a03028";
+  ctx.fillRect(-4, -34 + handleOff, 8, 28);
+  roundRect(-22, -46 + handleOff, 44, 13, 6, true);
+  // 底座
+  ctx.fillStyle = "#7a2a20";
+  roundRect(-32, 48, 64, 10, 5, true);
+  ctx.restore();
+  // 水柱粒子
+  ctx.fillStyle = "#4aa8ec";
+  for (const s of streams) { ctx.beginPath(); ctx.arc(s.x, s.y, 4, 0, 7); ctx.fill(); }
+  // 标签
+  if (pump.mode === "home") {
+    ctx.fillStyle = "rgba(120,20,10,0.7)";
+    ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("水泵", pump.x, pump.y + 76);
+  }
+}
+
+function drawSiphon() {
+  drawBackground();
+  ctx.fillStyle = "rgba(30,80,130,0.75)";
+  ctx.font = "bold 21px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("虹吸实验：装满水的软管，能把水从高处运到低处", W / 2, 116);
+  drawCup(0); drawCup(1);
+  drawHose();
+  drawPump();
+  // 流向说明
+  if (flowing) {
+    const left2right = fL > fR;
+    const ax = (S.cxL + S.cxR) / 2, ay = S.top - 96;
+    chip(ax, ay, left2right ? "水往低处流 ➜" : "⬅ 水往低处流", "#fff", "#e8873a");
+  }
+  // 持平标准线
+  if (hose.mode === "bridge" && hose.filled && Math.abs(fL - fR) < 0.01) {
+    const y = cupSurfY(fL);
+    ctx.strokeStyle = "rgba(47,127,233,0.6)"; ctx.lineWidth = 2.5;
+    ctx.setLineDash([10, 8]);
+    ctx.beginPath(); ctx.moveTo(S.cxL - S.cupW / 2 - 30, y); ctx.lineTo(S.cxR + S.cupW / 2 + 30, y); ctx.stroke();
+    ctx.setLineDash([]);
+    chip(W / 2, y - 22, "一样高 ✓");
+  }
+}
+
+/* ---- 彩带庆祝 ---- */
+const CONF_COLORS = ["#e94b4b", "#ffb800", "#2fbf4a", "#2f7fe9", "#9b3de0", "#ff7a1a"];
+let confettis = [];
+function confetti() {
+  for (let i = 0; i < 70; i++)
+    confettis.push({
+      x: W / 2 + (Math.random() * 2 - 1) * 160, y: H * 0.16,
+      vx: (Math.random() * 2 - 1) * 260, vy: -Math.random() * 260 - 60,
+      rot: Math.random() * 7, vr: (Math.random() * 2 - 1) * 8,
+      color: CONF_COLORS[i % CONF_COLORS.length], t: 0
+    });
+}
+function confettiStep(dt) {
+  for (let i = confettis.length - 1; i >= 0; i--) {
+    const c = confettis[i];
+    c.t += dt; c.vy += 900 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+    if (c.t > 2.2 || c.y > H + 20) confettis.splice(i, 1);
+  }
+}
+function drawConfetti() {
+  for (const c of confettis) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.max(0, 1 - c.t / 2.2);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-6, -4, 12, 8);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function updateScore() {
+  if (mode === "utube") {
+    const n = Math.round((U.chanBot - lvlY) / U.cellH);
+    scorebar.textContent = `💧 水位 ${n} 格 · 左右两边一样高`;
+  } else {
+    scorebar.textContent = `💧 左杯 ${Math.round(fL * 8)} 格 · 右杯 ${Math.round(fR * 8)} 格`;
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (mode === "utube") drawUtube();
+  else drawSiphon();
+  drawConfetti();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  time += dt;
+  if (mode === "utube") utubeStep(dt);
+  else siphonStep(dt);
+  confettiStep(dt);
+  updateScore();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type, freqEnd) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    if (freqEnd) o.frequency.exponentialRampToValueAtTime(freqEnd, actx.currentTime + dur);
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const glug = () => tone(150 + Math.random() * 60, 0.1, 0.1, "sine", 80);
+const splash = () => tone(700 + Math.random() * 300, 0.07, 0.06, "triangle", 220);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+
+/* ================= 测试钩子（无头浏览器验证用） ================= */
+window.__lab = {
+  getMode: () => mode,
+  utube: { lvl: () => lvlY, addWater, geo: () => ({ ...U }) },
+  siphon: {
+    state: () => ({ fL, fR, hoseMode: hose.mode, filled: hose.filled, flowing, hasFlowed }),
+    setLevels: (a, b) => { fL = a; fR = b; },
+    fillInstant: () => { hose.filled = true; hose.fillT = 1; hose.filling = false; },
+    bridge: () => { hose.mode = "bridge"; },
+    step: dt => siphonStep(dt),
+    ustep: dt => utubeStep(dt),
+  },
+};
+
+/* ================= 启动 ================= */
+resize();
+resetUtube();
+resetSiphon();
+const initMode = new URLSearchParams(location.search).get("mode");
+setMode(initMode === "siphon" ? "siphon" : "utube");
+updateScore();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

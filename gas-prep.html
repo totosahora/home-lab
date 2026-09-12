@@ -1,0 +1,1120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>气体制取装置拼装</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#dff0f6; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,70,0.85); color:#7fe3ff; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,70,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; max-width:92%;
+    transition:opacity 0.6s; white-space:nowrap; cursor:pointer;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  #resetBtn {
+    position:absolute; top:12px; left:12px; z-index:10;
+    font-size:16px; font-weight:bold; padding:10px 18px;
+    border-radius:24px; border:none; background:#2e7d9c; color:#fff;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.25);
+  }
+  #startBtn, #nextBtn {
+    position:absolute; bottom:56px; right:26px; z-index:10;
+    font-size:21px; font-weight:bold; padding:16px 32px;
+    border-radius:32px; border:none; background:#ffb800; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 12px rgba(0,0,0,0.3);
+  }
+  #nextBtn { display:none; background:#2fbf4a; color:#fff; }
+  #startBtn:active, #nextBtn:active, #resetBtn:active { transform:scale(1.06); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:20px;
+    background:rgba(0,20,30,0.55);
+  }
+  #winPanel .msg {
+    font-size:30px; font-weight:bold; color:#ffe9a8; line-height:1.7;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; padding:0 20px;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🧪 第 1 / 3 关</div>
+<button id="resetBtn">🔄 重来本关</button>
+<button id="startBtn">▶ 开始制取</button>
+<button id="nextBtn">下一关 ▶</button>
+<div id="hint">把零件拖到台面上拼装装置，导管靠近接口会自动吸附！</div>
+<div id="winPanel">
+  <div class="msg"></div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const startBtn = document.getElementById("startBtn");
+const nextBtn = document.getElementById("nextBtn");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1, S = 1;   // S = 整体缩放(k)
+
+// 台面布局（layout() 里按窗口计算）
+let TW = 200, benchY = 500, genX = 400, collX = 800;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  S = Math.min(W / 1280, H / 800);
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 三个关卡：制取 O₂ / CO₂ / H₂
+const LEVELS = [
+  {
+    gas:"O₂", name:"氧气", tint:"rgba(120,180,255,",
+    gens:["flask","tube"], colls:["up","water"],
+    flaskStuff:"过氧化氢溶液 + 二氧化锰", flaskLiquid:[228,240,250],
+    eqFlask:"2H₂O₂ —MnO₂→ 2H₂O + O₂↑",
+    eqTube:"2KMnO₄ —△→ K₂MnO₄ + MnO₂ + O₂↑",
+    intro:"第1关：制取氧气 O₂。两种发生装置都能用，收集可用排水法或向上排空气法！",
+    wrongGen:"",
+    errSink:"氧气密度比空气略大，瓶口朝下会漏掉！改用向上排空气法或排水法",
+    errFloat:"", errDissolve:""
+  },
+  {
+    gas:"CO₂", name:"二氧化碳", tint:"rgba(150,205,165,",
+    gens:["flask"], colls:["up"],
+    flaskStuff:"石灰石 + 稀盐酸", flaskLiquid:[232,244,238],
+    eqFlask:"CaCO₃ + 2HCl → CaCl₂ + H₂O + CO₂↑", eqTube:"",
+    intro:"第2关：制取二氧化碳 CO₂。想想：它能用排水法吗？瓶口该朝上还是朝下？",
+    wrongGen:"加热高锰酸钾只能得到氧气！制 CO₂ 要用石灰石和稀盐酸（常温发生瓶）",
+    errSink:"CO₂ 密度比空气大，瓶口朝下会全漏掉！应该用向上排空气法",
+    errFloat:"", errDissolve:"CO₂ 能溶于水，排水法收集不到它！应该用向上排空气法"
+  },
+  {
+    gas:"H₂", name:"氢气", tint:"rgba(235,170,205,",
+    gens:["flask"], colls:["down","water"],
+    flaskStuff:"锌粒 + 稀硫酸", flaskLiquid:[236,244,250],
+    eqFlask:"Zn + H₂SO₄ → ZnSO₄ + H₂↑", eqTube:"",
+    intro:"第3关：制取氢气 H₂。氢气是最轻的气体，会往上飘，该用哪种收集方法？",
+    wrongGen:"加热高锰酸钾得不到氢气！制 H₂ 要用锌粒和稀硫酸（常温发生瓶）",
+    errSink:"", errFloat:"H₂ 密度比空气小，瓶口朝上会飘走！用向下排空气法或排水法",
+    errDissolve:""
+  },
+];
+
+// 零件：发生装置 ×2、导管、集气装置 ×3
+const PART_DEFS = [
+  { id:"flask",  kind:"gen",  name:"常温发生瓶" },
+  { id:"tube",   kind:"gen",  name:"加热试管" },
+  { id:"conduit",kind:"tube", name:"导管" },
+  { id:"up",     kind:"coll", name:"向上排空气" },
+  { id:"down",   kind:"coll", name:"向下排空气" },
+  { id:"water",  kind:"coll", name:"排水集气法" },
+];
+let parts = [];            // {id,kind,name,x,y,home:{x,y},placed,drag}
+let conduit = { endA:false, endB:false, out:false, x:0, y:0, drag:null };
+let genSlot = { part:null }, collSlot = { part:null };
+
+let li = 0;                // 关卡序号
+let state = "build";       // build | react | error | done
+let prog = 0;              // 收集进度 0..1
+let errMode = "", errT = 0;
+let shakeT = 0;            // 错误时发生装置抖动
+let bubbles = [];          // 发生器里的气泡
+let escapes = [];          // 逃逸/溶解的气体粒子
+let puffs = [];            // 瓶口排出的空气
+let confetti = [];
+let fizzT = 0, spawnT = 0;
+
+function layout() {
+  TW = Math.max(150, 200 * S);
+  benchY = H * 0.72;
+  genX = TW + (W - TW) * 0.25;
+  collX = TW + (W - TW) * 0.70;
+  const top = 96 * S + 40, bot = H - 60;
+  const step = (bot - top) / PART_DEFS.length;
+  parts.forEach((p, i) => {
+    p.home = { x: TW / 2, y: top + step * (i + 0.5) };
+    if (!p.placed && !p.drag) { p.x = p.home.x; p.y = p.home.y; }
+  });
+  if (!conduit.out && !conduit.drag) {
+    const c = parts.find(p => p.id === "conduit");
+    if (c) { conduit.x = c.home.x; conduit.y = c.home.y; }
+  }
+}
+
+function resetLevel() {
+  parts = PART_DEFS.map(d => ({ id:d.id, kind:d.kind, name:d.name, x:0, y:0, home:{x:0,y:0}, placed:false, drag:null }));
+  conduit = { endA:false, endB:false, out:false, x:0, y:0, drag:null };
+  genSlot.part = null; collSlot.part = null;
+  state = "build"; prog = 0; errT = 0; shakeT = 0;
+  bubbles = []; escapes = []; puffs = []; confetti = [];
+  layout();
+  const L = LEVELS[li];
+  scorebar.textContent = `🧪 第 ${li + 1} / 3 关 · 制取${L.name} ${L.gas}`;
+  startBtn.style.display = "block";
+  nextBtn.style.display = "none";
+  showHint(L.intro, 5200);
+}
+
+/* ================= 几何：接口点 ================= */
+// 发生装置出气口 G
+function genOutlet() {
+  const k = S;
+  if (genSlot.part === "flask") return [genX + 34 * k, benchY - 152 * k];
+  return [genX + 84 * k, benchY - 94 * k];   // tube
+}
+// 集气装置进气口 C（导管末端）
+function collInlet() {
+  const k = S;
+  if (collSlot.part === "up")    return [collX, benchY - 28 * k];
+  if (collSlot.part === "down")  return [collX, benchY - 104 * k];
+  return [collX, benchY - 134 * k];          // water
+}
+// 集气瓶瓶口（空气排出/气体逃逸的位置）
+function collMouth() {
+  const k = S;
+  if (collSlot.part === "up")    return [collX, benchY - 134 * k];
+  if (collSlot.part === "down")  return [collX, benchY - 4 * k];
+  return [collX, benchY - 34 * k];           // water
+}
+// 完整连接时导管的贝塞尔曲线
+function tubeCurve() {
+  const k = S, G = genOutlet(), C = collInlet();
+  return { p0:G, p1:[G[0] + 60 * k, G[1] - 120 * k], p2:[C[0] - 60 * k, C[1] - 120 * k], p3:C };
+}
+function bezAt(c, t) {
+  const u = 1 - t;
+  return [
+    u*u*u*c.p0[0] + 3*u*u*t*c.p1[0] + 3*u*t*t*c.p2[0] + t*t*t*c.p3[0],
+    u*u*u*c.p0[1] + 3*u*u*t*c.p1[1] + 3*u*t*t*c.p2[1] + t*t*t*c.p3[1]
+  ];
+}
+
+/* ================= 更新（反应与粒子） ================= */
+const REACT_DUR = 7, ERR_DUR = 3.6;
+
+function update(dt, now) {
+  const k = S, L = LEVELS[li];
+  if (state === "react") {
+    prog = Math.min(1, prog + dt / REACT_DUR);
+    // 发生器冒泡
+    spawnT += dt;
+    if (spawnT > 0.09) { spawnT = 0; spawnGenBubble(); }
+    // 排空气法：前一段排出空气
+    if (prog < 0.3 && (collSlot.part === "up" || collSlot.part === "down") && Math.random() < 8 * dt) {
+      const M = collMouth();
+      puffs.push({ x:M[0] + (Math.random() - 0.5) * 30 * k, y:M[1],
+        vx:(Math.random() - 0.5) * 40 * k, vy:(collSlot.part === "up" ? -1 : 1) * 46 * k, life:0.8 });
+    }
+    // 排水法集满：瓶口冒泡
+    if (prog >= 1 && collSlot.part === "water" && Math.random() < 10 * dt) {
+      const M = collMouth();
+      escapes.push({ x:M[0] + (Math.random() - 0.5) * 24 * k, y:M[1] + 6 * k,
+        vx:(Math.random() - 0.5) * 30 * k, vy:60 * k, r:4 * k, life:1.0, mode:"full" });
+    }
+    fizzT += dt;
+    if (fizzT > 0.22) { fizzT = 0; fizz(); }
+    if (prog >= 1) finishLevel();
+  } else if (state === "error") {
+    errT += dt;
+    if (errMode === "noreact") {
+      shakeT = errT;
+    } else if (errT < ERR_DUR - 0.8 && Math.random() < 16 * dt) {
+      // 气体沿导管过来后逃逸/溶解
+      const C = collInlet();
+      if (errMode === "sink")        // 重气体从朝下的瓶口漏出
+        escapes.push({ x:C[0], y:C[1], vx:(Math.random() - 0.5) * 30 * k, vy:110 * k, r:5 * k, life:1.5, mode:"sink" });
+      else if (errMode === "float")  // 轻气体从朝上的瓶口飘走
+        escapes.push({ x:C[0], y:C[1], vx:(Math.random() - 0.5) * 30 * k, vy:-130 * k, r:5 * k, life:1.5, mode:"float" });
+      else                           // dissolve：溶进水里消失
+        escapes.push({ x:C[0], y:C[1], vx:(Math.random() - 0.5) * 20 * k, vy:36 * k, r:5 * k, life:1.1, mode:"dissolve" });
+      if (Math.random() < 0.3) fizz();
+    }
+    if (errT > ERR_DUR) { state = "build"; shakeT = 0; }
+  }
+  // 发生器气泡上升
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.y -= b.vy * dt; b.x += Math.sin(b.y * 0.06) * 0.5;
+    if (b.y < b.top) bubbles.splice(i, 1);
+  }
+  // 逃逸粒子
+  for (let i = escapes.length - 1; i >= 0; i--) {
+    const p = escapes[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+    if (p.mode === "float") p.x += Math.sin(now / 120 + i) * 0.8;
+    if (p.mode === "dissolve") p.r = Math.max(0.5, p.r - 3.5 * k * dt);
+    if (p.mode === "sink") p.vy += 60 * k * dt;
+    if (p.life <= 0 || p.r <= 0.6) escapes.splice(i, 1);
+  }
+  // 空气 puff
+  for (let i = puffs.length - 1; i >= 0; i--) {
+    const p = puffs[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+    if (p.life <= 0) puffs.splice(i, 1);
+  }
+  // 彩带
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.y += c.vy * dt; c.x += c.vx * dt; c.rot += c.vr * dt;
+    if (c.y > H + 30) confetti.splice(i, 1);
+  }
+}
+
+function spawnGenBubble() {
+  const k = S;
+  if (genSlot.part === "flask") {
+    bubbles.push({ x:genX + (Math.random() - 0.5) * 70 * k, y:benchY - 14 * k,
+      vy:(60 + Math.random() * 60) * k, r:(2 + Math.random() * 3.5) * k, top:benchY - 48 * k });
+  } else {
+    bubbles.push({ x:genX - 60 * k + Math.random() * 60 * k, y:benchY - 96 * k,
+      vy:(40 + Math.random() * 40) * k, r:(1.5 + Math.random() * 2.5) * k, top:benchY - 112 * k });
+  }
+}
+
+function finishLevel() {
+  state = "done";
+  const L = LEVELS[li];
+  fanfare(1);
+  showHint(`集满了！${L.name} ${L.gas} 收集成功 🎉`, 4000);
+  scorebar.textContent = `🎉 第 ${li + 1} / 3 关 · ${L.name}收集成功！`;
+  for (let i = 0; i < 80; i++) {
+    confetti.push({
+      x:Math.random() * W, y:-20 - Math.random() * H * 0.4,
+      vy:60 + Math.random() * 120, vx:(Math.random() - 0.5) * 60,
+      c:"hsl(" + (Math.random() * 360 | 0) + ",90%,60%)",
+      r:4 + Math.random() * 5, rot:Math.random() * 7, vr:(Math.random() - 0.5) * 6
+    });
+  }
+  if (li < LEVELS.length - 1) {
+    nextBtn.style.display = "block";
+  } else {
+    setTimeout(() => {
+      winPanel.querySelector(".msg").innerHTML =
+        "🎉 三关全部通关！<br>" +
+        "<span style='font-size:20px;color:#cfe8f2'>O₂：排水法 / 向上排空气法<br>" +
+        "CO₂：向上排空气法（比空气重、能溶于水）<br>" +
+        "H₂：向下排空气法 / 排水法（最轻、难溶于水）</span>";
+      winPanel.style.display = "flex";
+      fanfare(1);
+    }, 1200);
+  }
+  startBtn.style.display = "none";
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#eaf7fb"); g.addColorStop(1, "#cfe8f2");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 实验台面
+  ctx.fillStyle = "#b08968";
+  ctx.fillRect(TW, benchY, W - TW, H - benchY);
+  ctx.fillStyle = "rgba(0,0,0,0.12)";
+  ctx.fillRect(TW, benchY, W - TW, 6 * S + 2);
+  // 零件箱面板
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.fillRect(0, 0, TW, H);
+  ctx.strokeStyle = "rgba(46,125,156,0.5)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(TW, 0); ctx.lineTo(TW, H); ctx.stroke();
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#1d4e63";
+  ctx.font = `bold ${Math.round(18 * S + 5)}px sans-serif`;
+  ctx.fillText("🧰 零件箱", TW / 2, 84 * S + 10);
+}
+
+// 放置槽虚线框（拖拽时高亮）
+function drawSlots() {
+  const k = S;
+  const dragP = parts.find(p => p.drag);
+  const slots = [
+    { rect:[genX - 125 * k, benchY - 200 * k, 250 * k, 200 * k], kind:"gen", label:"发生装置放这里" },
+    { rect:[collX - 135 * k, benchY - 210 * k, 270 * k, 210 * k], kind:"coll", label:"集气装置放这里" },
+  ];
+  for (const s of slots) {
+    const occupied = s.kind === "gen" ? genSlot.part : collSlot.part;
+    const hot = dragP && dragP.kind === s.kind;
+    if (occupied && !hot) continue;
+    ctx.save();
+    ctx.setLineDash([10 * k, 8 * k]);
+    ctx.strokeStyle = hot ? "rgba(47,191,74,0.95)" : "rgba(46,125,156,0.4)";
+    ctx.lineWidth = hot ? 4 : 2.5;
+    roundRect(s.rect[0], s.rect[1], s.rect[2], s.rect[3], 16 * k, false); ctx.stroke();
+    ctx.setLineDash([]);
+    if (!occupied) {
+      ctx.fillStyle = hot ? "rgba(47,191,74,0.9)" : "rgba(46,125,156,0.45)";
+      ctx.font = `bold ${Math.round(14 * S + 4)}px sans-serif`;
+      ctx.textAlign = "center";
+      ctx.fillText(s.label, s.rect[0] + s.rect[2] / 2, s.rect[1] + 26 * k);
+    }
+    ctx.restore();
+  }
+}
+
+/* ---------- 发生装置 ---------- */
+function drawGenFlask(x, y, k, mini) {
+  const L = LEVELS[li];
+  const reacting = state === "react" && genSlot.part === "flask" && !mini;
+  const shake = (!mini && state === "error" && errMode === "noreact") ? Math.sin(shakeT * 40) * 4 * k : 0;
+  ctx.save();
+  ctx.translate(x + shake, y);
+  // 桌面阴影
+  ctx.fillStyle = "rgba(0,0,0,0.13)";
+  ctx.beginPath(); ctx.ellipse(0, 5 * k, 78 * k, 8 * k, 0, 0, 7); ctx.fill();
+  // 液体
+  const c = L.flaskLiquid;
+  ctx.save();
+  flaskPath(0, 0, k);
+  ctx.clip();
+  ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},0.95)`;
+  ctx.fillRect(-64 * k, -48 * k, 128 * k, 48 * k);
+  // 底部固体药品
+  if (!mini) {
+    if (li === 0) ctx.fillStyle = "rgba(40,40,46,0.9)";        // MnO₂ 黑
+    else if (li === 1) ctx.fillStyle = "rgba(150,150,145,0.95)"; // 石灰石 灰
+    else ctx.fillStyle = "rgba(170,185,200,0.95)";              // 锌粒 银
+    for (let i = 0; i < 7; i++) {
+      const ax = (-44 + i * 14) * k, ay = (-8 - (i % 2) * 6) * k;
+      ctx.beginPath(); ctx.arc(ax, ay, (5 + (i % 3)) * k, 0, 7); ctx.fill();
+    }
+    // 反应气泡
+    for (const b of bubbles) {
+      if (Math.abs(b.x - x) > 64 * k) continue;
+      ctx.beginPath(); ctx.arc(b.x - x, b.y - y, b.r, 0, 7);
+      ctx.fillStyle = "rgba(255,255,255,0.8)"; ctx.fill();
+    }
+  }
+  ctx.restore();
+  // 瓶身玻璃
+  ctx.strokeStyle = "rgba(90,120,140,0.9)"; ctx.lineWidth = 3 * k + 1;
+  ctx.fillStyle = "rgba(255,255,255,0.16)";
+  flaskPath(0, 0, k); ctx.fill(); ctx.stroke();
+  // 双孔塞
+  ctx.fillStyle = "#a5715a";
+  roundRect(-26 * k, -142 * k, 52 * k, 16 * k, 4 * k, true);
+  // 长颈漏斗（左孔，下端伸入液面下）
+  ctx.strokeStyle = "rgba(90,120,140,0.9)"; ctx.lineWidth = 2.5 * k;
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.beginPath();
+  ctx.moveTo(-19 * k, -198 * k); ctx.lineTo(-5 * k, -198 * k);
+  ctx.lineTo(-10 * k, -178 * k); ctx.lineTo(-10 * k, -60 * k);
+  ctx.lineTo(-14 * k, -60 * k); ctx.lineTo(-14 * k, -178 * k);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  // 出气短管（右孔）
+  ctx.beginPath();
+  ctx.moveTo(12 * k, -152 * k); ctx.lineTo(34 * k, -152 * k);
+  ctx.lineTo(34 * k, -140 * k); ctx.lineTo(12 * k, -140 * k);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  if (!mini) {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#fdf6e8";
+    ctx.font = `bold ${Math.round(12 * S + 3)}px sans-serif`;
+    ctx.fillText(L.flaskStuff, 0, 26 * k);
+    if (reacting) {
+      ctx.fillStyle = "rgba(60,110,150,0.95)";
+      ctx.font = `bold ${Math.round(14 * S + 4)}px sans-serif`;
+      ctx.fillText(L.gas + "↑", 56 * k, -60 * k + Math.sin(performance.now() / 280) * 3 * k);
+    }
+  }
+  ctx.restore();
+}
+function flaskPath(x, y, k) {
+  ctx.beginPath();
+  ctx.moveTo(x - 20 * k, y - 126 * k);
+  ctx.lineTo(x - 20 * k, y - 104 * k);
+  ctx.lineTo(x - 64 * k, y - 12 * k);
+  ctx.quadraticCurveTo(x - 66 * k, y, x - 54 * k, y);
+  ctx.lineTo(x + 54 * k, y);
+  ctx.quadraticCurveTo(x + 66 * k, y, x + 64 * k, y - 12 * k);
+  ctx.lineTo(x + 20 * k, y - 104 * k);
+  ctx.lineTo(x + 20 * k, y - 126 * k);
+  ctx.closePath();
+}
+
+function drawGenTube(x, y, k, mini) {
+  const reacting = state === "react" && genSlot.part === "tube" && !mini;
+  const shake = (!mini && state === "error" && errMode === "noreact") ? Math.sin(shakeT * 40) * 4 * k : 0;
+  ctx.save();
+  ctx.translate(x + shake, y);
+  // 铁架台
+  ctx.strokeStyle = "#6b747b"; ctx.lineWidth = 6 * k;
+  ctx.beginPath(); ctx.moveTo(-96 * k, -4 * k); ctx.lineTo(-96 * k, -160 * k); ctx.stroke();
+  ctx.fillStyle = "#6b747b";
+  roundRect(-126 * k, -8 * k, 66 * k, 8 * k, 3 * k, true);
+  // 铁夹
+  ctx.fillStyle = "#8d979e";
+  roundRect(-96 * k, -108 * k, 40 * k, 10 * k, 3 * k, true);
+  // 试管（管口略向下倾斜）
+  ctx.save();
+  ctx.translate(-10 * k, -96 * k);
+  ctx.rotate(0.10);
+  // 高锰酸钾（紫黑色）在管底
+  ctx.fillStyle = "#5c2a6e";
+  roundRect(-82 * k, -14 * k, 42 * k, 28 * k, 10 * k, true);
+  // 棉花团
+  ctx.fillStyle = "rgba(245,245,250,0.95)";
+  ctx.beginPath(); ctx.arc(52 * k, 0, 10 * k, 0, 7); ctx.fill();
+  // 管身玻璃
+  ctx.strokeStyle = "rgba(90,120,140,0.9)"; ctx.lineWidth = 3 * k + 1;
+  ctx.fillStyle = "rgba(255,255,255,0.16)";
+  ctx.beginPath();
+  ctx.moveTo(64 * k, -17 * k); ctx.lineTo(-70 * k, -17 * k);
+  ctx.arc(-70 * k, 0, 17 * k, -Math.PI / 2, Math.PI / 2, true);
+  ctx.lineTo(64 * k, 17 * k);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  // 气泡
+  if (!mini) {
+    for (const b of bubbles) {
+      ctx.beginPath(); ctx.arc(b.x - x + 10 * k, b.y - y + 96 * k, b.r * 0.8, 0, 7);
+      ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.fill();
+    }
+  }
+  ctx.restore();
+  // 橡皮塞 + 出气导管口
+  ctx.fillStyle = "#a5715a";
+  roundRect(56 * k, -104 * k, 14 * k, 34 * k, 4 * k, true);
+  ctx.strokeStyle = "rgba(90,120,140,0.9)"; ctx.lineWidth = 2.5 * k;
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.beginPath();
+  ctx.moveTo(70 * k, -94 * k); ctx.lineTo(86 * k, -94 * k);
+  ctx.lineTo(86 * k, -84 * k); ctx.lineTo(70 * k, -84 * k);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  // 酒精灯
+  ctx.fillStyle = "rgba(200,225,240,0.85)";
+  ctx.beginPath();
+  ctx.moveTo(-52 * k, 0); ctx.lineTo(-46 * k, -30 * k); ctx.lineTo(-26 * k, -30 * k); ctx.lineTo(-20 * k, 0);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "rgba(90,120,140,0.8)"; ctx.lineWidth = 2 * k; ctx.stroke();
+  ctx.fillStyle = "#3a3f45";
+  ctx.fillRect(-39 * k, -36 * k, 6 * k, 8 * k);   // 灯芯
+  // 火焰（反应时）
+  if (reacting || (state === "error" && errMode === "noreact" && !mini)) {
+    const fl = 1 + Math.sin(performance.now() / 90) * 0.18;
+    const g = ctx.createRadialGradient(-36 * k, -48 * k, 2, -36 * k, -48 * k, 20 * k * fl);
+    g.addColorStop(0, "rgba(255,240,150,0.95)");
+    g.addColorStop(0.6, "rgba(255,150,40,0.8)");
+    g.addColorStop(1, "rgba(255,80,20,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(-36 * k, -38 * k);
+    ctx.quadraticCurveTo(-52 * k, -52 * k, -36 * k, -68 * k * fl);
+    ctx.quadraticCurveTo(-20 * k, -52 * k, -36 * k, -38 * k);
+    ctx.fill();
+  }
+  if (!mini) {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#fdf6e8";
+    ctx.font = `bold ${Math.round(12 * S + 3)}px sans-serif`;
+    ctx.fillText("高锰酸钾（加热）", 0, 26 * k);
+  }
+  ctx.restore();
+}
+
+/* ---------- 集气装置 ---------- */
+function bottleGlass(x, y, w, h, k, mouthDown) {
+  // 画集气瓶玻璃轮廓（mouthDown=true 时瓶口朝下）
+  ctx.strokeStyle = "rgba(90,120,140,0.9)"; ctx.lineWidth = 3 * k + 1;
+  ctx.fillStyle = "rgba(255,255,255,0.16)";
+  ctx.beginPath();
+  if (!mouthDown) {
+    ctx.moveTo(x - w / 2, y - h);
+    ctx.lineTo(x - w / 2, y - 10 * k);
+    ctx.quadraticCurveTo(x - w / 2, y, x - w / 2 + 10 * k, y);
+    ctx.lineTo(x + w / 2 - 10 * k, y);
+    ctx.quadraticCurveTo(x + w / 2, y, x + w / 2, y - 10 * k);
+    ctx.lineTo(x + w / 2, y - h);
+  } else {
+    ctx.moveTo(x - w / 2, y);
+    ctx.lineTo(x - w / 2, y - h + 10 * k);
+    ctx.quadraticCurveTo(x - w / 2, y - h, x - w / 2 + 10 * k, y - h);
+    ctx.lineTo(x + w / 2 - 10 * k, y - h);
+    ctx.quadraticCurveTo(x + w / 2, y - h, x + w / 2, y - h + 10 * k);
+    ctx.lineTo(x + w / 2, y);
+  }
+  ctx.fill(); ctx.stroke();
+}
+
+function drawCollUp(x, y, k, mini) {
+  const L = LEVELS[li];
+  const w = 76 * k, h = 134 * k;
+  ctx.save(); ctx.translate(x, y);
+  ctx.fillStyle = "rgba(0,0,0,0.13)";
+  ctx.beginPath(); ctx.ellipse(0, 5 * k, 50 * k, 7 * k, 0, 0, 7); ctx.fill();
+  // 气体填充（从底部向上）
+  const fillH = (state === "done" ? 1 : prog) * (h - 16 * k);
+  if (fillH > 1 && collSlot.part === "up" || mini) {
+    ctx.save();
+    bottleGlass(0, 0, w, h, k, false);
+    ctx.clip();
+    ctx.fillStyle = L.tint + (mini ? "0.25)" : "0.4)");
+    const gy = -8 * k - fillH;
+    ctx.fillRect(-w / 2, gy, w, fillH + 8 * k);
+    // 波浪气面
+    if (!mini) {
+      ctx.strokeStyle = L.tint + "0.9)"; ctx.lineWidth = 2.5 * k;
+      ctx.beginPath();
+      for (let i = 0; i <= 10; i++) {
+        const px = -w / 2 + (w * i / 10);
+        const py = gy + Math.sin(performance.now() / 200 + i) * 2 * k;
+        i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  bottleGlass(0, 0, w, h, k, false);
+  if (!mini && fillH > 20 * k && collSlot.part === "up") {
+    ctx.textAlign = "center";
+    ctx.fillStyle = L.tint + "0.95)";
+    ctx.font = `bold ${Math.round(18 * S + 5)}px sans-serif`;
+    ctx.fillText(L.gas, 0, -fillH / 2 - 6 * k);
+  }
+  ctx.restore();
+}
+
+function drawCollDown(x, y, k, mini) {
+  const L = LEVELS[li];
+  const w = 76 * k, h = 130 * k;
+  ctx.save(); ctx.translate(x, y);
+  ctx.fillStyle = "rgba(0,0,0,0.13)";
+  ctx.beginPath(); ctx.ellipse(0, 5 * k, 50 * k, 7 * k, 0, 0, 7); ctx.fill();
+  // 气体从顶部（封闭端）向下填
+  const fillH = (state === "done" ? 1 : prog) * (h - 16 * k);
+  if ((fillH > 1 && collSlot.part === "down") || mini) {
+    ctx.save();
+    bottleGlass(0, 0, w, h, k, true);
+    ctx.clip();
+    ctx.fillStyle = L.tint + (mini ? "0.25)" : "0.4)");
+    const gy = -h + 8 * k + fillH;
+    ctx.fillRect(-w / 2, -h, w, h - (h - 8 * k - fillH));
+    if (!mini) {
+      ctx.strokeStyle = L.tint + "0.9)"; ctx.lineWidth = 2.5 * k;
+      ctx.beginPath();
+      for (let i = 0; i <= 10; i++) {
+        const px = -w / 2 + (w * i / 10);
+        const py = gy + Math.sin(performance.now() / 200 + i) * 2 * k;
+        i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  bottleGlass(0, 0, w, h, k, true);
+  if (!mini && fillH > 20 * k && collSlot.part === "down") {
+    ctx.textAlign = "center";
+    ctx.fillStyle = L.tint + "0.95)";
+    ctx.font = `bold ${Math.round(18 * S + 5)}px sans-serif`;
+    ctx.fillText(L.gas, 0, -h + fillH / 2 + 4 * k);
+  }
+  ctx.restore();
+}
+
+function drawCollWater(x, y, k, mini) {
+  const L = LEVELS[li];
+  const tw = 190 * k, th = 66 * k;          // 水槽
+  const bw = 70 * k, bh = 128 * k;          // 集气瓶
+  const mouthY = -36 * k, topY = mouthY - bh;
+  ctx.save(); ctx.translate(x, y);
+  ctx.fillStyle = "rgba(0,0,0,0.13)";
+  ctx.beginPath(); ctx.ellipse(0, 5 * k, tw * 0.55, 8 * k, 0, 0, 7); ctx.fill();
+  // 槽内水
+  ctx.fillStyle = "rgba(160,210,240,0.55)";
+  ctx.fillRect(-tw / 2 + 4 * k, -th + 10 * k, tw - 8 * k, th - 14 * k);
+  // 瓶内水（随气体增多下降）
+  const p = (collSlot.part === "water" && !mini) ? (state === "done" ? 1 : prog) : (mini ? 0.35 : 0);
+  const waterTop = mouthY - (1 - p) * (bh - 10 * k);
+  ctx.save();
+  bottleGlass(0, mouthY, bw, bh, k, true);
+  ctx.clip();
+  // 气体区
+  ctx.fillStyle = L.tint + "0.4)";
+  ctx.fillRect(-bw / 2, topY, bw, waterTop - topY);
+  // 水区
+  ctx.fillStyle = "rgba(140,200,240,0.65)";
+  ctx.fillRect(-bw / 2, waterTop, bw, mouthY - waterTop);
+  ctx.restore();
+  // 液面线
+  if (!mini && collSlot.part === "water") {
+    ctx.strokeStyle = "rgba(90,150,200,0.9)"; ctx.lineWidth = 2 * k;
+    ctx.beginPath();
+    ctx.moveTo(-bw / 2 + 4 * k, waterTop); ctx.lineTo(bw / 2 - 4 * k, waterTop); ctx.stroke();
+  }
+  bottleGlass(0, mouthY, bw, bh, k, true);
+  // 水槽壁
+  ctx.strokeStyle = "rgba(90,120,140,0.9)"; ctx.lineWidth = 3 * k + 1;
+  ctx.fillStyle = "rgba(255,255,255,0.10)";
+  ctx.beginPath();
+  ctx.moveTo(-tw / 2, -th); ctx.lineTo(-tw / 2, 0); ctx.lineTo(tw / 2, 0); ctx.lineTo(tw / 2, -th);
+  ctx.fill(); ctx.stroke();
+  // 水面线
+  ctx.strokeStyle = "rgba(90,150,200,0.8)"; ctx.lineWidth = 2 * k;
+  ctx.beginPath(); ctx.moveTo(-tw / 2 + 4 * k, -th + 10 * k); ctx.lineTo(tw / 2 - 4 * k, -th + 10 * k); ctx.stroke();
+  if (!mini && p > 0.15 && collSlot.part === "water") {
+    ctx.textAlign = "center";
+    ctx.fillStyle = L.tint + "0.95)";
+    ctx.font = `bold ${Math.round(18 * S + 5)}px sans-serif`;
+    ctx.fillText(L.gas, 0, topY + (waterTop - topY) / 2 + 6 * k);
+  }
+  ctx.restore();
+}
+
+/* ---------- 导管 ---------- */
+function drawConduitIcon(x, y, k) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.strokeStyle = "rgba(120,180,215,0.95)"; ctx.lineWidth = 10 * k; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(-34 * k, 26 * k);
+  ctx.lineTo(-34 * k, -14 * k);
+  ctx.quadraticCurveTo(-34 * k, -34 * k, -14 * k, -34 * k);
+  ctx.lineTo(30 * k, -34 * k);
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(70,110,140,0.7)"; ctx.lineWidth = 2 * k;
+  ctx.beginPath();
+  ctx.moveTo(-34 * k, 26 * k);
+  ctx.lineTo(-34 * k, -14 * k);
+  ctx.quadraticCurveTo(-34 * k, -34 * k, -14 * k, -34 * k);
+  ctx.lineTo(30 * k, -34 * k);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawConduit() {
+  const k = S;
+  ctx.save();
+  ctx.lineCap = "round";
+  if (conduit.endA && conduit.endB && genSlot.part && collSlot.part) {
+    // 完整连接：贝塞尔曲线
+    const c = tubeCurve();
+    ctx.strokeStyle = "rgba(120,180,215,0.9)"; ctx.lineWidth = 10 * k;
+    ctx.beginPath();
+    ctx.moveTo(c.p0[0], c.p0[1]);
+    ctx.bezierCurveTo(c.p1[0], c.p1[1], c.p2[0], c.p2[1], c.p3[0], c.p3[1]);
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(70,110,140,0.55)"; ctx.lineWidth = 2 * k;
+    ctx.stroke();
+    // 反应时：气体粒子沿导管流动
+    if (state === "react" || state === "error" && errMode !== "noreact") {
+      const L = LEVELS[li];
+      ctx.fillStyle = L.tint + "0.85)";
+      for (let i = 0; i < 9; i++) {
+        const t = (performance.now() / 1600 + i / 9) % 1;
+        const [px, py] = bezAt(c, t);
+        ctx.beginPath(); ctx.arc(px, py, 4 * k, 0, 7); ctx.fill();
+      }
+    }
+  } else if (conduit.out && (conduit.endA || conduit.endB)) {
+    // 一端已接，另一端垂着/被拖
+    const fixed = conduit.endA && genSlot.part ? genOutlet() : (conduit.endB && collSlot.part ? collInlet() : null);
+    if (fixed) {
+      const mx = (fixed[0] + conduit.x) / 2, my = Math.max(fixed[1], conduit.y) + 46 * k;
+      ctx.strokeStyle = "rgba(120,180,215,0.9)"; ctx.lineWidth = 10 * k;
+      ctx.beginPath();
+      ctx.moveTo(fixed[0], fixed[1]);
+      ctx.quadraticCurveTo(mx, my, conduit.x, conduit.y);
+      ctx.stroke();
+      ctx.fillStyle = "rgba(120,180,215,0.95)";
+      ctx.beginPath(); ctx.arc(conduit.x, conduit.y, 8 * k, 0, 7); ctx.fill();
+    } else {
+      drawConduitIcon(conduit.x, conduit.y, k * 0.8);
+    }
+  } else if (!parts.find(p => p.id === "conduit").placed) {
+    drawConduitIcon(conduit.x, conduit.y, k * 0.8);
+  }
+  ctx.restore();
+}
+
+// 拖拽导管时画吸附目标圈
+function drawSnapTargets() {
+  if (!conduit.drag) return;
+  const k = S;
+  ctx.save();
+  ctx.setLineDash([6 * k, 6 * k]);
+  ctx.strokeStyle = "rgba(47,191,74,0.95)"; ctx.lineWidth = 3 * k;
+  if (genSlot.part && !conduit.endA) {
+    const G = genOutlet();
+    ctx.beginPath(); ctx.arc(G[0], G[1], 22 * k, 0, 7); ctx.stroke();
+  }
+  if (collSlot.part && !conduit.endB) {
+    const C = collInlet();
+    ctx.beginPath(); ctx.arc(C[0], C[1], 22 * k, 0, 7); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* ---------- 零件（工具箱与拖拽中） ---------- */
+function drawPart(p) {
+  const k = S * (p.placed ? 1 : 0.52);
+  const x = p.placed ? (p.kind === "gen" ? genX : collX) : p.x;
+  const y = p.placed ? benchY : p.y + 44 * S;
+  const mini = !p.placed;
+  if (p.id === "flask") drawGenFlask(x, y, k, mini);
+  else if (p.id === "tube") drawGenTube(x, y, k, mini);
+  else if (p.id === "up") drawCollUp(x, y, k, mini);
+  else if (p.id === "down") drawCollDown(x, y, k, mini);
+  else if (p.id === "water") drawCollWater(x, y, k, mini);
+  // 工具箱里的名牌
+  if (!p.placed && p.id !== "conduit") {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#2b5468";
+    ctx.font = `bold ${Math.round(13 * S + 4)}px sans-serif`;
+    ctx.fillText(p.name, p.x, p.y + 58 * S);
+  }
+  if (p.id === "conduit" && !conduit.out && !conduit.drag) {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#2b5468";
+    ctx.font = `bold ${Math.round(13 * S + 4)}px sans-serif`;
+    ctx.fillText(p.name, conduit.x, conduit.y + 58 * S);
+  }
+}
+
+/* ---------- 粒子与特效 ---------- */
+function drawParticles() {
+  const k = S, L = LEVELS[li];
+  for (const p of puffs) {
+    ctx.fillStyle = `rgba(160,170,180,${Math.max(0, p.life) * 0.5})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 6 * k, 0, 7); ctx.fill();
+  }
+  for (const p of escapes) {
+    const a = Math.max(0, Math.min(1, p.life));
+    ctx.fillStyle = L.tint + (0.75 * a) + ")";
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  }
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.c;
+    ctx.fillRect(-c.r, -c.r / 2, c.r * 2, c.r);
+    ctx.restore();
+  }
+}
+
+// 反应方程式标牌
+function drawEquation() {
+  if (state !== "react" && state !== "done") return;
+  const L = LEVELS[li];
+  const eq = genSlot.part === "tube" ? L.eqTube : L.eqFlask;
+  if (!eq) return;
+  const k = S;
+  const cx = TW + (W - TW) * 0.47, cy = 74 * k + 30;
+  ctx.save();
+  ctx.font = `bold ${Math.round(17 * S + 5)}px sans-serif`;
+  const w = ctx.measureText(eq).width + 44 * k;
+  ctx.fillStyle = "rgba(20,50,70,0.82)";
+  roundRect(cx - w / 2, cy - 26 * k, w, 44 * k, 12 * k, true);
+  ctx.fillStyle = "#ffe9a8";
+  ctx.textAlign = "center";
+  ctx.fillText(eq, cx, cy + 4 * k);
+  ctx.restore();
+}
+
+// 错误时画"气体跑了"说明箭头
+function drawErrorNote() {
+  if (state !== "error" || errMode === "noreact") return;
+  const k = S;
+  const M = collMouth();
+  const txt = errMode === "sink" ? "气体沉下来漏掉了 💨"
+            : errMode === "float" ? "气体飘走了 💨" : "气体溶进水里了 💧";
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.font = `bold ${Math.round(16 * S + 5)}px sans-serif`;
+  ctx.fillStyle = "rgba(200,60,50,0.95)";
+  const ty = errMode === "float" ? M[1] - 90 * k : M[1] + 60 * k;
+  ctx.fillText(txt, M[0], ty);
+  ctx.restore();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawSlots();
+  // 台面零件（先画放置的）
+  const dragP = parts.find(p => p.drag);
+  parts.forEach(p => { if (p.id !== "conduit" && p.placed && p !== dragP) drawPart(p); });
+  drawConduit();
+  drawSnapTargets();
+  parts.forEach(p => { if (p.id !== "conduit" && !p.placed && p !== dragP) drawPart(p); });
+  // 导管名牌（out 时在工具箱外不画名牌）
+  if (conduit.drag) drawConduitIcon(conduit.x, conduit.y, S * 0.8);
+  if (dragP) drawPart(dragP);
+  drawParticles();
+  drawEquation();
+  drawErrorNote();
+}
+
+/* ================= 交互 ================= */
+const SNAP_R = () => 130 * S;
+
+function partAt(x, y) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    if (p.id === "conduit") continue;
+    const cx = p.placed ? (p.kind === "gen" ? genX : collX) : p.x;
+    const cy = p.placed ? benchY - 80 * S : p.y;
+    const r = (p.placed ? 110 : 62) * S;
+    if (Math.hypot(x - cx, y - cy) < r) return p;
+  }
+  return null;
+}
+function conduitAt(x, y) {
+  if (conduit.endA && conduit.endB) return false;   // 已接好不拖
+  if (conduit.out || conduit.drag) return Math.hypot(x - conduit.x, y - conduit.y) < 60 * S;
+  const c = parts.find(p => p.id === "conduit");
+  return Math.hypot(x - c.home.x, y - c.home.y) < 60 * S;
+}
+function inGenSlot(x, y) {
+  return Math.abs(x - genX) < 135 * S && y > benchY - 210 * S && y < benchY + 20 * S;
+}
+function inCollSlot(x, y) {
+  return Math.abs(x - collX) < 145 * S && y > benchY - 220 * S && y < benchY + 20 * S;
+}
+function inToolbox(x) { return x < TW; }
+
+canvas.addEventListener("pointerdown", e => {
+  if (state !== "build" || winPanel.style.display === "flex") return;
+  const x = e.clientX, y = e.clientY;
+  if (conduitAt(x, y)) {
+    conduit.drag = { dx:conduit.x - x, dy:conduit.y - y };
+    conduit.out = true;
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(520);
+    return;
+  }
+  const p = partAt(x, y);
+  if (p) {
+    p.drag = { dx:p.x - x, dy:p.y - y };
+    if (p.placed) {
+      // 从槽里拿起
+      (p.kind === "gen" ? genSlot : collSlot).part = null;
+      p.placed = false;
+      if (p.kind === "gen" && conduit.endA) { conduit.endA = false; conduit.x = genX + 60 * S; conduit.y = benchY - 200 * S; }
+      if (p.kind === "coll" && conduit.endB) { conduit.endB = false; conduit.x = collX - 60 * S; conduit.y = benchY - 220 * S; }
+      p.x = x + p.drag.dx; p.y = y + p.drag.dy;
+    }
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(520);
+  }
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (conduit.drag) {
+    conduit.x = e.clientX + conduit.drag.dx;
+    conduit.y = e.clientY + conduit.drag.dy;
+    return;
+  }
+  const p = parts.find(p => p.drag);
+  if (p) { p.x = e.clientX + p.drag.dx; p.y = e.clientY + p.drag.dy; }
+});
+
+window.addEventListener("pointerup", e => {
+  const x = e.clientX, y = e.clientY;
+  // 导管落点：靠近接口自动吸附
+  if (conduit.drag) {
+    conduit.drag = null;
+    let snapped = false;
+    if (inToolbox(x)) {
+      conduit.endA = conduit.endB = conduit.out = false;
+      const c = parts.find(p => p.id === "conduit");
+      conduit.x = c.home.x; conduit.y = c.home.y;
+      pop(440);
+      return;
+    }
+    if (genSlot.part && !conduit.endA) {
+      const G = genOutlet();
+      if (Math.hypot(x - G[0], y - G[1]) < SNAP_R()) { conduit.endA = true; snapped = true; }
+    }
+    if (collSlot.part && !conduit.endB) {
+      const C = collInlet();
+      if (Math.hypot(x - C[0], y - C[1]) < SNAP_R()) { conduit.endB = true; snapped = true; }
+    }
+    // 两个装置都在且拖在中间：两端一起吸附
+    if (!snapped && genSlot.part && collSlot.part && !conduit.endA && !conduit.endB &&
+        x > genX && x < collX && y < benchY) {
+      conduit.endA = conduit.endB = true; snapped = true;
+    }
+    if (snapped) {
+      pop(760);
+      if (conduit.endA && conduit.endB) showHint("导管连接好了！点「开始制取」试试");
+    } else {
+      showHint("把导管拖到绿色圆圈附近，它会自动吸附接口", 2600);
+      pop(300);
+    }
+    return;
+  }
+  const p = parts.find(p => p.drag);
+  if (!p) return;
+  p.drag = null;
+  if (inToolbox(x)) {
+    p.x = p.home.x; p.y = p.home.y;
+    pop(440);
+    return;
+  }
+  const slot = p.kind === "gen" ? genSlot : collSlot;
+  const inSlot = p.kind === "gen" ? inGenSlot(x, y) : inCollSlot(x, y);
+  if (inSlot) {
+    // 槽里已有零件：换下来的回零件箱
+    if (slot.part) {
+      const old = parts.find(q => q.id === slot.part);
+      old.placed = false; old.x = old.home.x; old.y = old.home.y;
+    }
+    slot.part = p.id; p.placed = true;
+    p.x = p.home.x; p.y = p.home.y;
+    pop(660);
+    // 导管已在台面上：自动吸附新装置的接口
+    if (conduit.out) {
+      if (p.kind === "gen" && !conduit.endA) { conduit.endA = true; pop(760); }
+      if (p.kind === "coll" && !conduit.endB) { conduit.endB = true; pop(760); }
+    }
+    const L = LEVELS[li];
+    if (p.kind === "gen") {
+      if (!L.gens.includes(p.id)) showHint(`注意：本关制取${L.name}，这个发生装置可能不对哦`, 2800);
+      else showHint(p.id === "flask" ? "常温发生瓶就位！" : "加热试管就位！", 1600);
+    } else {
+      showHint("集气装置就位！还需要导管把气体引过去", 2000);
+    }
+  } else {
+    p.x = p.home.x; p.y = p.home.y;
+    pop(440);
+  }
+});
+
+/* ---------- 开始制取 ---------- */
+function tryStart() {
+  if (state !== "build") return;
+  const L = LEVELS[li];
+  if (!genSlot.part) { showHint("先把一个发生装置拖到左边台面！", 2600); pop(300); return; }
+  if (!collSlot.part) { showHint("再把一个集气装置拖到右边台面！", 2600); pop(300); return; }
+  if (!(conduit.endA && conduit.endB)) {
+    showHint("导管还没连好！把它拖到两个装置之间，靠近接口会自动吸附", 3000);
+    pop(300); return;
+  }
+  if (!L.gens.includes(genSlot.part)) {
+    state = "error"; errMode = "noreact"; errT = 0; shakeT = 0;
+    errBuzz();
+    showHint(L.wrongGen, 4200);
+    startBtn.style.display = "none";
+    setTimeout(() => { if (state === "build") startBtn.style.display = "block"; }, ERR_DUR * 1000);
+    return;
+  }
+  if (!L.colls.includes(collSlot.part)) {
+    state = "error"; errT = 0;
+    errMode = collSlot.part === "down" ? "sink" : collSlot.part === "up" ? "float" : "dissolve";
+    errBuzz();
+    showHint(errMode === "sink" ? L.errSink : errMode === "float" ? L.errFloat : L.errDissolve, 4600);
+    startBtn.style.display = "none";
+    setTimeout(() => { if (state === "build") startBtn.style.display = "block"; }, ERR_DUR * 1000);
+    return;
+  }
+  // 组装正确，开始反应
+  state = "react"; prog = 0; spawnT = 0;
+  bubbles = []; escapes = []; puffs = [];
+  whooshReact();
+  showHint("反应开始！看气泡产生，气体顺着导管进入集气瓶…", 3000);
+}
+
+startBtn.addEventListener("click", tryStart);
+nextBtn.addEventListener("click", () => { li++; resetLevel(); pop(880); });
+document.getElementById("resetBtn").addEventListener("click", () => { resetLevel(); pop(880); });
+document.getElementById("replayBtn").addEventListener("click", () => {
+  winPanel.style.display = "none"; li = 0; resetLevel(); pop(880);
+});
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = (f, v) => tone(f, 0.12, v || 0.12);
+const fizz = () => tone(1600 + Math.random() * 1600, 0.05, 0.03, "square");
+const errBuzz = () => { tone(180, 0.25, 0.14, "sawtooth"); setTimeout(() => tone(140, 0.3, 0.12, "sawtooth"), 180); };
+const whooshReact = () => tone(300, 0.25, 0.1, "triangle");
+function fanfare(k) {
+  [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.18, 0.12 * (k || 1)), i * 120));
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  update(dt, now);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 3200);
+}
+resize();
+resetLevel();
+requestAnimationFrame(loop);
+
+// 测试钩子（不影响游戏）
+window.__gp = {
+  get state() { return state; }, get li() { return li; }, get prog() { return prog; },
+  place(gen, coll) {
+    genSlot.part = gen; collSlot.part = coll;
+    parts.forEach(p => { p.placed = (p.id === gen || p.id === coll); });
+    conduit.out = true; conduit.endA = conduit.endB = true;
+  },
+  start: tryStart,
+  step(dt) { update(dt, performance.now()); },
+  next() { li++; resetLevel(); }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

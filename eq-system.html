@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>方程组天平</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#0e1a26; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,18,26,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,18,26,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">⚖️ 第 1 / 3 关</div>
+<div id="hint">把天平①整个拖到天平②上，减去两边相同的东西！</div>
+<div id="winPanel">
+  <div class="msg">🎉 解出来啦！</div>
+  <button id="nextBtn">下一关 ▶</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const nextBtn = document.getElementById("nextBtn");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 关卡数据 ================= */
+// 每关两个天平：{a:箱子数(x), b:瓶子数(y), c:右盘千克数}，即 ax + by = c
+const LEVELS = [
+  { b:[{a:1,b:1,c:5}, {a:1,b:2,c:7}],  hint:"把天平①整个拖到天平②上，减去两边相同的东西！" },   // y=2, x=3
+  { b:[{a:1,b:1,c:4}, {a:2,b:1,c:7}],  hint:"这次②上箱子多！还是把①拖到②上试试" },               // x=3, y=1
+  { b:[{a:1,b:1,c:6}, {a:2,b:3,c:15}], hint:"要减两次才能消元哦，把①往②上放两次！" }              // y=3, x=3
+];
+const CN = ["①", "②"];   // 天平编号
+const VAR_NAME = { x:"箱子", y:"瓶子" };
+const VAR_ICON = { x:"📦", y:"🍼" };
+
+/* ================= 游戏状态 ================= */
+let levelIdx = 0;
+let bals = [];          // 两个天平 {a, b, c, sub:{var,val,count}|null}
+let phase = "subtract"; // subtract | substitute | done
+let solved = { x:null, y:null };
+let logs = [];          // 代数变换记录 {txt, gold}
+let chip = null;        // 已知量砝码 {var, val, x, y, w, h}
+let dragBal = null;     // {src, x, y} 正在拖整个天平
+let dragChip = null;    // {x, y}
+let anim = null;        // 当前动画 {type, t, dur, ...}
+let floats = [];        // 漂浮文字 {x, y, txt, t, dur}
+let confetti = [];
+let geo = [];           // 每个天平的几何布局
+let nowMs = 0;
+
+function loadLevel(i) {
+  levelIdx = i;
+  bals = LEVELS[i].b.map(b => ({ a:b.a, b:b.b, c:b.c, sub:null }));
+  phase = "subtract";
+  solved = { x:null, y:null };
+  logs = []; chip = null; dragBal = null; dragChip = null;
+  anim = null; floats = []; confetti = [];
+  winPanel.style.display = "none";
+  hintEl.textContent = LEVELS[i].hint;
+  hintEl.style.opacity = "1";
+  updateScore();
+  layout();
+}
+function updateScore() { scorebar.textContent = `⚖️ 第 ${levelIdx + 1} / ${LEVELS.length} 关`; }
+
+/* ================= 布局 ================= */
+function layout() {
+  const beamHalf = Math.max(90, Math.min(160, W * 0.14));
+  const panW = Math.max(100, Math.min(150, W * 0.12));
+  const beamY = Math.round(H * 0.30);
+  const panY = beamY + 86;
+  const baseY = Math.round(H * 0.56);
+  geo = [0, 1].map(i => {
+    const cx = W * (i ? 0.73 : 0.27);
+    return {
+      cx, beamY, panY, baseY, beamHalf, panW,
+      eqY: baseY + 52,
+      region: { x:cx - beamHalf - panW / 2 - 30, y:beamY - 110, w:2 * (beamHalf + panW / 2 + 30), h:baseY - beamY + 170 }
+    };
+  });
+  if (chip && !dragChip) { chip.x = W / 2; chip.y = H * 0.90; }
+}
+// 左盘物品位置：先箱子后瓶子，居中排开
+function itemPos(i, kind, k) {
+  const bal = bals[i], g = geo[i];
+  const n = bal.a + bal.b;
+  const idx = kind === "box" ? k : bal.a + k;
+  return [g.cx - g.beamHalf + (idx - (n - 1) / 2) * 46, g.panY - 6];
+}
+function inRegion(x, y, r) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+/* ================= 等式文本 ================= */
+function fmtLeft(bal) {
+  const parts = [];
+  if (bal.a > 0) parts.push(bal.a > 1 ? bal.a + "x" : "x");
+  if (bal.b > 0) parts.push(bal.b > 1 ? bal.b + "y" : "y");
+  return parts.join(" + ") || "0";
+}
+function fmtEq(bal) { return fmtLeft(bal) + " = " + bal.c; }
+// 代入已知量后的式子：x + 2 = 5
+function fmtEqSub(bal) {
+  const parts = [];
+  if (bal.sub && bal.sub.var === "x") parts.push(String(bal.sub.count * bal.sub.val));
+  else if (bal.a > 0) parts.push(bal.a > 1 ? bal.a + "x" : "x");
+  if (bal.sub && bal.sub.var === "y") parts.push(String(bal.sub.count * bal.sub.val));
+  else if (bal.b > 0) parts.push(bal.b > 1 ? bal.b + "y" : "y");
+  return parts.join(" + ") + " = " + bal.c;
+}
+function pushLog(txt, gold) {
+  logs.push({ txt, gold:!!gold });
+  if (logs.length > 6) logs.shift();
+}
+
+/* ================= 消元（天平减法） ================= */
+const easeOut = p => 1 - (1 - p) * (1 - p);
+const easeInOut = p => p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+
+function canSubtract(S, D) { return S.a <= D.a && S.b <= D.b && S.c <= D.c && S.a + S.b > 0; }
+
+function trySubtract(src, dst) {
+  const S = bals[src], D = bals[dst];
+  if (canSubtract(S, D)) {
+    startSubtractAnim(src, dst);
+  } else {
+    showHint(`天平${CN[src]}的东西比${CN[dst]}还多，减不动哦！换轻的那边放上去试试`);
+    pop(200);
+  }
+}
+
+function startSubtractAnim(src, dst) {
+  const S = bals[src], D = bals[dst];
+  const oldD = { a:D.a, b:D.b, c:D.c };
+  // 配对：目标天平左盘上被消掉的物品
+  const pairs = [], flyers = [];
+  for (let k = 0; k < S.a; k++) pairs.push({ kind:"box", k });
+  for (let k = 0; k < S.b; k++) pairs.push({ kind:"bottle", k });
+  const fromX = dragBal ? dragBal.x : geo[src].cx;
+  const fromY = dragBal ? dragBal.y : geo[src].beamY;
+  pairs.forEach((p, i) => {
+    const [tx, ty] = itemPos(dst, p.kind, p.k);
+    flyers.push({ kind:p.kind, x0:fromX + (i - (pairs.length - 1) / 2) * 30, y0:fromY, x1:tx, y1:ty });
+  });
+  anim = { type:"subtract", t:0, dur:1.3, src, dst, oldD, pairs, flyers, applied:false };
+  whoosh();
+}
+
+function subtractApply(an) {
+  const S = bals[an.src], D = bals[an.dst];
+  const rx = geo[an.dst].cx + geo[an.dst].beamHalf;
+  floats.push({ x:rx, y:geo[an.dst].panY - 80, txt:`−${S.c} kg`, t:0, dur:1.2 });
+  D.a -= S.a; D.b -= S.b; D.c -= S.c;
+  pop(520); ding();
+  pushLog(`${CN[an.dst]} − ${CN[an.src]}：${fmtLeft(an.oldD)} − (${fmtLeft(S)}) = ${an.oldD.c} − ${S.c}`);
+  pushLog(`→ ${fmtEq(D)}`, true);
+}
+
+function subtractDone(an) {
+  const D = bals[an.dst];
+  anim = null;
+  if (D.a === 0 && D.b === 1) onVarSolved("y", D.c, an.dst);
+  else if (D.b === 0 && D.a === 1) onVarSolved("x", D.c, an.dst);
+  else showHint("变简单了！再减一次试试");
+}
+
+/* ================= 回代求解 ================= */
+function onVarSolved(v, val, dst) {
+  solved[v] = val;
+  phase = "substitute";
+  chip = { var:v, val, x:W / 2, y:H * 0.90, w:150, h:54 };
+  pop(880); setTimeout(() => pop(1175), 90);
+  const other = 1 - dst;
+  showHint(`${VAR_ICON[v]} ${VAR_NAME[v]} = ${val}kg！把下面的 ${val}kg 砝码拖到天平${CN[other]}的${VAR_NAME[v]}上`);
+}
+
+function startSubstAnim(bi) {
+  const bal = bals[bi];
+  const v = chip.var;
+  const count = v === "y" ? bal.b : bal.a;
+  const kind = v === "y" ? "bottle" : "box";
+  const [tx, ty] = itemPos(bi, kind, 0);
+  anim = {
+    type:"subst", t:0, dur:1.8, bi, v, val:chip.val, count,
+    x0:chip.x, y0:chip.y, x1:tx, y1:ty - 20,
+    subApplied:false, floated:false, cancelApplied:false
+  };
+  chip = null; dragChip = null;
+  whoosh();
+}
+
+function substUpdate(an, p) {
+  const bal = bals[an.bi];
+  if (p >= 0.35 && !an.subApplied) {
+    an.subApplied = true;
+    bal.sub = { var:an.v, val:chipVal(an), count:an.count };
+    pushLog(`把 ${an.v} = ${an.val} 代入${CN[an.bi]}：${fmtEqSub(bal)}`);
+    pop(660);
+  }
+  if (p >= 0.55 && !an.floated) {
+    an.floated = true;
+    const g = geo[an.bi];
+    const total = an.count * an.val;
+    floats.push({ x:g.cx - g.beamHalf, y:g.panY - 90, txt:`−${total} kg`, t:0, dur:1.2 });
+    floats.push({ x:g.cx + g.beamHalf, y:g.panY - 90, txt:`−${total} kg`, t:0, dur:1.2 });
+  }
+  if (p >= 0.85 && !an.cancelApplied) {
+    an.cancelApplied = true;
+    if (an.v === "y") bal.b = 0; else bal.a = 0;
+    bal.c -= an.count * an.val;
+    bal.sub = null;
+    pushLog(`→ ${fmtEq(bal)}`, true);
+    ding();
+  }
+}
+// chip 在动画开始时被清空，值暂存在 anim 上
+function chipVal(an) { return an.val; }
+
+function substDone(an) {
+  const bal = bals[an.bi];
+  if (bal.a > 0) solved.x = bal.c / bal.a;
+  if (bal.b > 0) solved.y = bal.c / bal.b;
+  anim = null;
+  phase = "done";
+  fanfare();
+  boom();
+  setTimeout(showWin, 900);
+}
+
+function showWin() {
+  const last = levelIdx >= LEVELS.length - 1;
+  winPanel.querySelector(".msg").innerHTML =
+    (last ? "🎉 全部通关！你是方程组小达人！" : "⚖️ 解出来啦！") +
+    `<br><span style="font-size:28px;color:#fff">x = ${solved.x}，y = ${solved.y}</span>`;
+  nextBtn.textContent = last ? "再玩一次" : "下一关 ▶";
+  winPanel.style.display = "flex";
+  fanfare();
+}
+
+/* ================= 交互 ================= */
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex" || anim) return;
+  const x = e.clientX, y = e.clientY;
+  // 回代阶段：拖已知量砝码
+  if (phase === "substitute" && chip &&
+      x >= chip.x - chip.w / 2 && x <= chip.x + chip.w / 2 &&
+      y >= chip.y - chip.h / 2 && y <= chip.y + chip.h / 2) {
+    dragChip = { x, y };
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(660);
+    return;
+  }
+  // 消元阶段：拖整个天平
+  if (phase === "subtract") {
+    for (let i = 0; i < 2; i++) {
+      if (inRegion(x, y, geo[i].region)) {
+        dragBal = { src:i, x, y };
+        canvas.setPointerCapture(e.pointerId);
+        hintEl.style.opacity = "0";
+        pop(660);
+        return;
+      }
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (dragBal) { dragBal.x = e.clientX; dragBal.y = e.clientY; }
+  if (dragChip) { dragChip.x = e.clientX; dragChip.y = e.clientY; }
+});
+window.addEventListener("pointerup", e => {
+  if (dragBal) {
+    const src = dragBal.src, dst = 1 - src;
+    if (inRegion(dragBal.x, dragBal.y, geo[dst].region)) trySubtract(src, dst);
+    else pop(300);
+    dragBal = null;
+  }
+  if (dragChip) {
+    const other = chipTarget();
+    if (other >= 0 && inRegion(dragChip.x, dragChip.y, geo[other].region)) {
+      startSubstAnim(other);
+    } else {
+      pop(300);
+    }
+    dragChip = null;
+  }
+});
+canvas.addEventListener("pointercancel", () => { dragBal = null; dragChip = null; });
+// 回代目标：还同时有两种物品的那个天平
+function chipTarget() {
+  for (let i = 0; i < 2; i++) if (bals[i].a > 0 && bals[i].b > 0) return i;
+  return -1;
+}
+
+/* ================= 绘制 ================= */
+const GOLD = "#ffd54a", GREEN = "#2fbf4a", RED = "#ff5252";
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+// 箱子（未知数 x）
+function drawBox(x, y, s) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = "#c98d4b";
+  roundRect(-19 * s, -34 * s, 38 * s, 34 * s, 4 * s, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2;
+  roundRect(-19 * s, -34 * s, 38 * s, 34 * s, 4 * s, false); ctx.stroke();
+  ctx.fillStyle = "#a76f35";
+  ctx.fillRect(-19 * s, -20 * s, 38 * s, 5 * s);          // 胶带横
+  ctx.fillRect(-3 * s, -34 * s, 6 * s, 34 * s);           // 胶带竖
+  ctx.fillStyle = "#fff";
+  ctx.font = `bold ${Math.round(18 * s)}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("x", 10 * s, -8 * s);
+  ctx.restore();
+}
+// 瓶子（未知数 y）
+function drawBottle(x, y, s) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = "#4aa3e8";
+  roundRect(-12 * s, -36 * s, 24 * s, 36 * s, 7 * s, true);   // 瓶身
+  ctx.fillRect(-5 * s, -46 * s, 10 * s, 12 * s);              // 瓶颈
+  ctx.fillStyle = "#2f7fc0";
+  ctx.fillRect(-6 * s, -50 * s, 12 * s, 6 * s);               // 瓶盖
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2;
+  roundRect(-12 * s, -36 * s, 24 * s, 36 * s, 7 * s, false); ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  ctx.fillRect(-8 * s, -32 * s, 4 * s, 24 * s);               // 高光
+  ctx.fillStyle = "#fff";
+  ctx.font = `bold ${Math.round(16 * s)}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("y", 3 * s, -16 * s);
+  ctx.restore();
+}
+// 砝码块
+function drawWeight(x, y, w, h, label, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha === undefined ? 1 : alpha;
+  ctx.translate(x, y);
+  ctx.beginPath();
+  ctx.moveTo(-w / 2 + 10, -h); ctx.lineTo(w / 2 - 10, -h);
+  ctx.lineTo(w / 2, 0); ctx.lineTo(-w / 2, 0);
+  ctx.closePath();
+  ctx.fillStyle = "#5a6472"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, -h - 5, 7, 0, 7);               // 提环
+  ctx.strokeStyle = "#5a6472"; ctx.lineWidth = 4; ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(label, 0, -h / 2);
+  ctx.restore();
+}
+// 单个天平
+function drawBalance(i) {
+  const g = geo[i], bal = bals[i];
+  // 拖拽悬停高亮
+  if (dragBal && i !== dragBal.src) {
+    const ok = canSubtract(bals[dragBal.src], bal);
+    const hover = inRegion(dragBal.x, dragBal.y, g.region);
+    ctx.save();
+    ctx.strokeStyle = ok ? GREEN : RED;
+    ctx.globalAlpha = hover ? 0.9 : 0.35;
+    ctx.lineWidth = hover ? 5 : 3;
+    ctx.setLineDash([12, 10]);
+    roundRect(g.region.x, g.region.y, g.region.w, g.region.h, 18, false);
+    ctx.stroke();
+    ctx.restore();
+  }
+  // 编号标签
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.font = "bold 22px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(`天平${CN[i]}`, g.cx, g.beamY - 74);
+  // 底座 + 立柱
+  ctx.fillStyle = "#8a6a3e";
+  ctx.beginPath();
+  ctx.moveTo(g.cx - 54, g.baseY); ctx.lineTo(g.cx + 54, g.baseY);
+  ctx.lineTo(g.cx + 30, g.baseY - 22); ctx.lineTo(g.cx - 30, g.baseY - 22);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#a5804c";
+  ctx.fillRect(g.cx - 7, g.beamY, 14, g.baseY - 22 - g.beamY);
+  // 横梁（水平 = 平衡）
+  ctx.fillStyle = "#c9a05e";
+  roundRect(g.cx - g.beamHalf - 8, g.beamY - 8, (g.beamHalf + 8) * 2, 16, 8, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2;
+  roundRect(g.cx - g.beamHalf - 8, g.beamY - 8, (g.beamHalf + 8) * 2, 16, 8, false); ctx.stroke();
+  // 中柱顶珠
+  ctx.beginPath(); ctx.arc(g.cx, g.beamY - 12, 6, 0, 7);
+  ctx.fillStyle = GOLD; ctx.fill();
+  // 两个托盘
+  for (const side of [-1, 1]) {
+    const px = g.cx + side * g.beamHalf;
+    ctx.strokeStyle = "#8a6a3e"; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(px, g.beamY + 4); ctx.lineTo(px - g.panW / 2, g.panY);
+    ctx.moveTo(px, g.beamY + 4); ctx.lineTo(px + g.panW / 2, g.panY);
+    ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(px, g.panY, g.panW / 2, 13, 0, 0, 7);
+    ctx.fillStyle = "#b08c50"; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2; ctx.stroke();
+  }
+  // 消元动画中被消掉的物品（渐隐）
+  let fadeMap = null;
+  if (anim && anim.type === "subtract" && anim.dst === i) {
+    fadeMap = {};
+    const p = Math.min(1, anim.t / anim.dur);
+    const alpha = 1 - Math.max(0, Math.min(1, (p - 0.35) / 0.3));
+    for (const pr of anim.pairs) fadeMap[pr.kind + pr.k] = alpha;
+  }
+  // 左盘物品（或回代后变成砝码）
+  let subFade = 1;
+  if (anim && anim.type === "subst" && anim.bi === i) {
+    const p = Math.min(1, anim.t / anim.dur);
+    subFade = 1 - Math.max(0, Math.min(1, (p - 0.55) / 0.3));
+  }
+  for (let k = 0; k < bal.a; k++) {
+    const [ix, iy] = itemPos(i, "box", k);
+    if (bal.sub && bal.sub.var === "x") drawWeight(ix, iy, 40, 34, String(bal.sub.val), subFade);
+    else {
+      const al = fadeMap && fadeMap["box" + k] !== undefined ? fadeMap["box" + k] : 1;
+      ctx.save(); ctx.globalAlpha = al; drawBox(ix, iy, 1); ctx.restore();
+    }
+  }
+  for (let k = 0; k < bal.b; k++) {
+    const [ix, iy] = itemPos(i, "bottle", k);
+    if (bal.sub && bal.sub.var === "y") drawWeight(ix, iy, 40, 34, String(bal.sub.val), subFade);
+    else {
+      const al = fadeMap && fadeMap["bottle" + k] !== undefined ? fadeMap["bottle" + k] : 1;
+      ctx.save(); ctx.globalAlpha = al; drawBottle(ix, iy, 1); ctx.restore();
+    }
+  }
+  // 右盘砝码（总重）
+  const rx = g.cx + g.beamHalf;
+  drawWeight(rx, g.panY - 6, 78, 44, bal.c + " kg");
+  // 下方等式
+  ctx.font = "bold 24px sans-serif";
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(bal.sub ? fmtEqSub(bal) : fmtEq(bal), g.cx, g.eqY);
+}
+// 拖拽中的天平幽灵卡片
+function drawDragGhost() {
+  const S = bals[dragBal.src];
+  const x = dragBal.x, y = dragBal.y;
+  ctx.save();
+  ctx.globalAlpha = 0.92;
+  ctx.fillStyle = "rgba(40,60,90,0.95)";
+  roundRect(x - 100, y - 46, 200, 92, 14, true);
+  ctx.strokeStyle = GOLD; ctx.lineWidth = 2.5;
+  roundRect(x - 100, y - 46, 200, 92, 14, false); ctx.stroke();
+  // 迷你物品
+  let ix = x - 78;
+  for (let k = 0; k < S.a; k++) { drawBox(ix + 14, y + 4, 0.62); ix += 30; }
+  for (let k = 0; k < S.b; k++) { drawBottle(ix + 10, y + 6, 0.62); ix += 24; }
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 20px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("= " + S.c + " kg", ix + 8, y - 4);
+  ctx.fillStyle = GOLD;
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("− 减去这整份", x, y + 30);
+  ctx.restore();
+}
+// 第 1 关引导箭头
+function drawGuide() {
+  if (levelIdx !== 0 || phase !== "subtract" || dragBal || anim) return;
+  const pulse = 0.5 + 0.5 * Math.sin(nowMs / 280);
+  const x0 = geo[0].cx + geo[0].beamHalf + 60, x1 = geo[1].cx - geo[1].beamHalf - 60;
+  const y = geo[0].beamY - 40;
+  ctx.save();
+  ctx.globalAlpha = 0.4 + 0.6 * pulse;
+  ctx.strokeStyle = GOLD; ctx.lineWidth = 6; ctx.lineCap = "round";
+  ctx.setLineDash([16, 12]);
+  ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = GOLD;
+  ctx.beginPath();
+  ctx.moveTo(x1 + 4, y); ctx.lineTo(x1 - 18, y - 12); ctx.lineTo(x1 - 18, y + 12);
+  ctx.closePath(); ctx.fill();
+  ctx.font = "bold 18px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("把①拖到这里", (x0 + x1) / 2, y - 26);
+  ctx.restore();
+}
+// 已知量砝码 chip
+function drawChip(cx, cy, ghost) {
+  const v = chip ? chip.var : anim.v;
+  const val = chip ? chip.val : anim.val;
+  ctx.save();
+  if (ghost) ctx.globalAlpha = 0.95;
+  const w = 150, h = 54;
+  ctx.fillStyle = "rgba(255,213,74,0.95)";
+  roundRect(cx - w / 2, cy - h / 2, w, h, 27, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2;
+  roundRect(cx - w / 2, cy - h / 2, w, h, 27, false); ctx.stroke();
+  ctx.fillStyle = "#5a3d00";
+  ctx.font = "bold 21px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(`${VAR_ICON[v]} = ${val} kg`, cx, cy + 1);
+  ctx.restore();
+}
+// 代数变换记录面板
+function drawLog() {
+  const pw = Math.min(660, W - 40), ph = 118;
+  const px = W / 2 - pw / 2, py = H * 0.70;
+  ctx.fillStyle = "rgba(255,255,255,0.06)";
+  roundRect(px, py, pw, ph, 16, true);
+  ctx.fillStyle = "rgba(255,255,255,0.65)";
+  ctx.font = "bold 14px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("📝 代数变换", px + 18, py + 20);
+  const lines = logs.slice(-3);
+  ctx.font = "bold 19px sans-serif";
+  lines.forEach((l, i) => {
+    const newest = i === lines.length - 1;
+    ctx.fillStyle = l.gold && newest ? GOLD : "rgba(255,255,255," + (newest ? 0.95 : 0.55) + ")";
+    ctx.fillText(l.txt, px + 18, py + 48 + i * 26);
+  });
+}
+// 消元动画：飞过去消掉的幽灵物品
+function drawSubtractAnim() {
+  const p = Math.min(1, anim.t / anim.dur);
+  const e = easeInOut(Math.min(1, p / 0.6));
+  for (const f of anim.flyers) {
+    const x = f.x0 + (f.x1 - f.x0) * e;
+    const y = f.y0 + (f.y1 - f.y0) * e - Math.sin(e * Math.PI) * 60;
+    ctx.save();
+    ctx.globalAlpha = p < 0.6 ? 1 : 1 - (p - 0.6) / 0.3;
+    if (f.kind === "box") drawBox(x, y, 0.9); else drawBottle(x, y, 0.9);
+    ctx.restore();
+  }
+}
+// 回代动画：砝码飞向目标物品
+function drawSubstAnim() {
+  const p = Math.min(1, anim.t / anim.dur);
+  if (p >= 0.4) return;   // 已变成托盘上的砝码
+  const e = easeOut(Math.min(1, p / 0.35));
+  const x = anim.x0 + (anim.x1 - anim.x0) * e;
+  const y = anim.y0 + (anim.y1 - anim.y0) * e - Math.sin(e * Math.PI) * 50;
+  drawChip(x, y, true);
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#1b2a3a"); g.addColorStop(1, "#0e1a26");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 顶部图例
+  ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(255,255,255,0.8)";
+  ctx.fillText("📦 箱子 = x kg　　🍼 瓶子 = y kg　　天平平衡 = 等式成立", W / 2, 66);
+  drawGuide();
+  drawBalance(0);
+  drawBalance(1);
+  if (anim && anim.type === "subtract") drawSubtractAnim();
+  if (anim && anim.type === "subst") drawSubstAnim();
+  drawLog();
+  // 已知量砝码（静止或拖拽中）
+  if (chip && phase === "substitute") {
+    const cx = dragChip ? dragChip.x : chip.x;
+    const cy = dragChip ? dragChip.y : chip.y;
+    // 呼吸提示圈
+    if (!dragChip) {
+      const pulse = 0.5 + 0.5 * Math.sin(nowMs / 300);
+      ctx.save();
+      ctx.strokeStyle = `rgba(255,213,74,${0.3 + 0.4 * pulse})`;
+      ctx.lineWidth = 3;
+      roundRect(cx - 82, cy - 34, 164, 68, 34, false); ctx.stroke();
+      ctx.restore();
+    }
+    drawChip(cx, cy, !!dragChip);
+  }
+  if (dragBal) drawDragGhost();
+  // 漂浮文字
+  for (const f of floats) {
+    const p = f.t / f.dur;
+    ctx.save();
+    ctx.globalAlpha = 1 - p;
+    ctx.fillStyle = GOLD;
+    ctx.font = "bold 24px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(f.txt, f.x, f.y - p * 46);
+    ctx.restore();
+  }
+  // 彩带
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.c;
+    ctx.fillRect(-c.size / 2, -c.size / 2, c.size, c.size * 0.6);
+    ctx.restore();
+  }
+}
+function boom() {
+  const colors = ["#ffd54a", "#e93b3b", "#2fbf4a", "#3f8cff", "#ff7ad9"];
+  for (let i = 0; i < 80; i++) {
+    confetti.push({
+      x:W / 2 + (Math.random() - 0.5) * 320, y:H * 0.3,
+      vx:(Math.random() - 0.5) * 420, vy:-Math.random() * 480 - 120,
+      vr:(Math.random() - 0.5) * 12, rot:Math.random() * 7,
+      c:colors[i % colors.length], size:4 + Math.random() * 5, life:1.5 + Math.random()
+    });
+  }
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function step(now) {
+  nowMs = now;
+  const dt = Math.max(0, Math.min(0.033, (now - lastT) / 1000));
+  lastT = now;
+  if (anim) {
+    anim.t += dt;
+    const p = Math.min(1, anim.t / anim.dur);
+    if (anim.type === "subtract" && p >= 0.55 && !anim.applied) {
+      anim.applied = true;
+      subtractApply(anim);
+    }
+    if (anim.type === "subst") substUpdate(anim, p);
+    if (anim.t >= anim.dur) {
+      const done = anim;
+      if (done.type === "subtract") subtractDone(done);
+      else substDone(done);
+    }
+  }
+  for (const f of floats) f.t += dt;
+  floats = floats.filter(f => f.t < f.dur);
+  for (const c of confetti) {
+    c.vy += 800 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += c.vr * dt; c.life -= dt;
+  }
+  confetti = confetti.filter(c => c.life > 0);
+  draw();
+}
+function loop(now) {
+  step(now);
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const ding = () => tone(1046, 0.1, 0.08);
+const whoosh = () => tone(520, 0.18, 0.09, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2400);
+}
+nextBtn.addEventListener("click", () => {
+  pop(880);
+  loadLevel(levelIdx < LEVELS.length - 1 ? levelIdx + 1 : 0);
+});
+
+/* ================= 启动 ================= */
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+resize();
+loadLevel(0);
+draw();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

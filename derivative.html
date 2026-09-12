@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>导数斜率直觉</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#141b2d; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,32,0.85); color:#7fd4ff; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,32,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  .toolbar { position:absolute; z-index:10; display:flex; gap:8px; }
+  #funcBar { top:12px; left:14px; }
+  #modeBar { top:12px; right:14px; }
+  .toolbar button {
+    font-size:14px; font-weight:bold; padding:8px 14px; border-radius:20px;
+    border:2px solid rgba(127,212,255,0.4); background:rgba(10,16,32,0.8);
+    color:#cfe9ff; cursor:pointer; font-family:inherit; white-space:nowrap;
+  }
+  .toolbar button.active { background:#1c5d8c; border-color:#7fd4ff; color:#fff; }
+  .toolbar button:active { transform:scale(1.05); }
+  #limitBtn { border-color:#ffb800; color:#ffd54a; display:none; }
+  #limitBtn.show { display:block; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">切线斜率 k = +0.00</div>
+<div class="toolbar" id="funcBar">
+  <button data-f="0" class="active">y = x²/4</button>
+  <button data-f="1">y = x³/12</button>
+</div>
+<div class="toolbar" id="modeBar">
+  <button data-m="tangent" class="active">切线</button>
+  <button data-m="secant">割线逼近</button>
+  <button id="limitBtn">▶ 极限逼近 Δx→0</button>
+</div>
+<div id="hint">拖动红点沿曲线滑动，观察切线怎么旋转、斜率怎么变！（点我关闭）</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 函数与场景数据 ================= */
+const FUNCS = [
+  {
+    label: "y = x²/4", f: x => x * x / 4, df: x => x / 2,
+    dlabel: "f′(x) = x/2", dom: [-4, 4], yRange: [-1.5, 4.5], dyRange: [-2.6, 2.6]
+  },
+  {
+    label: "y = x³/12", f: x => x * x * x / 12, df: x => x * x / 4,
+    dlabel: "f′(x) = x²/4", dom: [-3, 3], yRange: [-3, 3], dyRange: [-0.6, 2.6]
+  }
+];
+let funcIdx = 0;
+let mode = "tangent";          // tangent | secant
+let px = 1.2;                  // 切点 P 的 x
+let qx = 2.8;                  // 割线第二点 Q 的 x
+let dragging = null;           // "p" | "q" | "dp"(导函数面板上的点)
+let limitAnim = null;          // {t, T, h0}
+let trail = [];                // 拖过的斜率记录点 [{x,y}]
+let visited = new Set();       // 覆盖过的 x 区间格
+let celebratedTrail = false, celebratedLimit = false;
+let lastSign = 0;
+const BINS = 40;
+
+const F = () => FUNCS[funcIdx];
+const clampDom = x => Math.max(F().dom[0], Math.min(F().dom[1], x));
+
+/* ================= 布局与坐标映射 ================= */
+// 左侧大图：原函数；右侧面板：上=原函数小图，下=导函数
+const mainRect = { x:0, y:0, w:0, h:0 };
+const miniRect = { x:0, y:0, w:0, h:0 };
+const derivRect = { x:0, y:0, w:0, h:0 };
+
+function layout() {
+  const top = 64, pad = 26;
+  mainRect.x = pad; mainRect.y = top;
+  mainRect.w = Math.max(280, W * 0.60 - pad);
+  mainRect.h = H - top - 70;
+  const rx = mainRect.x + mainRect.w + pad;
+  const rw = W - rx - pad;
+  const rh = (H - top - 70 - pad) / 2;
+  miniRect.x = rx; miniRect.y = top; miniRect.w = rw; miniRect.h = rh;
+  derivRect.x = rx; derivRect.y = top + rh + pad; derivRect.w = rw; derivRect.h = rh;
+}
+function mx(r, x) { const d = F().dom; return r.x + (x - d[0]) / (d[1] - d[0]) * r.w; }
+function my(r, y) { const yr = F().yRange; return r.y + r.h - (y - yr[0]) / (yr[1] - yr[0]) * r.h; }
+function dy2py(y) { const yr = F().dyRange; return derivRect.y + derivRect.h - (y - yr[0]) / (yr[1] - yr[0]) * derivRect.h; }
+function px2x(sx) { const d = F().dom; return d[0] + (sx - mainRect.x) / mainRect.w * (d[1] - d[0]); }
+function dpx2x(sx) { const d = F().dom; return d[0] + (sx - derivRect.x) / derivRect.w * (d[1] - d[0]); }
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 交互 ================= */
+function near(sx, sy, tx, ty, r) { return Math.hypot(sx - tx, sy - ty) < r; }
+
+canvas.addEventListener("pointerdown", e => {
+  const sx = e.clientX, sy = e.clientY;
+  const f = F();
+  const P = [mx(mainRect, px), my(mainRect, f.f(px))];
+  const Q = [mx(mainRect, qx), my(mainRect, f.f(qx))];
+  const DP = [mx(derivRect, px), dy2py(f.df(px))];
+  if (mode === "secant" && !limitAnim && near(sx, sy, Q[0], Q[1], 30)) dragging = "q";
+  else if (near(sx, sy, P[0], P[1], 34)) dragging = "p";
+  else if (near(sx, sy, DP[0], DP[1], 30)) dragging = "dp";
+  else if (sx >= mainRect.x && sx <= mainRect.x + mainRect.w) { px = clampDom(px2x(sx)); dragging = "p"; }
+  else if (sx >= derivRect.x && sx <= derivRect.x + derivRect.w &&
+           sy >= derivRect.y && sy <= derivRect.y + derivRect.h) { px = clampDom(dpx2x(sx)); dragging = "dp"; }
+  if (dragging) { canvas.setPointerCapture(e.pointerId); pop(620); hintEl.style.opacity = "0"; }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging || limitAnim) return;
+  const f = F();
+  if (dragging === "q") {
+    qx = clampDom(px2x(e.clientX));
+    if (Math.abs(qx - px) < 0.02) qx = clampDom(px + 0.02 * Math.sign(qx - px || 1));
+  } else {
+    px = clampDom(dragging === "dp" ? dpx2x(e.clientX) : px2x(e.clientX));
+    if (dragging === "p" && mode === "secant" && Math.abs(qx - px) < 0.02) qx = clampDom(px + 0.02);
+  }
+  recordTrail();
+  checkSignChange();
+});
+window.addEventListener("pointerup", () => { if (dragging) pop(440); dragging = null; });
+
+function recordTrail() {
+  const f = F();
+  trail.push({ x: px, y: f.df(px) });
+  if (trail.length > 600) trail.shift();
+  const bin = Math.floor((px - f.dom[0]) / (f.dom[1] - f.dom[0]) * BINS);
+  visited.add(Math.max(0, Math.min(BINS - 1, bin)));
+  if (!celebratedTrail && visited.size >= BINS * 0.85) {
+    celebratedTrail = true;
+    fanfare();
+    showHint("太棒了！你几乎画出了整条导数曲线——导数就是斜率的记录！", 4000);
+  }
+}
+function checkSignChange() {
+  const s = Math.sign(F().df(px));
+  if (s !== 0 && lastSign !== 0 && s !== lastSign) {
+    pop(880);
+    showHint(s > 0 ? "看！斜率由负变正，导函数刚好穿过 0" : "看！斜率由正变负，导函数刚好穿过 0", 3000);
+  }
+  if (s !== 0) lastSign = s;
+}
+
+/* ================= 模式与函数切换 ================= */
+document.querySelectorAll("#funcBar button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    funcIdx = +btn.dataset.f;
+    document.querySelectorAll("#funcBar button").forEach(b => b.classList.toggle("active", b === btn));
+    resetState();
+    pop(760);
+    showHint("换成 " + F().label + " 了，再拖拖看斜率怎么变！", 2500);
+  });
+});
+document.querySelectorAll("#modeBar button[data-m]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    mode = btn.dataset.m;
+    document.querySelectorAll("#modeBar button[data-m]").forEach(b => b.classList.toggle("active", b === btn));
+    document.getElementById("limitBtn").classList.toggle("show", mode === "secant");
+    limitAnim = null;
+    if (mode === "secant") { qx = clampDom(px + 1.4); pop(700); showHint("拖动绿点 Q 靠近红点 P，看割线斜率慢慢逼近切线斜率", 3500); }
+    else pop(520);
+  });
+});
+function resetState() {
+  px = 1.2; qx = clampDom(px + 1.4);
+  trail = []; visited = new Set();
+  celebratedTrail = false; lastSign = 0; limitAnim = null;
+}
+
+/* ================= 极限逼近动画 ================= */
+document.getElementById("limitBtn").addEventListener("click", () => {
+  if (limitAnim) return;
+  limitAnim = { t: 0, T: 4.0, h0: 1.4 };
+  showHint("Δx 正在趋近于 0……盯紧两个斜率！", 2500);
+});
+function stepLimit(dt) {
+  if (!limitAnim) return;
+  limitAnim.t += dt;
+  const k = Math.min(1, limitAnim.t / limitAnim.T);
+  const h = limitAnim.h0 * Math.pow(0.0008 / limitAnim.h0, k);   // 指数收缩
+  qx = clampDom(px + h);
+  if (Math.abs(qx - px) < 1e-4) qx = px + 1e-4;
+  if (k >= 1) {
+    limitAnim = null;
+    if (!celebratedLimit) {
+      celebratedLimit = true;
+      fanfare();
+      showHint("Δx→0 时，割线斜率 = 切线斜率！这就是导数的定义 f′(x)=lim Δy/Δx", 5000);
+    }
+  }
+}
+
+/* ================= 绘制 ================= */
+function drawGrid(r, yRange, xRange, step) {
+  ctx.save();
+  ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip();
+  ctx.fillStyle = "rgba(30,42,70,0.55)";
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  ctx.strokeStyle = "rgba(127,212,255,0.10)"; ctx.lineWidth = 1;
+  for (let x = Math.ceil(xRange[0]); x <= xRange[1]; x++) {
+    const sx = mx(r, x);
+    ctx.beginPath(); ctx.moveTo(sx, r.y); ctx.lineTo(sx, r.y + r.h); ctx.stroke();
+  }
+  for (let y = Math.ceil(yRange[0]); y <= yRange[1]; y += step) {
+    const sy = r.y + r.h - (y - yRange[0]) / (yRange[1] - yRange[0]) * r.h;
+    ctx.beginPath(); ctx.moveTo(r.x, sy); ctx.lineTo(r.x + r.w, sy); ctx.stroke();
+  }
+  // 坐标轴
+  ctx.strokeStyle = "rgba(200,225,255,0.55)"; ctx.lineWidth = 1.5;
+  const y0 = r.y + r.h - (0 - yRange[0]) / (yRange[1] - yRange[0]) * r.h;
+  if (y0 >= r.y && y0 <= r.y + r.h) { ctx.beginPath(); ctx.moveTo(r.x, y0); ctx.lineTo(r.x + r.w, y0); ctx.stroke(); }
+  const x0 = mx(r, 0);
+  if (x0 >= r.x && x0 <= r.x + r.w) { ctx.beginPath(); ctx.moveTo(x0, r.y); ctx.lineTo(x0, r.y + r.h); ctx.stroke(); }
+  ctx.restore();
+}
+
+function drawCurve(r, yRange, fn, color, lw) {
+  ctx.save();
+  ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip();
+  ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.lineJoin = "round";
+  ctx.beginPath();
+  const d = F().dom, n = 220;
+  for (let i = 0; i <= n; i++) {
+    const x = d[0] + (d[1] - d[0]) * i / n;
+    const sx = mx(r, x);
+    const sy = r.y + r.h - (fn(x) - yRange[0]) / (yRange[1] - yRange[0]) * r.h;
+    i === 0 ? ctx.moveTo(sx, sy) : ctx.lineTo(sx, sy);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawDot(sx, sy, r, color, ring) {
+  ctx.beginPath(); ctx.arc(sx, sy, r, 0, 7);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.lineWidth = 2.5; ctx.strokeStyle = "#fff"; ctx.stroke();
+  if (ring) {
+    ctx.beginPath(); ctx.arc(sx, sy, r + 6, 0, 7);
+    ctx.strokeStyle = ring; ctx.lineWidth = 2; ctx.stroke();
+  }
+}
+
+function drawMain() {
+  const f = F(), r = mainRect;
+  drawGrid(r, f.yRange, f.dom, 1);
+  drawCurve(r, f.yRange, f.f, "#7fd4ff", 3.5);
+
+  const P = [mx(r, px), my(r, f.f(px))];
+  const slope = f.df(px);
+
+  // 割线（割线模式）
+  if (mode === "secant") {
+    const Q = [mx(r, qx), my(r, f.f(qx))];
+    const mSec = (f.f(qx) - f.f(px)) / (qx - px);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip();
+    ctx.setLineDash([10, 8]);
+    ctx.strokeStyle = "#8dff9a"; ctx.lineWidth = 2.5;
+    lineThrough(P[0], P[1], mSec, r);
+    ctx.setLineDash([]);
+    ctx.restore();
+    drawDot(Q[0], Q[1], 9, "#5be35e", "rgba(91,227,94,0.4)");
+    // Q 标签
+    ctx.font = "bold 13px 'PingFang SC',sans-serif";
+    ctx.fillStyle = "#8dff9a";
+    ctx.fillText("Q", Q[0] + 14, Q[1] - 10);
+  }
+
+  // 切线
+  ctx.save();
+  ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip();
+  ctx.strokeStyle = "#ff6b81"; ctx.lineWidth = 3;
+  lineThrough(P[0], P[1], slope, r);
+  ctx.restore();
+
+  // 斜率三角形：横 1 竖 slope
+  drawSlopeTriangle(P, slope, r);
+
+  // 切点 P
+  drawDot(P[0], P[1], 11, "#ff4d6b", "rgba(255,77,107,0.4)");
+  ctx.font = "bold 14px 'PingFang SC',sans-serif";
+  ctx.fillStyle = "#ffb3c0";
+  const lx = P[0] + 16 > r.x + r.w - 150 ? P[0] - 160 : P[0] + 16;
+  ctx.fillText(`P(${px.toFixed(2)}, ${f.f(px).toFixed(2)})`, lx, P[1] - 14);
+
+  // 标题
+  ctx.font = "bold 16px 'PingFang SC',sans-serif";
+  ctx.fillStyle = "#cfe9ff";
+  ctx.fillText("原函数  " + f.label, r.x + 12, r.y + 24);
+}
+
+function lineThrough(cx0, cy0, m, r) {
+  // y - cy0 = m(x - cx0)，注意屏幕 y 向下：sy = cy0 - m*(sx - cx0)
+  const yAtL = cy0 - m * (r.x - cx0);
+  const yAtR = cy0 - m * (r.x + r.w - cx0);
+  ctx.beginPath(); ctx.moveTo(r.x, yAtL); ctx.lineTo(r.x + r.w, yAtR); ctx.stroke();
+}
+
+function drawSlopeTriangle(P, slope, r) {
+  // 屏幕上 1 个世界单位的像素宽度
+  const unitPx = r.w / (F().dom[1] - F().dom[0]);
+  let run = unitPx;
+  if (Math.abs(slope) * run > r.h * 0.28) run = r.h * 0.28 / Math.abs(slope);  // 太陡就缩小
+  const Ax = P[0] + run, Ay = P[1];
+  const By = P[1] - slope * run;
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,213,74,0.9)"; ctx.lineWidth = 2;
+  ctx.setLineDash([5, 4]);
+  ctx.beginPath();
+  ctx.moveTo(P[0], P[1]); ctx.lineTo(Ax, Ay); ctx.lineTo(Ax, By);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.font = "12px 'PingFang SC',sans-serif";
+  ctx.fillStyle = "#ffd54a";
+  ctx.fillText("Δx", (P[0] + Ax) / 2 - 10, Ay + 16);
+  ctx.fillText("Δy", Ax + 6, (Ay + By) / 2);
+  ctx.restore();
+}
+
+function drawMini() {
+  const f = F(), r = miniRect;
+  drawGrid(r, f.yRange, f.dom, 1);
+  drawCurve(r, f.yRange, f.f, "#7fd4ff", 2);
+  drawDot(mx(r, px), my(r, f.f(px)), 6, "#ff4d6b");
+  ctx.font = "bold 13px 'PingFang SC',sans-serif";
+  ctx.fillStyle = "#cfe9ff";
+  ctx.fillText("原函数 " + f.label, r.x + 10, r.y + 20);
+}
+
+function drawDeriv() {
+  const f = F(), r = derivRect;
+  drawGrid(r, f.dyRange, f.dom, 1);
+  drawCurve(r, f.dyRange, f.df, "#c9a7ff", 2.5);
+
+  // 斜率记录轨迹
+  for (const p of trail) {
+    const sx = mx(r, p.x), sy = dy2py(p.y);
+    if (sy < r.y || sy > r.y + r.h) continue;
+    ctx.beginPath(); ctx.arc(sx, sy, 2.5, 0, 7);
+    ctx.fillStyle = "rgba(255,213,74,0.55)"; ctx.fill();
+  }
+
+  // 当前 x 的同步高亮
+  const hx = mx(r, px), hy = dy2py(f.df(px));
+  ctx.save();
+  ctx.setLineDash([4, 5]);
+  ctx.strokeStyle = "rgba(255,213,74,0.6)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(hx, r.y); ctx.lineTo(hx, r.y + r.h); ctx.stroke();
+  ctx.restore();
+  if (hy >= r.y - 4 && hy <= r.y + r.h + 4) drawDot(hx, hy, 9, "#ffd54a", "rgba(255,213,74,0.4)");
+
+  ctx.font = "bold 13px 'PingFang SC',sans-serif";
+  ctx.fillStyle = "#e5d5ff";
+  ctx.fillText("导函数 " + f.dlabel + "（斜率的记录）", r.x + 10, r.y + 20);
+  ctx.fillStyle = "#ffd54a";
+  ctx.fillText("f′(" + px.toFixed(2) + ") = " + fmt(f.df(px)), r.x + 10, r.y + r.h - 12);
+}
+
+function fmt(v) { return (v >= 0 ? "+" : "") + v.toFixed(2); }
+
+function drawReadout() {
+  const f = F();
+  const slope = f.df(px);
+  scorebar.textContent = mode === "secant"
+    ? `切线斜率 ${fmt(slope)} ｜ 割线斜率 ${fmt((f.f(qx) - f.f(px)) / (qx - px))} ｜ Δx = ${Math.abs(qx - px).toFixed(3)}`
+    : `切线斜率 k = ${fmt(slope)} ｜ x = ${px.toFixed(2)}`;
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#141b2d";
+  ctx.fillRect(0, 0, W, H);
+  drawMain();
+  drawMini();
+  drawDeriv();
+  drawReadout();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  stepLimit(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 提示条 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 2200);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

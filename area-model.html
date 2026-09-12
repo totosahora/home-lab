@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>面积模型乘法</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:linear-gradient(#d8ecff,#f4faff); }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(255,255,255,0.88); color:#1b5fa8; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; box-shadow:0 3px 10px rgba(30,80,140,0.15);
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,90,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #eqbar {
+    position:absolute; bottom:60px; left:50%; transform:translateX(-50%);
+    background:rgba(255,255,255,0.92); padding:10px 24px; border-radius:18px;
+    font-size:24px; font-weight:bold; color:#333; z-index:10; white-space:nowrap;
+    box-shadow:0 3px 12px rgba(30,80,140,0.18); display:none;
+  }
+  #eqbar .r { color:#e03131; } #eqbar .o { color:#e8890c; }
+  #eqbar .b { color:#1971c2; } #eqbar .g { color:#2f9e44; }
+  #actionBtn {
+    position:absolute; right:26px; bottom:52px; z-index:11;
+    font-size:22px; font-weight:bold; padding:14px 32px; border-radius:32px;
+    border:none; background:#ffd54a; color:#5a3d00; cursor:pointer;
+    box-shadow:0 4px 12px rgba(0,0,0,0.25);
+  }
+  #actionBtn:active { transform:scale(1.06); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(20,50,90,0.45);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.5); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🖐️ 热身：拖出你的长方形</div>
+<div id="eqbar"></div>
+<div id="hint">拖动黄色圆点，拉出一个长方形（4~9 格），看看它的面积！</div>
+<button id="actionBtn">开始挑战 →</button>
+<div id="winPanel">
+  <div class="msg">🎉 全部完成！<br>你是面积拆分小能手！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const eqbar = document.getElementById("eqbar");
+const actionBtn = document.getElementById("actionBtn");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  computeLayout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 题目数据 ================= */
+// 4 道递增挑战题：cols × rows，拆成 (整十 + 个位) × (整十 + 个位)
+const LEVELS = [
+  { cols: 12, rows: 13 },   // 156
+  { cols: 23, rows: 14 },   // 322
+  { cols: 32, rows: 21 },   // 672
+  { cols: 45, rows: 23 },   // 1035
+];
+const WARMUP_MAX = 9;       // 热身方格画布 9×9，矩形范围 4~9
+const BLOCKS = [            // 四块固定配色（按位置）
+  { key:"r", fill:"rgba(255,107,107,0.55)", edge:"#e03131", name:"红" },  // 左下（最大）
+  { key:"o", fill:"rgba(255,169,77,0.55)", edge:"#e8890c", name:"橙" },  // 左上
+  { key:"b", fill:"rgba(77,171,247,0.55)", edge:"#1971c2", name:"蓝" },  // 右下
+  { key:"g", fill:"rgba(81,207,102,0.55)", edge:"#2f9e44", name:"绿" },  // 右上
+];
+
+/* ================= 游戏状态 ================= */
+let phase = "warmup";        // warmup | play
+let levelIdx = 0;
+let cols = WARMUP_MAX, rows = WARMUP_MAX;   // 当前方格画布尺寸
+let warm = { w: 6, h: 5 };   // 热身矩形（格数）
+let split = { v: 6, h: 7 };  // 挑战分割线：v=左段列数, h=上段行数
+let celebrating = false;
+let confetti = [];
+
+// 拆分目标：左边取整十，上边取个位余数
+const vTarget = () => cols - (cols % 10);
+const hTarget = () => rows % 10;
+
+function initLevel() {
+  const L = LEVELS[levelIdx];
+  cols = L.cols; rows = L.rows;
+  // 初始分割线放在中间（故意不在整十），让孩子自己拖
+  split.v = Math.max(1, Math.round(cols / 2));
+  split.h = Math.max(1, Math.round(rows / 2));
+  if (split.v === vTarget()) split.v = Math.max(1, split.v - 2);
+  if (split.h === hTarget()) split.h = Math.min(rows - 1, split.h + 2);
+  celebrating = false;
+  computeLayout();
+  updateEq();
+  scorebar.textContent = `第 ${levelIdx + 1} / ${LEVELS.length} 题 · ${cols} × ${rows}`;
+  actionBtn.textContent = "完成 ✓";
+  showHint("拖动两条虚线，把长方形拆成 4 块：拆出整十最好算！", 4000);
+}
+
+function resetGame() {
+  phase = "warmup";
+  levelIdx = 0;
+  cols = WARMUP_MAX; rows = WARMUP_MAX;
+  warm = { w: 6, h: 5 };
+  confetti = [];
+  celebrating = false;
+  winPanel.style.display = "none";
+  eqbar.style.display = "none";
+  actionBtn.textContent = "开始挑战 →";
+  scorebar.textContent = "🖐️ 热身：拖出你的长方形";
+  computeLayout();
+}
+
+/* ================= 布局 ================= */
+let cell = 40, gx = 0, gy = 0;   // 单元格像素、网格左上角
+function computeLayout() {
+  const top = 100, bottom = 168, sideL = 96, sideR = 56;
+  const availW = W - sideL - sideR, availH = H - top - bottom;
+  cell = Math.max(13, Math.min(56, Math.floor(Math.min(availW / cols, availH / rows))));
+  gx = Math.round(sideL + (availW - cols * cell) / 2);
+  gy = Math.round(top + (availH - rows * cell) / 2);
+}
+
+/* ================= 交互 ================= */
+let drag = null;   // {kind:"corner"|"v"|"h"}
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex" || celebrating) return;
+  hintEl.style.opacity = "0";
+  const px = e.clientX, py = e.clientY;
+  if (phase === "warmup") {
+    // 角手柄：矩形右下角
+    const hx = gx + warm.w * cell, hy = gy + warm.h * cell;
+    if (Math.hypot(px - hx, py - hy) < 34) {
+      drag = { kind: "corner" };
+      canvas.setPointerCapture(e.pointerId);
+      pop(500);
+    }
+  } else {
+    const sx = gx + split.v * cell, sy = gy + split.h * cell;
+    const inX = px > gx - 10 && px < gx + cols * cell + 10;
+    const inY = py > gy - 10 && py < gy + rows * cell + 10;
+    if (Math.abs(px - sx) < 20 && inY) {
+      drag = { kind: "v" };
+      canvas.setPointerCapture(e.pointerId);
+      pop(460);
+    } else if (Math.abs(py - sy) < 20 && inX) {
+      drag = { kind: "h" };
+      canvas.setPointerCapture(e.pointerId);
+      pop(420);
+    }
+  }
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  if (drag.kind === "corner") {
+    const w = Math.round((e.clientX - gx) / cell);
+    const h = Math.round((e.clientY - gy) / cell);
+    const nw = Math.max(4, Math.min(WARMUP_MAX, w));
+    const nh = Math.max(4, Math.min(WARMUP_MAX, h));
+    if (nw !== warm.w || nh !== warm.h) { warm.w = nw; warm.h = nh; tick(); }
+  } else if (drag.kind === "v") {
+    const v = Math.max(1, Math.min(cols - 1, Math.round((e.clientX - gx) / cell)));
+    if (v !== split.v) { split.v = v; tick(); updateEq(); }
+  } else if (drag.kind === "h") {
+    const h = Math.max(1, Math.min(rows - 1, Math.round((e.clientY - gy) / cell)));
+    if (h !== split.h) { split.h = h; tick(); updateEq(); }
+  }
+});
+
+window.addEventListener("pointerup", () => {
+  if (!drag) return;
+  drag = null;
+  if (phase === "play" && split.v === vTarget() && split.h === hTarget()) {
+    tone(880, 0.18, 0.14);
+    tone(1175, 0.22, 0.12);
+    showHint("🌟 正好拆成整十数！点右下角「完成 ✓」", 3000);
+  } else if (phase === "warmup") {
+    pop(700);
+  }
+});
+
+actionBtn.addEventListener("click", () => {
+  if (phase === "warmup") {
+    pop(880);
+    phase = "play";
+    eqbar.style.display = "block";
+    levelIdx = 0;
+    initLevel();
+    return;
+  }
+  if (celebrating) return;
+  if (split.v === vTarget() && split.h === hTarget()) {
+    celebrate();
+  } else {
+    // 不判错，只温柔提示整十拆法
+    tone(240, 0.2, 0.1);
+    showHint(`试试整十拆法：${cols} = ${vTarget()} + ${cols - vTarget()}，${rows} = ${rows - hTarget()} + ${hTarget()}`, 3600);
+  }
+});
+
+/* ================= 流程 ================= */
+function blockDims() {
+  // 返回四块 {w, h}：左下红、左上橙、右下蓝、右上绿
+  const lw = split.v, rw = cols - split.v;
+  const th = split.h, bh = rows - split.h;
+  return [
+    { w: lw, h: bh },   // 红 左下
+    { w: lw, h: th },   // 橙 左上
+    { w: rw, h: bh },   // 蓝 右下
+    { w: rw, h: th },   // 绿 右上
+  ];
+}
+
+function updateEq() {
+  const d = blockDims();
+  const total = cols * rows;
+  eqbar.innerHTML = `${cols} × ${rows} = ` +
+    d.map((b, i) => `<span class="${BLOCKS[i].key}">${b.w}×${b.h}</span>`).join(" + ") +
+    ` = <b>${total}</b>`;
+}
+
+function celebrate() {
+  celebrating = true;
+  fanfare();
+  spawnConfetti();
+  showHint(`🎉 ${cols} × ${rows} = ${cols * rows}，拆着算真快！`, 2400);
+  setTimeout(() => {
+    levelIdx++;
+    if (levelIdx >= LEVELS.length) {
+      winPanel.style.display = "flex";
+      fanfare();
+      spawnConfetti();
+    } else {
+      initLevel();
+    }
+  }, 2200);
+}
+
+/* ================= 彩带 ================= */
+function spawnConfetti() {
+  const colors = ["#ff6b6b", "#ffa94d", "#4dabf7", "#51cf66", "#ffd54a", "#b197fc"];
+  for (let i = 0; i < 130; i++) {
+    confetti.push({
+      x: Math.random() * W, y: -20 - Math.random() * H * 0.4,
+      vx: (Math.random() - 0.5) * 60, vy: 120 + Math.random() * 160,
+      s: 6 + Math.random() * 8, rot: Math.random() * 7, vr: (Math.random() - 0.5) * 8,
+      c: colors[i % colors.length], life: 3.2 + Math.random(),
+    });
+  }
+}
+function stepConfetti(dt) {
+  for (const p of confetti) {
+    p.vy += 140 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.rot += p.vr * dt; p.life -= dt;
+  }
+  confetti = confetti.filter(p => p.life > 0 && p.y < H + 40);
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBoard() {
+  // 白色底版
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  roundRect(gx - 46, gy - 52, cols * cell + 92, rows * cell + 92, 18, true);
+  // 浅色方格
+  ctx.strokeStyle = "rgba(90,140,200,0.25)";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= cols; i++) {
+    ctx.beginPath(); ctx.moveTo(gx + i * cell, gy); ctx.lineTo(gx + i * cell, gy + rows * cell); ctx.stroke();
+  }
+  for (let j = 0; j <= rows; j++) {
+    ctx.beginPath(); ctx.moveTo(gx, gy + j * cell); ctx.lineTo(gx + cols * cell, gy + j * cell); ctx.stroke();
+  }
+  ctx.strokeStyle = "rgba(60,110,180,0.6)";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(gx, gy, cols * cell, rows * cell);
+}
+
+function drawWarmup() {
+  const rw = warm.w * cell, rh = warm.h * cell;
+  // 矩形填充
+  ctx.fillStyle = "rgba(77,171,247,0.4)";
+  ctx.fillRect(gx, gy, rw, rh);
+  ctx.strokeStyle = "#1971c2"; ctx.lineWidth = 3;
+  ctx.strokeRect(gx, gy, rw, rh);
+  // 内部格线稍明显
+  ctx.strokeStyle = "rgba(25,113,194,0.35)"; ctx.lineWidth = 1.5;
+  for (let i = 1; i < warm.w; i++) {
+    ctx.beginPath(); ctx.moveTo(gx + i * cell, gy); ctx.lineTo(gx + i * cell, gy + rh); ctx.stroke();
+  }
+  for (let j = 1; j < warm.h; j++) {
+    ctx.beginPath(); ctx.moveTo(gx, gy + j * cell); ctx.lineTo(gx + rw, gy + j * cell); ctx.stroke();
+  }
+  // 边标签：长 / 宽
+  ctx.fillStyle = "#1b5fa8";
+  ctx.font = "bold 20px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(`长 ${warm.w}`, gx + rw / 2, gy - 26);
+  ctx.save();
+  ctx.translate(gx - 30, gy + rh / 2); ctx.rotate(-Math.PI / 2);
+  ctx.fillText(`宽 ${warm.h}`, 0, 0);
+  ctx.restore();
+  // 中央算式
+  ctx.font = `bold ${Math.min(40, cell * 0.8)}px sans-serif`;
+  ctx.fillStyle = "#123f6e";
+  ctx.fillText(`${warm.w} × ${warm.h} = ${warm.w * warm.h}`, gx + rw / 2, gy + rh / 2);
+  // 角手柄（大黄圆点 + 双向箭头）
+  const hx = gx + rw, hy = gy + rh;
+  ctx.beginPath(); ctx.arc(hx, hy, 20, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  ctx.strokeStyle = "#c98f00"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#5a3d00";
+  ctx.font = "bold 20px sans-serif";
+  ctx.fillText("↘", hx, hy + 1);
+  // 手柄呼吸圈
+  const t = performance.now() / 500;
+  ctx.beginPath(); ctx.arc(hx, hy, 24 + Math.sin(t) * 3, 0, 7);
+  ctx.strokeStyle = "rgba(255,213,74,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+}
+
+function drawChallenge() {
+  const d = blockDims();
+  const sx = gx + split.v * cell, sy = gy + split.h * cell;
+  const rects = [
+    { x: gx, y: sy, w: d[0].w * cell, h: d[0].h * cell },          // 红 左下
+    { x: gx, y: gy, w: d[1].w * cell, h: d[1].h * cell },          // 橙 左上
+    { x: sx, y: sy, w: d[2].w * cell, h: d[2].h * cell },          // 蓝 右下
+    { x: sx, y: gy, w: d[3].w * cell, h: d[3].h * cell },          // 绿 右上
+  ];
+  const hitTarget = split.v === vTarget() && split.h === hTarget();
+  // 四块填充 + 边框 + 面积数字
+  for (let i = 0; i < 4; i++) {
+    const r = rects[i], B = BLOCKS[i], b = d[i];
+    ctx.fillStyle = B.fill;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = B.edge; ctx.lineWidth = hitTarget ? 4 : 2.5;
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    // 块内文字：上行 w×h，下行大数字面积
+    const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    const big = Math.max(18, Math.min(40, r.w / 3.2, r.h / 2.4));
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = B.edge;
+    ctx.font = `bold ${Math.max(13, big * 0.5)}px sans-serif`;
+    ctx.fillText(`${b.w} × ${b.h}`, cx, cy - big * 0.55);
+    ctx.fillStyle = "#222";
+    ctx.font = `bold ${big}px sans-serif`;
+    ctx.fillText(`${b.w * b.h}`, cx, cy + big * 0.35);
+  }
+  // 顶部列宽标签 / 左侧行高标签
+  ctx.fillStyle = "#1b5fa8";
+  ctx.font = "bold 19px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(`${split.v}`, gx + split.v * cell / 2, gy - 26);
+  ctx.fillText(`${cols - split.v}`, sx + (cols - split.v) * cell / 2, gy - 26);
+  ctx.fillText(`${split.h}`, gx - 30, gy + split.h * cell / 2);
+  ctx.fillText(`${rows - split.h}`, gx - 30, sy + (rows - split.h) * cell / 2);
+  // 分割线（粗虚线，可拖）
+  ctx.setLineDash([10, 8]);
+  ctx.strokeStyle = "#333"; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(sx, gy); ctx.lineTo(sx, gy + rows * cell); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(gx, sy); ctx.lineTo(gx + cols * cell, sy); ctx.stroke();
+  ctx.setLineDash([]);
+  // 分割手柄
+  drawGrip(sx, gy + rows * cell * 0.82, "↔");
+  drawGrip(gx + cols * cell * 0.18, sy, "↕");
+  // 达成整十拆分时的小星星
+  if (hitTarget) {
+    ctx.font = "30px sans-serif";
+    ctx.fillText("⭐", gx + cols * cell + 26, gy - 20);
+  }
+}
+
+function drawGrip(x, y, arrow) {
+  ctx.beginPath(); ctx.arc(x, y, 17, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  ctx.strokeStyle = "#c98f00"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#5a3d00";
+  ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(arrow, x, y + 1);
+}
+
+function drawConfetti() {
+  for (const p of confetti) {
+    ctx.save();
+    ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+    ctx.globalAlpha = Math.min(1, p.life);
+    ctx.fillStyle = p.c;
+    ctx.fillRect(-p.s / 2, -p.s / 4, p.s, p.s / 2);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  drawBoard();
+  if (phase === "warmup") drawWarmup(); else drawChallenge();
+  drawConfetti();
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const tick = () => tone(600 + Math.random() * 120, 0.04, 0.05, "square");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 提示 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 2200);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+/* ================= 主循环 ================= */
+resize();
+resetGame();
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  stepConfetti(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>化学平衡移动 · NO₂⇌N₂O₄</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#141c28; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,26,0.85); color:#8fd0ff; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:170px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,26,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:11; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  #cards {
+    position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+    display:flex; gap:12px; z-index:10; flex-wrap:wrap; justify-content:center;
+    width:max-content; max-width:98vw;
+  }
+  .card {
+    width:258px; background:rgba(16,24,38,0.92); border:2px solid #41527a;
+    border-radius:14px; padding:10px 12px; color:#eaf1ff; font-size:13px;
+    position:relative; transition:border-color 0.3s;
+  }
+  .card h4 { font-size:14px; color:#8fd0ff; margin-bottom:4px; }
+  .card .q { line-height:1.45; margin-bottom:8px; min-height:37px; }
+  .card .opts { display:flex; gap:8px; }
+  .card button {
+    flex:1; padding:7px 4px; border-radius:9px; border:none;
+    background:#33436b; color:#fff; cursor:pointer; font-size:13px;
+  }
+  .card button:hover { background:#425488; }
+  .card.done { border-color:#3fbf6a; }
+  .card.done button { background:#26324e; color:#9aa8c8; cursor:default; }
+  .card .badge {
+    position:absolute; top:-11px; right:10px; background:#3fbf6a; color:#062b14;
+    font-size:12px; font-weight:bold; padding:2px 10px; border-radius:12px;
+    display:none;
+  }
+  .card.done .badge { display:block; }
+  .card .seen {
+    position:absolute; top:-11px; left:10px; background:#5a6c96; color:#fff;
+    font-size:12px; padding:2px 10px; border-radius:12px; display:none;
+  }
+  .card.seen .seen { display:block; }
+  @keyframes shake {
+    0%,100% { transform:translateX(0); }
+    25% { transform:translateX(-6px); } 75% { transform:translateX(6px); }
+  }
+  .card.shake { animation:shake 0.3s; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">勒夏特列任务卡 0 / 3</div>
+<div id="hint">👆 拖动活塞改变压强，拖动温度滑杆改变温度，观察颜色与分子的变化！</div>
+<div id="cards"></div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const cardsEl = document.getElementById("cards");
+let W = 0, H = 0, DPR = 1, ui = 1;
+
+// 布局矩形（resize 时重算）
+const R = {};
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  ui = Math.max(0.62, Math.min(1.25, Math.min(W / 1280, H / 800)));
+  R.syringe = { x: 0.045 * W, y: 0.17 * H, w: 0.48 * W, h: 0.27 * H };
+  R.temp    = { x: 0.045 * W, y: 0.55 * H, w: 0.48 * W, h: 0.10 * H };
+  R.mol     = { x: 0.565 * W, y: 0.115 * H, w: 0.40 * W, h: 0.315 * H };
+  R.rates   = { x: 0.565 * W, y: 0.455 * H, w: 0.40 * W, h: 0.15 * H };
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 化学模型 =================
+   2NO₂(g, 红棕) ⇌ N₂O₄(g, 无色)  ΔH = -57 kJ/mol（正反应放热）
+   状态量：V（相对体积）、T（K）、n2（NO₂ 的摩尔数，总氮原子 = 2 mol）
+   p(NO₂) = n2·R'T/V，p(N₂O₄) = ((2-n2)/2)·R'T/V
+   平衡：p(N₂O₄) = Kp(T)·p(NO₂)²  →  关于 n2 的二次方程，有解析解   */
+const T0 = 298, KP0 = 1.5, C0 = 1.0;      // 参考温度、参考 Kp、R' 归一化
+const VMIN = 0.35, TMIN = 273, TMAX = 373;
+const DHOVER = 57000 / 8.314;              // -ΔH/R
+
+function Kp(T) { return KP0 * Math.exp(DHOVER * (1 / T - 1 / T0)); }
+function n2Eq(T, V) {
+  const c = C0 * (T / T0) / V;             // R'T/V
+  const K = Kp(T);
+  return (-1 + Math.sqrt(1 + 16 * K * c)) / (4 * K * c);
+}
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+/* ================= 游戏状态 ================= */
+let V = 1, T = T0;
+let n2 = n2Eq(T0, 1);                      // 当前 NO₂ 摩尔数（向平衡值弛豫）
+let particles = [];                        // 分子视图粒子
+let flashes = [];                          // 转化闪光
+let convTimer = 0;
+let phase1 = 0, phase2 = 0;                // 速率箭头动画相位
+let dragging = null;                       // 'piston' | 'temp'
+let tasksDone = 0;
+// 动手验证标记
+const seen = { compress: false, heat: false, expand: false };
+
+/* ================= 任务卡 ================= */
+const CARDS = [
+  { title: "预测 1 · 加压", key: "compress",
+    q: "向内推活塞（加压），重新平衡后气体颜色与最初相比？",
+    opts: ["更深", "更浅"], answer: 0,
+    why: "加压平衡正向移动，但 NO₂ 浓度仍比原来大，颜色更深。" },
+  { title: "预测 2 · 升温", key: "heat",
+    q: "升高温度，平衡向哪边移动？（正反应放热）",
+    opts: ["逆向 · 生成 NO₂", "正向 · 生成 N₂O₄"], answer: 0,
+    why: "升温平衡向吸热方向（逆向）移动，颜色变深。" },
+  { title: "预测 3 · 减压", key: "expand",
+    q: "先压缩再向外拉活塞（减压），平衡向哪边移动？",
+    opts: ["分子数增多方向", "分子数减少方向"], answer: 0,
+    why: "减压平衡向气体分子数增多的方向（逆向）移动。" },
+];
+const cardEls = [];
+
+function buildCards() {
+  CARDS.forEach((c, i) => {
+    const d = document.createElement("div");
+    d.className = "card";
+    d.innerHTML = `<div class="seen">👀 已观察</div><div class="badge">✓ 预测正确</div>` +
+      `<h4>${c.title}</h4><div class="q">${c.q}</div>` +
+      `<div class="opts">${c.opts.map((o, j) => `<button data-i="${i}" data-j="${j}">${o}</button>`).join("")}</div>`;
+    cardsEl.appendChild(d);
+    cardEls.push(d);
+  });
+  cardsEl.addEventListener("click", e => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    answerCard(+b.dataset.i, +b.dataset.j);
+  });
+}
+function answerCard(i, j) {
+  const c = CARDS[i], el = cardEls[i];
+  if (el.classList.contains("done")) return;
+  if (j === c.answer) {
+    el.classList.add("done");
+    pop(880);
+    tasksDone++;
+    updateScore();
+    showHint(`✅ 正确！${c.why}` + (seen[c.key] ? "" : " 动手在装置上验证一下吧！"), 4200);
+    if (tasksDone === CARDS.length) {
+      setTimeout(() => {
+        fanfare();
+        showHint("🎉 三个预测全部正确！勒夏特列原理：平衡总是朝着“减弱改变”的方向移动！", 6000);
+      }, 700);
+    }
+  } else {
+    tone(160, 0.25, 0.12, "sawtooth");
+    el.classList.remove("shake");
+    void el.offsetWidth;
+    el.classList.add("shake");
+    showHint("再想想：平衡会“反抗”外加的改变～ 可以先在装置上试一试！", 3600);
+  }
+}
+function updateScore() {
+  scorebar.textContent = `勒夏特列任务卡 ${tasksDone} / ${CARDS.length}`;
+}
+buildCards();
+updateScore();
+
+/* ================= 物理（平衡弛豫 + 分子运动） ================= */
+function physics(dt) {
+  // 组成向当前 (T, V) 下的平衡组成弛豫 —— 压缩/升温的瞬间组成来不及变
+  const target = n2Eq(T, V);
+  n2 += (target - n2) * (1 - Math.exp(-dt / 1.4));
+
+  // 动手验证标记
+  if (V < 0.6) seen.compress = true;
+  if (T > 338) seen.heat = true;
+  if (seen.compress && V > 0.85) seen.expand = true;
+  CARDS.forEach((c, i) => { if (seen[c.key]) cardEls[i].classList.add("seen"); });
+
+  // 分子视图：粒子数向目标比例调整
+  const wantNO2 = Math.round(18 * n2 / 2);
+  convTimer += dt;
+  if (convTimer > 0.09) {
+    const curNO2 = particles.filter(p => p.type === "no2").length;
+    if (curNO2 > wantNO2 + 1) { mergePair(); convTimer = 0; }
+    else if (curNO2 < wantNO2 - 1) { splitOne(); convTimer = 0; }
+  }
+  // 粒子运动（温度越高运动越快）
+  const b = R.mol, sp = 30 * Math.sqrt(T / T0) * ui;
+  for (const p of particles) {
+    p.x += p.vx * sp * dt; p.y += p.vy * sp * dt;
+    p.rot += p.vr * dt;
+    const r = 12 * ui;
+    if (p.x < b.x + r) { p.x = b.x + r; p.vx = Math.abs(p.vx); }
+    if (p.x > b.x + b.w - r) { p.x = b.x + b.w - r; p.vx = -Math.abs(p.vx); }
+    if (p.y < b.y + r + 26 * ui) { p.y = b.y + r + 26 * ui; p.vy = Math.abs(p.vy); }
+    if (p.y > b.y + b.h - r) { p.y = b.y + b.h - r; p.vy = -Math.abs(p.vy); }
+  }
+  for (let i = flashes.length - 1; i >= 0; i--) {
+    flashes[i].t += dt;
+    if (flashes[i].t > 0.5) flashes.splice(i, 1);
+  }
+  // 速率箭头相位（速度 ∝ 相对速率）
+  const c = C0 * (T / T0) / V;
+  const pNO2 = n2 * c, pN2O4 = (2 - n2) / 2 * c;
+  const rf = pNO2 * pNO2, rr = pN2O4 / Kp(T);
+  const mx = Math.max(rf, rr, 1e-6);
+  phase1 += dt * (0.4 + 2.6 * rf / mx);
+  phase2 += dt * (0.4 + 2.6 * rr / mx);
+}
+
+function rndVel() { const a = Math.random() * Math.PI * 2; return [Math.cos(a), Math.sin(a)]; }
+function spawn(type, x, y) {
+  const b = R.mol;
+  const [vx, vy] = rndVel();
+  particles.push({
+    type,
+    x: x !== undefined ? x : b.x + 20 + Math.random() * (b.w - 40),
+    y: y !== undefined ? y : b.y + 40 + Math.random() * (b.h - 60),
+    vx, vy, rot: Math.random() * 7, vr: (Math.random() - 0.5) * 2,
+  });
+}
+function mergePair() {  // 2 NO₂ → N₂O₄
+  const idx = [];
+  particles.forEach((p, i) => { if (p.type === "no2") idx.push(i); });
+  if (idx.length < 2) return;
+  const a = particles[idx[0]], b2 = particles[idx[1]];
+  const mx = (a.x + b2.x) / 2, my = (a.y + b2.y) / 2;
+  particles = particles.filter((_, i) => i !== idx[0] && i !== idx[1]);
+  spawn("n2o4", mx, my);
+  flashes.push({ x: mx, y: my, t: 0 });
+  tick();
+}
+function splitOne() {   // N₂O₄ → 2 NO₂
+  const i = particles.findIndex(p => p.type === "n2o4");
+  if (i < 0) return;
+  const p = particles[i];
+  particles.splice(i, 1);
+  spawn("no2", p.x - 8, p.y); spawn("no2", p.x + 8, p.y);
+  flashes.push({ x: p.x, y: p.y, t: 0 });
+  tick();
+}
+// 初始粒子
+(function initParticles() {
+  const wantNO2 = Math.round(18 * n2 / 2);
+  for (let i = 0; i < wantNO2; i++) spawn("no2");
+  for (let i = 0; i < (18 - wantNO2) / 2; i++) spawn("n2o4");
+})();
+
+/* ================= 交互（Pointer Events） ================= */
+function pistonX() {
+  const s = R.syringe;
+  const gasL = s.x + 14 * ui, gasR = s.x + s.w * 0.86;
+  return gasL + ((V - VMIN) / (1 - VMIN)) * (gasR - gasL);
+}
+canvas.addEventListener("pointerdown", e => {
+  hintEl.style.opacity = "0";
+  const x = e.clientX, y = e.clientY;
+  const s = R.syringe, t = R.temp;
+  // 活塞/手柄命中
+  if (x > pistonX() - 10 && x < s.x + s.w + 60 * ui && y > s.y - 14 && y < s.y + s.h + 14) {
+    dragging = "piston";
+    canvas.setPointerCapture(e.pointerId);
+    movePiston(x);
+    return;
+  }
+  // 温度滑杆命中
+  if (y > t.y + t.h * 0.25 && y < t.y + t.h + 20 && x > t.x - 20 && x < t.x + t.w + 20) {
+    dragging = "temp";
+    canvas.setPointerCapture(e.pointerId);
+    moveTemp(x);
+    return;
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (dragging === "piston") movePiston(e.clientX);
+  else if (dragging === "temp") moveTemp(e.clientX);
+});
+window.addEventListener("pointerup", () => { dragging = null; });
+
+function movePiston(x) {
+  const s = R.syringe;
+  const gasL = s.x + 14 * ui, gasR = s.x + s.w * 0.86;
+  V = clamp(VMIN + ((x - gasL) / (gasR - gasL)) * (1 - VMIN), VMIN, 1);
+}
+function moveTemp(x) {
+  const t = R.temp;
+  const k = clamp((x - t.x) / t.w, 0, 1);
+  T = TMIN + k * (TMAX - TMIN);
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function gasAlpha() { return clamp(0.05 + 0.28 * (n2 / V), 0, 0.92); }
+
+function drawHeader() {
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.font = `bold ${Math.round(20 * ui)}px "PingFang SC",sans-serif`;
+  ctx.fillStyle = "#eaf1ff";
+  ctx.fillText("化学平衡移动：密闭注射器里的 ", R.syringe.x, 0.075 * H);
+  let x = R.syringe.x + ctx.measureText("化学平衡移动：密闭注射器里的 ").width;
+  ctx.fillStyle = "#e07b39";
+  ctx.fillText("2NO₂(g)", x, 0.075 * H);
+  x += ctx.measureText("2NO₂(g)").width;
+  ctx.fillStyle = "#eaf1ff";
+  ctx.fillText(" ⇌ ", x, 0.075 * H);
+  x += ctx.measureText(" ⇌ ").width;
+  ctx.fillStyle = "#cfd6dd";
+  ctx.fillText("N₂O₄(g)", x, 0.075 * H);
+  x += ctx.measureText("N₂O₄(g)").width;
+  ctx.fillStyle = "#9fb2d8";
+  ctx.font = `${Math.round(15 * ui)}px "PingFang SC",sans-serif`;
+  ctx.fillText("　ΔH < 0（正反应放热）", x, 0.076 * H);
+}
+
+function drawSyringe() {
+  const s = R.syringe;
+  const px = pistonX();
+  const gasL = s.x + 14 * ui;
+  // 标题与读数
+  const c = C0 * (T / T0) / V;
+  const Prel = (1 + n2 / 2) * c;
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  ctx.font = `bold ${Math.round(15 * ui)}px "PingFang SC",sans-serif`;
+  ctx.fillStyle = "#8fd0ff";
+  ctx.fillText("密闭注射器（拖动活塞 ⇆）", s.x, s.y - 30 * ui);
+  ctx.fillStyle = "#eaf1ff";
+  ctx.font = `${Math.round(14 * ui)}px "PingFang SC",sans-serif`;
+  ctx.fillText(`相对压强 P ≈ ${Prel.toFixed(2)}　NO₂ 浓度 ∝ 颜色深浅`, s.x + 230 * ui, s.y - 30 * ui);
+  // 玻璃管
+  roundRect(s.x, s.y, s.w, s.h, 14 * ui);
+  ctx.fillStyle = "rgba(190,215,240,0.10)"; ctx.fill();
+  ctx.lineWidth = 3 * ui; ctx.strokeStyle = "rgba(190,215,240,0.55)"; ctx.stroke();
+  // 气体（先淡底色，再按 NO₂ 浓度叠红棕）
+  ctx.save();
+  roundRect(s.x + 3, s.y + 3, s.w - 6, s.h - 6, 11 * ui);
+  ctx.clip();
+  ctx.fillStyle = "#f3ecdd";
+  ctx.fillRect(gasL, s.y, Math.max(0, px - gasL), s.h);
+  ctx.fillStyle = `rgba(150,52,14,${gasAlpha()})`;
+  ctx.fillRect(gasL, s.y, Math.max(0, px - gasL), s.h);
+  // 刻度
+  ctx.strokeStyle = "rgba(120,140,170,0.5)"; ctx.lineWidth = 1.5 * ui;
+  for (let i = 1; i < 10; i++) {
+    const tx = gasL + (i / 10) * (s.x + s.w * 0.86 - gasL);
+    ctx.beginPath(); ctx.moveTo(tx, s.y + 3); ctx.lineTo(tx, s.y + 12 * ui); ctx.stroke();
+  }
+  ctx.restore();
+  // 密封端
+  ctx.fillStyle = "#5a6c96";
+  roundRect(s.x - 8 * ui, s.y - 6 * ui, 16 * ui, s.h + 12 * ui, 6 * ui); ctx.fill();
+  // 活塞
+  ctx.fillStyle = "#39445c";
+  ctx.fillRect(px, s.y + 2, 16 * ui, s.h - 4);
+  ctx.strokeStyle = "#7f8fb5"; ctx.lineWidth = 2 * ui;
+  ctx.strokeRect(px, s.y + 2, 16 * ui, s.h - 4);
+  // 活塞杆 + 手柄
+  ctx.fillStyle = "#7f8fb5";
+  ctx.fillRect(px + 16 * ui, s.y + s.h / 2 - 5 * ui, s.x + s.w - px - 16 * ui + 26 * ui, 10 * ui);
+  ctx.fillStyle = dragging === "piston" ? "#ff9a3d" : "#e07b39";
+  roundRect(s.x + s.w + 14 * ui, s.y + s.h / 2 - 26 * ui, 16 * ui, 52 * ui, 8 * ui); ctx.fill();
+  // 体积标注
+  ctx.fillStyle = "#9fb2d8";
+  ctx.font = `${Math.round(13 * ui)}px "PingFang SC",sans-serif`;
+  ctx.fillText(`体积 V ≈ ${(V * 100).toFixed(0)}%`, s.x, s.y + s.h + 24 * ui);
+}
+
+function drawTemp() {
+  const t = R.temp;
+  const ty = t.y + t.h * 0.62;
+  const degC = Math.round(T - 273);
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  ctx.font = `bold ${Math.round(15 * ui)}px "PingFang SC",sans-serif`;
+  ctx.fillStyle = "#8fd0ff";
+  ctx.fillText("温度滑杆（拖动）", t.x, t.y);
+  ctx.fillStyle = T > 330 ? "#ff9a5a" : T < 290 ? "#7fc4ff" : "#eaf1ff";
+  ctx.fillText(`${degC} °C`, t.x + 150 * ui, t.y);
+  // 滑杆
+  const g = ctx.createLinearGradient(t.x, 0, t.x + t.w, 0);
+  g.addColorStop(0, "#4fa8ff"); g.addColorStop(1, "#ff5a3c");
+  roundRect(t.x, ty - 6 * ui, t.w, 12 * ui, 6 * ui);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 1.5 * ui; ctx.stroke();
+  // 端点图标
+  ctx.font = `${Math.round(18 * ui)}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.fillText("❄", t.x - 16 * ui, ty + 6 * ui);
+  ctx.fillText("🔥", t.x + t.w + 16 * ui, ty + 6 * ui);
+  ctx.textAlign = "left";
+  // 滑块
+  const kx = t.x + ((T - TMIN) / (TMAX - TMIN)) * t.w;
+  ctx.beginPath(); ctx.arc(kx, ty, 13 * ui, 0, 7);
+  ctx.fillStyle = dragging === "temp" ? "#ffd54a" : "#fff";
+  ctx.fill();
+  ctx.lineWidth = 3 * ui; ctx.strokeStyle = "#33436b"; ctx.stroke();
+  ctx.fillStyle = "#33436b";
+  ctx.font = `bold ${Math.round(11 * ui)}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.fillText("T", kx, ty + 4 * ui);
+  ctx.textAlign = "left";
+}
+
+function drawMol() {
+  const b = R.mol;
+  roundRect(b.x, b.y, b.w, b.h, 14 * ui);
+  ctx.fillStyle = "rgba(10,16,28,0.75)"; ctx.fill();
+  ctx.lineWidth = 2 * ui; ctx.strokeStyle = "rgba(140,170,220,0.45)"; ctx.stroke();
+  ctx.font = `bold ${Math.round(14 * ui)}px "PingFang SC",sans-serif`;
+  ctx.fillStyle = "#8fd0ff"; ctx.textBaseline = "alphabetic";
+  ctx.fillText("分子视图 🔬（小球在不停运动、相互转化）", b.x + 12 * ui, b.y + 20 * ui);
+  // 闪光
+  for (const f of flashes) {
+    const a = 1 - f.t / 0.5;
+    ctx.beginPath(); ctx.arc(f.x, f.y, (8 + f.t * 60) * ui, 0, 7);
+    ctx.strokeStyle = `rgba(255,220,120,${a * 0.8})`; ctx.lineWidth = 2.5 * ui; ctx.stroke();
+  }
+  // 粒子
+  for (const p of particles) {
+    if (p.type === "no2") {
+      ctx.beginPath(); ctx.arc(p.x, p.y, 8 * ui, 0, 7);
+      ctx.fillStyle = "#c14a1c"; ctx.fill();
+      ctx.lineWidth = 1.5 * ui; ctx.strokeStyle = "#7a2a0c"; ctx.stroke();
+      ctx.beginPath(); ctx.arc(p.x - 2.5 * ui, p.y - 2.5 * ui, 2.2 * ui, 0, 7);
+      ctx.fillStyle = "rgba(255,255,255,0.55)"; ctx.fill();
+    } else {
+      const dx = Math.cos(p.rot) * 7 * ui, dy = Math.sin(p.rot) * 7 * ui;
+      ctx.strokeStyle = "#9aa5b1"; ctx.lineWidth = 3 * ui;
+      ctx.beginPath(); ctx.moveTo(p.x - dx, p.y - dy); ctx.lineTo(p.x + dx, p.y + dy); ctx.stroke();
+      for (const sgn of [-1, 1]) {
+        ctx.beginPath(); ctx.arc(p.x + sgn * dx, p.y + sgn * dy, 6.5 * ui, 0, 7);
+        ctx.fillStyle = "#dfe4ea"; ctx.fill();
+        ctx.lineWidth = 1.5 * ui; ctx.strokeStyle = "#8b96a5"; ctx.stroke();
+      }
+    }
+  }
+  // 图例与计数
+  const nNO2 = particles.filter(p => p.type === "no2").length;
+  const nN2O4 = particles.filter(p => p.type === "n2o4").length;
+  const ly = b.y + b.h - 12 * ui;
+  ctx.font = `${Math.round(13 * ui)}px "PingFang SC",sans-serif`;
+  ctx.beginPath(); ctx.arc(b.x + 18 * ui, ly - 4 * ui, 6 * ui, 0, 7);
+  ctx.fillStyle = "#c14a1c"; ctx.fill();
+  ctx.fillStyle = "#e07b39";
+  ctx.fillText(`NO₂（红棕）×${nNO2}`, b.x + 30 * ui, ly);
+  const x2 = b.x + 30 * ui + ctx.measureText(`NO₂（红棕）×${nNO2}`).width + 22 * ui;
+  ctx.beginPath(); ctx.arc(x2, ly - 4 * ui, 6 * ui, 0, 7);
+  ctx.fillStyle = "#dfe4ea"; ctx.fill();
+  ctx.fillStyle = "#cfd6dd";
+  ctx.fillText(`N₂O₄（无色）×${nN2O4}`, x2 + 12 * ui, ly);
+}
+
+function drawArrow(x1, y1, x2, y2, rel, phase, color) {
+  const wpx = (2.5 + 6 * rel) * ui;
+  ctx.save();
+  ctx.strokeStyle = color; ctx.fillStyle = color;
+  ctx.lineWidth = wpx; ctx.lineCap = "round";
+  ctx.setLineDash([14 * ui, 10 * ui]);
+  ctx.lineDashOffset = -phase * 40 * ui * (x2 > x1 ? 1 : -1);
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  ctx.setLineDash([]);
+  // 箭头头部
+  const dir = Math.sign(x2 - x1);
+  const hs = (8 + 5 * rel) * ui;
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - dir * hs, y2 - hs * 0.62);
+  ctx.lineTo(x2 - dir * hs, y2 + hs * 0.62);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawRates() {
+  const b = R.rates;
+  roundRect(b.x, b.y, b.w, b.h, 12 * ui);
+  ctx.fillStyle = "rgba(10,16,28,0.6)"; ctx.fill();
+  ctx.lineWidth = 1.5 * ui; ctx.strokeStyle = "rgba(140,170,220,0.3)"; ctx.stroke();
+  ctx.font = `bold ${Math.round(13.5 * ui)}px "PingFang SC",sans-serif`;
+  ctx.fillStyle = "#8fd0ff"; ctx.textBaseline = "alphabetic";
+  ctx.fillText("正逆反应速率（箭头越快 = 速率越大）", b.x + 10 * ui, b.y + 18 * ui);
+  // 速率
+  const c = C0 * (T / T0) / V;
+  const pNO2 = n2 * c, pN2O4 = (2 - n2) / 2 * c;
+  const rf = pNO2 * pNO2, rr = pN2O4 / Kp(T);
+  const mx = Math.max(rf, rr, 1e-6);
+  const sum = rf + rr;
+  const ax1 = b.x + 165 * ui, ax2 = b.x + b.w - 18 * ui;
+  const y1 = b.y + b.h * 0.46, y2 = b.y + b.h * 0.80;
+  ctx.font = `${Math.round(13 * ui)}px "PingFang SC",sans-serif`;
+  ctx.fillStyle = "#9fe8a8";
+  ctx.fillText("正反应 2NO₂→N₂O₄", b.x + 10 * ui, y1 + 4 * ui);
+  drawArrow(ax1, y1, ax2, y1, rf / mx, phase1, "#7fd08f");
+  ctx.fillStyle = "#f0c28a";
+  ctx.fillText("逆反应 N₂O₄→2NO₂", b.x + 10 * ui, y2 + 4 * ui);
+  drawArrow(ax2, y2, ax1, y2, rr / mx, phase2, "#e0a35a");
+  // 平衡指示
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#eaf1ff";
+  const pf = Math.round(100 * rf / sum);
+  ctx.fillText(`v正:v逆 ≈ ${pf}:${100 - pf}`, b.x + b.w - 12 * ui, b.y + 18 * ui);
+  ctx.textAlign = "left";
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#1a2434"); g.addColorStop(1, "#101722");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  drawHeader();
+  drawSyringe();
+  drawTemp();
+  drawMol();
+  drawRates();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const tick = () => tone(700 + Math.random() * 400, 0.04, 0.025, "square");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 提示条 ================= */
+let hintTimer = null;
+function showHint(text, dur) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, dur || 3200);
+}
+hintEl.addEventListener("pointerdown", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 测试接口（无头验证用） ================= */
+window.__eq = {
+  state: () => ({
+    V, T, n2,
+    n2eq: n2Eq(T, V),
+    conc: n2 / V,
+    Kp: Kp(T),
+    tasksDone,
+  }),
+  setV: v => { V = clamp(v, VMIN, 1); },
+  setT: t => { T = clamp(t, TMIN, TMAX); },
+  step: dt => physics(dt),
+  answer: (i, j) => answerCard(i, j),
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

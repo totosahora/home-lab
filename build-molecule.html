@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>分子拼装实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#dfe9f5; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,70,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,70,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92%;
+  }
+  #recipes {
+    position:absolute; top:64px; right:10px; width:152px; z-index:10;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  #recipes .ptitle {
+    text-align:center; font-size:17px; font-weight:bold; color:#234;
+    background:rgba(255,255,255,0.85); border-radius:14px; padding:5px 0;
+  }
+  .card {
+    background:rgba(255,255,255,0.94); border-radius:16px; padding:8px 4px;
+    text-align:center; border:3px solid transparent; position:relative;
+    box-shadow:0 2px 8px rgba(20,40,70,0.18); transition:transform 0.25s, border-color 0.25s;
+    cursor:pointer;
+  }
+  .card .emoji { font-size:32px; line-height:1.15; }
+  .card .rname { font-size:16px; font-weight:bold; color:#333; }
+  .card .formula { font-size:15px; color:#777; font-weight:bold; }
+  .card .check {
+    position:absolute; top:-11px; right:-9px; width:30px; height:30px;
+    border-radius:50%; background:#2fbf4a; color:#fff; font-size:18px;
+    font-weight:bold; display:none; align-items:center; justify-content:center;
+    box-shadow:0 2px 6px rgba(0,0,0,0.3);
+  }
+  .card.done { border-color:#2fbf4a; transform:scale(1.06); }
+  .card.done .check { display:flex; animation:pop 0.45s; }
+  @keyframes pop { 0%{transform:scale(0)} 70%{transform:scale(1.35)} 100%{transform:scale(1)} }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🧪 配方：0 / 4</div>
+<div id="recipes">
+  <div class="ptitle">🧪 配方卡</div>
+  <div class="card" id="card-water"><div class="check">✓</div><div class="emoji">💧</div><div class="rname">水</div><div class="formula">H₂O</div></div>
+  <div class="card" id="card-oxygen"><div class="check">✓</div><div class="emoji">🫧</div><div class="rname">氧气</div><div class="formula">O₂</div></div>
+  <div class="card" id="card-co2"><div class="check">✓</div><div class="emoji">☁️</div><div class="rname">二氧化碳</div><div class="formula">CO₂</div></div>
+  <div class="card" id="card-methane"><div class="check">✓</div><div class="emoji">💨</div><div class="rname">甲烷</div><div class="formula">CH₄</div></div>
+</div>
+<div id="hint">从左边原子盒把原子拖到中间，两个原子靠近就会自动连上化学键！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+const PALETTE_W = 116;    // 左侧原子盒宽度
+const PANEL_W = 175;      // 右侧配方卡预留宽度
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+function clampX(x, r) { return Math.max(r + 6, Math.min(W - PANEL_W - r - 8, x)); }
+function clampY(y, r) { return Math.max(r + 8, Math.min(H - r - 8, y)); }
+
+/* ================= 原子与配方 ================= */
+// 球棍模型经典配色：H 白、O 红、C 黑、N 蓝；valence = 最多能连几根键
+const ATOM_DEF = {
+  H: { r:17, color:"#ffffff", rim:"#b9c4cc", text:"#444444", valence:1, cn:"氢" },
+  O: { r:27, color:"#e53935", rim:"#a42020", text:"#ffffff", valence:2, cn:"氧" },
+  C: { r:23, color:"#3a3a3a", rim:"#111111", text:"#ffffff", valence:4, cn:"碳" },
+  N: { r:23, color:"#2f6fe0", rim:"#1a4a9e", text:"#ffffff", valence:3, cn:"氮" }
+};
+const PALETTE_ITEMS = ["H", "O", "C", "N"];
+const RECIPES = [
+  { id:"water",   name:"水",       emoji:"💧", counts:{ H:2, O:1 },       done:false },
+  { id:"oxygen",  name:"氧气",     emoji:"🫧", counts:{ O:2 },            done:false },
+  { id:"co2",     name:"二氧化碳", emoji:"☁️", counts:{ C:1, O:2 },       done:false },
+  { id:"methane", name:"甲烷",     emoji:"💨", counts:{ C:1, H:4 },       done:false }
+];
+
+let atoms = [];   // {type, x, y, r}
+let bonds = [];   // {a, b}  a、b 为 atoms 里的原子
+let winAt = 0;    // 全部拼齐的时间戳（0 = 还没赢）
+
+function spawnAtom(type, x, y) {
+  const def = ATOM_DEF[type];
+  const a = { type, x:clampX(x, def.r), y:clampY(y, def.r), r:def.r };
+  atoms.push(a);
+  return a;
+}
+function removeAtom(a) {
+  atoms = atoms.filter(o => o !== a);
+  bonds = bonds.filter(b => b.a !== a && b.b !== a);
+}
+function bondCount(a) {
+  let n = 0;
+  for (const b of bonds) if (b.a === a || b.b === a) n++;
+  return n;
+}
+function hasBond(a, c) {
+  return bonds.some(b => (b.a === a && b.b === c) || (b.a === c && b.b === a));
+}
+// 从 a 出发沿化学键找连在一起的原子团
+function componentOf(a) {
+  const seen = new Set([a]);
+  const stack = [a];
+  while (stack.length) {
+    const u = stack.pop();
+    for (const b of bonds) {
+      let v = null;
+      if (b.a === u) v = b.b; else if (b.b === u) v = b.a;
+      if (v && !seen.has(v)) { seen.add(v); stack.push(v); }
+    }
+  }
+  return [...seen];
+}
+function sameComponent(a, c) {
+  return componentOf(a).includes(c);
+}
+
+/* ================= 成键与断键 ================= */
+const BOND_GAP = 18;   // 两球心距离 < r1+r2+BOND_GAP 时自动成键
+
+function checkBonds() {
+  for (let i = 0; i < atoms.length; i++) {
+    for (let j = i + 1; j < atoms.length; j++) {
+      const a = atoms[i], c = atoms[j];
+      if (hasBond(a, c)) continue;
+      if (Math.hypot(a.x - c.x, a.y - c.y) >= a.r + c.r + BOND_GAP) continue;
+      if (bondCount(a) >= ATOM_DEF[a.type].valence) continue;
+      if (bondCount(c) >= ATOM_DEF[c.type].valence) continue;
+      if (sameComponent(a, c)) continue;
+      bonds.push({ a, b: c });
+      bondSound();
+      burst((a.x + c.x) / 2, (a.y + c.y) / 2, ["#ffffff", "#ffd54a"], 8, 130, 0.05);
+      onBondFormed(a);
+      // 拖着的原子团连上了新原子 → 新原子一起跟着走
+      if (drag && (inParts(a) || inParts(c))) rebuildParts();
+    }
+  }
+}
+
+function breakBond(b) {
+  const idx = bonds.indexOf(b);
+  if (idx < 0) return;
+  bonds.splice(idx, 1);
+  burst((b.a.x + b.b.x) / 2, (b.a.y + b.b.y) / 2, ["#ffffff", "#90a4ae"], 10, 160, 0.05);
+  // 把断开的一团推开一点，避免马上又自动连回去
+  const d = Math.hypot(b.b.x - b.a.x, b.b.y - b.a.y) || 1;
+  const need = b.a.r + b.b.r + BOND_GAP + 14 - d;
+  if (need > 0) {
+    const nx = (b.b.x - b.a.x) / d, ny = (b.b.y - b.a.y) / d;
+    for (const o of componentOf(b.b)) {
+      o.x = clampX(o.x + nx * need, o.r);
+      o.y = clampY(o.y + ny * need, o.r);
+    }
+  }
+}
+
+/* ================= 配方判定与庆祝 ================= */
+function countsMatch(comp, counts) {
+  const tally = {};
+  for (const a of comp) tally[a.type] = (tally[a.type] || 0) + 1;
+  const keys = Object.keys(counts);
+  if (Object.keys(tally).length !== keys.length) return false;
+  return keys.every(k => tally[k] === counts[k]);
+}
+
+function onBondFormed(a) {
+  const comp = componentOf(a);
+  for (const r of RECIPES) {
+    if (r.done || !countsMatch(comp, r.counts)) continue;
+    r.done = true;
+    document.getElementById("card-" + r.id).classList.add("done");
+    showHint(`你拼出了${r.name}分子！${r.emoji}`);
+    fanfare();
+    const cx = comp.reduce((s, o) => s + o.x, 0) / comp.length;
+    const cy = comp.reduce((s, o) => s + o.y, 0) / comp.length;
+    burst(cx, cy, ["#ffd54a", "#ffb800", "#fff59d", "#ff8a65"], 34, 320, 0.12);
+    updateScore();
+    if (RECIPES.every(q => q.done)) {
+      winAt = performance.now();
+      showHint("🎉 全部拼齐啦！你是小小化学家！");
+      bigFanfare();
+    }
+    return;
+  }
+}
+
+function updateScore() {
+  scorebar.textContent = `🧪 配方：${RECIPES.filter(r => r.done).length} / ${RECIPES.length}`;
+}
+
+/* ================= 交互（拖拽 / 甩断 / 拆键） ================= */
+let drag = null;   // {grab, parts:[{o,dx,dy}], x, y, hist:[{x,y,t}], lastBreak, overPal}
+const FLICK_SPEED = 1500;   // 甩动多快会把键甩断（像素/秒）
+
+function paletteItemAt(x, y) {
+  if (x > PALETTE_W) return null;
+  for (let i = 0; i < PALETTE_ITEMS.length; i++) {
+    const p = palettePos(i);
+    if (Math.hypot(x - p.x, y - p.y) < 44) return PALETTE_ITEMS[i];
+  }
+  return null;
+}
+function palettePos(i) {
+  const top = 110, bottom = H - 90;
+  const step = Math.min(108, (bottom - top) / (PALETTE_ITEMS.length - 1));
+  return { x: PALETTE_W / 2, y: top + i * step };
+}
+function atomAt(x, y) {
+  for (let i = atoms.length - 1; i >= 0; i--) {
+    const a = atoms[i];
+    if (Math.hypot(x - a.x, y - a.y) < Math.max(a.r + 8, 30)) return a;
+  }
+  return null;
+}
+function bondAt(x, y) {
+  for (const b of bonds) {
+    const dx = b.b.x - b.a.x, dy = b.b.y - b.a.y;
+    const L2 = dx * dx + dy * dy || 1;
+    let t = ((x - b.a.x) * dx + (y - b.a.y) * dy) / L2;
+    t = Math.max(0, Math.min(1, t));
+    if (Math.hypot(x - (b.a.x + dx * t), y - (b.a.y + dy * t)) < 14) return b;
+  }
+  return null;
+}
+
+function inParts(o) { return drag && drag.parts.some(p => p.o === o); }
+function rebuildParts() {
+  const comp = componentOf(drag.grab);
+  drag.parts = comp.map(o => ({ o, dx: o.x - drag.x, dy: o.y - drag.y }));
+}
+function startDrag(a, x, y) {
+  drag = { grab:a, parts:[], x, y, hist:[{ x, y, t:performance.now() }], lastBreak:0, overPal:false };
+  rebuildParts();
+  // 把抓住的原子团画到最上层
+  const comp = componentOf(a);
+  atoms = atoms.filter(o => !comp.includes(o)).concat(comp);
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  hintEl.style.opacity = "0";
+  // 1. 原子盒：生成一个新原子
+  const item = paletteItemAt(x, y);
+  if (item) {
+    startDrag(spawnAtom(item, x, y), x, y);
+    pop(700);
+    return;
+  }
+  // 2. 原子：拖动整个原子团
+  const a = atomAt(x, y);
+  if (a) { startDrag(a, x, y); pop(500); return; }
+  // 3. 化学键：点一下拆开
+  const b = bondAt(x, y);
+  if (b) { breakBond(b); snap(); showHint("拆开了一根化学键"); }
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const x = e.clientX, y = e.clientY;
+  drag.x = x; drag.y = y;
+  drag.overPal = x < PALETTE_W;
+  for (const p of drag.parts) {
+    p.o.x = clampX(x + p.dx, p.o.r);
+    p.o.y = clampY(y + p.dy, p.o.r);
+  }
+  // 甩动检测：近期速度足够快就把团里的一根键甩断
+  const now = performance.now();
+  drag.hist.push({ x, y, t:now });
+  while (drag.hist.length > 2 && now - drag.hist[0].t > 90) drag.hist.shift();
+  const old = drag.hist[0];
+  const dt = (now - old.t) / 1000;
+  if (dt > 0.02 && now - drag.lastBreak > 300) {
+    const speed = Math.hypot(x - old.x, y - old.y) / dt;
+    if (speed > FLICK_SPEED) {
+      const inner = bonds.filter(b => inParts(b.a) && inParts(b.b));
+      if (inner.length) {
+        breakBond(inner[Math.floor(Math.random() * inner.length)]);
+        drag.lastBreak = now;
+        snap();
+        showHint("哇，甩断了一根化学键！");
+        rebuildParts();
+      }
+    }
+  }
+});
+
+function endDrag() {
+  if (!drag) return;
+  // 拖回左边原子盒 = 把原子收回去
+  if (drag.overPal && atoms.includes(drag.grab)) {
+    removeAtom(drag.grab);
+    pop(240);
+    showHint("原子放回盒子啦");
+  }
+  drag = null;
+}
+window.addEventListener("pointerup", endDrag);
+window.addEventListener("pointercancel", endDrag);
+
+// 点配方卡提示需要什么原子
+for (const r of RECIPES) {
+  document.getElementById("card-" + r.id).addEventListener("click", () => {
+    const need = Object.entries(r.counts).map(([t, n]) => `${n} 个${ATOM_DEF[t].cn}(${t})`).join(" + ");
+    showHint(`${r.emoji} ${r.name} ${Object.keys(r.counts).join("")} = ${need}`);
+    pop(880);
+  });
+}
+
+/* ================= 粒子（烟花 / 庆祝） ================= */
+let sparks = [];   // {x, y, vx, vy, life, maxLife, color, size, grav}
+const FIREWORK_COLORS = ["#ff5252", "#ffd54a", "#69f0ae", "#40c4ff", "#e040fb", "#ffffff"];
+
+function burst(x, y, colors, n, speed, grav) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = speed * (0.3 + Math.random() * 0.7);
+    sparks.push({
+      x, y, vx:Math.cos(a) * sp, vy:Math.sin(a) * sp - speed * 0.25,
+      life:0, maxLife:0.7 + Math.random() * 0.8,
+      color:colors[Math.floor(Math.random() * colors.length)],
+      size:2.5 + Math.random() * 3, grav:grav || 0.1
+    });
+  }
+}
+function updateSparks(dt) {
+  for (const s of sparks) {
+    s.life += dt;
+    s.vy += s.grav * 900 * dt / 10;
+    s.x += s.vx * dt; s.y += s.vy * dt;
+    s.vx *= 0.985; s.vy *= 0.985;
+  }
+  sparks = sparks.filter(s => s.life < s.maxLife);
+}
+function drawSparks() {
+  for (const s of sparks) {
+    ctx.globalAlpha = Math.max(0, 1 - s.life / s.maxLife);
+    ctx.fillStyle = s.color;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.size, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ================= 绘制 ================= */
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#e8f1fb"); g.addColorStop(1, "#cfdff0");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 工作台圆点网格
+  ctx.fillStyle = "rgba(80,110,150,0.14)";
+  for (let x = PALETTE_W + 40; x < W - PANEL_W; x += 46)
+    for (let y = 40; y < H; y += 46) {
+      ctx.beginPath(); ctx.arc(x, y, 2, 0, 7); ctx.fill();
+    }
+}
+
+function drawPalette() {
+  const over = drag && drag.overPal;
+  ctx.fillStyle = over ? "rgba(46,80,130,0.95)" : "rgba(30,50,86,0.92)";
+  roundRect(8, 8, PALETTE_W - 16, H - 16, 20, true);
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 19px 'PingFang SC', sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("原子盒", PALETTE_W / 2, 40);
+  ctx.font = "13px 'PingFang SC', sans-serif";
+  ctx.fillStyle = over ? "#ffe082" : "rgba(255,255,255,0.65)";
+  ctx.fillText(over ? "松手放回" : "拖我出去→", PALETTE_W / 2, 64);
+  for (let i = 0; i < PALETTE_ITEMS.length; i++) {
+    const t = PALETTE_ITEMS[i], def = ATOM_DEF[t], p = palettePos(i);
+    drawAtomBall(p.x, p.y - 8, def.r * 0.85, def, t);
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.font = "13px 'PingFang SC', sans-serif";
+    ctx.fillText(def.cn, p.x, p.y + def.r * 0.85 + 2);
+  }
+}
+
+function drawAtomBall(x, y, r, def, label) {
+  const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.15, x, y, r);
+  g.addColorStop(0, lighten(def.color));
+  g.addColorStop(1, def.color);
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = def.rim; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = def.text;
+  ctx.font = `bold ${Math.round(r * 1.05)}px 'PingFang SC', sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(label, x, y + 1);
+}
+function lighten(hex) {
+  if (hex === "#ffffff") return "#ffffff";
+  const n = parseInt(hex.slice(1), 16);
+  const f = c => Math.min(255, Math.round(c + (255 - c) * 0.45));
+  return `rgb(${f(n >> 16)},${f((n >> 8) & 255)},${f(n & 255)})`;
+}
+
+function drawBonds() {
+  for (const b of bonds) {
+    ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(b.a.x, b.a.y); ctx.lineTo(b.b.x, b.b.y);
+    ctx.strokeStyle = "#78909c"; ctx.lineWidth = 10; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(b.a.x, b.a.y); ctx.lineTo(b.b.x, b.b.y);
+    ctx.strokeStyle = "#eceff1"; ctx.lineWidth = 4; ctx.stroke();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawBonds();
+  for (const a of atoms) drawAtomBall(a.x, a.y, a.r, ATOM_DEF[a.type], a.type);
+  drawSparks();
+  drawPalette();
+}
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  checkBonds();
+  updateSparks(dt);
+  // 全部拼齐后放 6 秒烟花
+  if (winAt && now - winAt < 6000 && Math.random() < 0.09 && sparks.length < 400) {
+    burst(PALETTE_W + 60 + Math.random() * (W - PALETTE_W - PANEL_W - 120),
+          60 + Math.random() * H * 0.45, FIREWORK_COLORS, 42, 380, 0.12);
+    boom();
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+const snap = () => { tone(320, 0.07, 0.16, "square"); tone(160, 0.1, 0.1, "square"); };
+const bondSound = () => { pop(620); setTimeout(() => pop(930), 60); };
+const boom = () => tone(110, 0.35, 0.1, "sawtooth");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+function bigFanfare() { [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => setTimeout(() => pop(f), i * 150)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+updateScore();
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

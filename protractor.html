@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>角度量角器</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#12324a; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(8,25,40,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(8,25,40,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10;
+    transition:opacity 0.6s; white-space:nowrap; cursor:pointer;
+  }
+  #tabs {
+    position:absolute; top:12px; left:12px; z-index:10;
+    display:flex; gap:8px;
+  }
+  #tabs button {
+    font-size:17px; font-weight:bold; padding:10px 20px;
+    border-radius:22px; border:none; background:rgba(255,255,255,0.18);
+    color:#cfe6f5; cursor:pointer;
+  }
+  #tabs button.on { background:#ffd54a; color:#4a3200; }
+  #tabs button:active { transform:scale(1.06); }
+  #answerBtns {
+    position:absolute; bottom:64px; left:50%; transform:translateX(-50%);
+    z-index:10; display:none; gap:12px;
+  }
+  #answerBtns button {
+    font-size:22px; font-weight:bold; padding:16px 28px;
+    border-radius:26px; border:none; background:#ffffff; color:#12324a;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.35); min-width:96px;
+  }
+  #answerBtns button:active { transform:scale(1.07); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="tabs">
+  <button data-mode="measure" class="on">📐 量角器</button>
+  <button data-mode="classify">🤔 角分类</button>
+  <button data-mode="clock">🕒 钟表</button>
+</div>
+<div id="scorebar">任务 1 / 5：转到 45°</div>
+<div id="hint">拖动彩色射线，转到任务要求的角度！</div>
+<div id="answerBtns">
+  <button data-k="acute">锐角</button>
+  <button data-k="right">直角</button>
+  <button data-k="obtuse">钝角</button>
+  <button data-k="straight">平角</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const answerBtns = document.getElementById("answerBtns");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 模式与状态 ================= */
+let mode = "measure";          // measure | classify | clock
+const TOL = 3;                 // 量角器容差 ±3°
+
+// 量角器模式
+const TASKS = [45, 120, 30, 90, 150];
+let taskIdx = 0;
+let rayDeg = 0;                // 当前射线角度（0-180）
+let taskDoneFlash = 0;         // 成功打勾的高亮计时
+
+// 角分类模式
+let clsAngle = 60;             // 当前角的度数
+let clsKind = "acute";         // acute | right | obtuse | straight
+let clsRot = 0;                // 整体随机旋转（弧度）
+let stars = 0;
+let clsLock = false;           // 答错后短暂锁定按钮
+
+// 钟表模式
+let clockHour = 3;             // 1-12
+let clockMin = 0;              // 0-59
+
+// 布局（随窗口变化）
+const view = { cx:0, cy:0, R:200 };
+function layout() {
+  view.cx = W / 2;
+  view.cy = H * 0.68;
+  view.R = Math.min(W * 0.42, H * 0.52);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const tickSnd = () => tone(900, 0.04, 0.05, "square");
+const wrongSnd = () => tone(220, 0.25, 0.1, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 提示条 ================= */
+let hintTimer = null;
+function showHint(text, sticky) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  if (!sticky) hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2400);
+}
+hintEl.addEventListener("pointerdown", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 庆祝粒子 ================= */
+let parts = [];   // {x, y, vx, vy, life, color}
+function burst(x, y) {
+  const colors = ["#ffd54a", "#ff6b6b", "#4dd0a6", "#6fb7ff", "#ffffff"];
+  for (let i = 0; i < 36; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 260;
+    parts.push({ x, y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp - 120,
+                 life:0.9 + Math.random()*0.5, color:colors[i % colors.length] });
+  }
+}
+function stepParts(dt) {
+  for (const p of parts) { p.x += p.vx*dt; p.y += p.vy*dt; p.vy += 500*dt; p.life -= dt; }
+  parts = parts.filter(p => p.life > 0);
+}
+function drawParts() {
+  for (const p of parts) {
+    ctx.globalAlpha = Math.min(1, p.life);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ================= 模式切换 ================= */
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll("#tabs button").forEach(b =>
+    b.classList.toggle("on", b.dataset.mode === m));
+  answerBtns.style.display = m === "classify" ? "flex" : "none";
+  dragging = false;
+  if (m === "measure") {
+    updateScore();
+    showHint("拖动彩色射线，转到任务要求的角度！", true);
+  } else if (m === "classify") {
+    newClassifyAngle();
+    updateScore();
+    showHint("看一看，这个角是哪一种？点下面的按钮回答", true);
+  } else {
+    updateScore();
+    showHint("拖动分针转一转，看时针和分针的夹角变化！", true);
+  }
+}
+document.querySelectorAll("#tabs button").forEach(b =>
+  b.addEventListener("click", () => { setMode(b.dataset.mode); pop(660); }));
+
+function updateScore() {
+  if (mode === "measure") {
+    if (taskIdx < TASKS.length)
+      scorebar.textContent = `任务 ${taskIdx + 1} / ${TASKS.length}：转到 ${TASKS[taskIdx]}°`;
+    else
+      scorebar.textContent = `🎉 全部任务完成！`;
+  } else if (mode === "classify") {
+    scorebar.textContent = `⭐ 星星：${stars}`;
+  } else {
+    scorebar.textContent = `🕒 ${clockHour} 时 ${String(clockMin).padStart(2,"0")} 分`;
+  }
+}
+
+/* ================= 角分类出题 ================= */
+function newClassifyAngle() {
+  const kinds = ["acute", "right", "obtuse", "straight"];
+  clsKind = kinds[Math.floor(Math.random() * kinds.length)];
+  if (clsKind === "acute")        clsAngle = 15 + 5 * Math.floor(Math.random() * 14);  // 15~80
+  else if (clsKind === "right")   clsAngle = 90;
+  else if (clsKind === "obtuse")  clsAngle = 95 + 5 * Math.floor(Math.random() * 16);  // 95~170
+  else                            clsAngle = 180;
+  clsRot = (Math.random() - 0.5) * Math.PI * 0.8;
+  clsLock = false;
+}
+const KIND_NAME = { acute:"锐角", right:"直角", obtuse:"钝角", straight:"平角" };
+const KIND_DESC = {
+  acute:"小于 90°", right:"正好等于 90°",
+  obtuse:"大于 90° 小于 180°", straight:"正好等于 180°"
+};
+answerBtns.querySelectorAll("button").forEach(b => {
+  b.addEventListener("click", () => {
+    if (clsLock || mode !== "classify") return;
+    if (b.dataset.k === clsKind) {
+      stars++;
+      pop(880); setTimeout(() => pop(1175), 120);
+      burst(view.cx, view.cy - view.R * 0.5);
+      showHint(`答对啦！这是${KIND_NAME[clsKind]} ⭐`);
+      newClassifyAngle();
+    } else {
+      clsLock = true;
+      wrongSnd();
+      showHint(`正确答案是：${KIND_NAME[clsKind]}（${KIND_DESC[clsKind]}），再试试下一题`);
+      setTimeout(() => { if (mode === "classify") newClassifyAngle(); }, 2200);
+    }
+    updateScore();
+  });
+});
+
+/* ================= 交互（拖拽） ================= */
+let dragging = false;
+
+// 屏幕点 → 量角器角度（0-180，右侧为 0°，逆时针）
+function pointerDegMeasure(px, py) {
+  const dx = px - view.cx, dy = py - view.cy;
+  if (dy > 0) return dx >= 0 ? 0 : 180;   // 基准线以下按侧边收拢
+  let a = Math.atan2(-dy, dx) * 180 / Math.PI;
+  return Math.max(0, Math.min(180, a));
+}
+// 屏幕点 → 钟表分钟（0-59，12 点方向为 0，顺时针）
+function pointerMinClock(px, py) {
+  const a = Math.atan2(px - view.cx, -(py - view.cy));   // 从 12 点顺时针
+  let t = a * 180 / Math.PI; if (t < 0) t += 360;
+  return Math.round(t / 6) % 60;
+}
+function inPlayArea(px, py) {
+  const d = Math.hypot(px - view.cx, py - view.cy);
+  return d < view.R * 1.25;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (mode === "classify") return;
+  if (!inPlayArea(e.clientX, e.clientY)) return;
+  dragging = true;
+  canvas.setPointerCapture(e.pointerId);
+  if (mode === "measure") {
+    rayDeg = pointerDegMeasure(e.clientX, e.clientY);
+    checkTask();
+  } else {
+    clockMin = pointerMinClock(e.clientX, e.clientY);
+    updateScore();
+    tickSnd();
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  if (mode === "measure") {
+    rayDeg = pointerDegMeasure(e.clientX, e.clientY);
+    checkTask();
+  } else {
+    const m = pointerMinClock(e.clientX, e.clientY);
+    if (m !== clockMin) { clockMin = m; updateScore(); tickSnd(); }
+  }
+});
+window.addEventListener("pointerup", () => { dragging = false; });
+
+/* ================= 量角器任务判定 ================= */
+function checkTask() {
+  if (taskIdx >= TASKS.length) return;
+  if (Math.abs(rayDeg - TASKS[taskIdx]) <= TOL) {
+    rayDeg = TASKS[taskIdx];      // 吸附到准确角度
+    taskIdx++;
+    taskDoneFlash = 1;
+    burst(view.cx + Math.cos(rayDeg * Math.PI / 180) * view.R * 0.75,
+          view.cy - Math.sin(rayDeg * Math.PI / 180) * view.R * 0.75);
+    if (taskIdx >= TASKS.length) { showHint("🎉 全部任务完成！你太棒了！"); fanfare(); }
+    else { showHint("✔ 成功！下一个任务"); pop(880); }
+    updateScore();
+  }
+}
+
+/* ================= 绘制：量角器 ================= */
+function drawProtractor() {
+  const { cx, cy, R } = view;
+  // 半透明量角器盘面
+  ctx.beginPath();
+  ctx.moveTo(cx - R, cy);
+  ctx.arc(cx, cy, R, Math.PI, 0);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(255,235,170,0.28)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,220,130,0.9)"; ctx.lineWidth = 4; ctx.stroke();
+  // 内圈装饰弧
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.55, Math.PI, 0);
+  ctx.strokeStyle = "rgba(255,220,130,0.35)"; ctx.lineWidth = 2; ctx.stroke();
+
+  // 任务目标绿色容差带（±3°）
+  if (taskIdx < TASKS.length) {
+    const t = TASKS[taskIdx] * Math.PI / 180, tol = TOL * Math.PI / 180;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, R * 0.98, -(t + tol), -(t - tol));
+    ctx.closePath();
+    ctx.fillStyle = "rgba(77,208,166,0.35)";
+    ctx.fill();
+  }
+
+  // 刻度线：每 1° 小刻度，5° 中刻度，10° 大刻度+数字
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (let d = 0; d <= 180; d++) {
+    const a = d * Math.PI / 180;
+    const c = Math.cos(a), s = Math.sin(a);
+    let len = 8, lw = 1.5;
+    if (d % 10 === 0) { len = 20; lw = 3; }
+    else if (d % 5 === 0) { len = 13; lw = 2; }
+    ctx.strokeStyle = "rgba(255,240,200,0.85)"; ctx.lineWidth = lw;
+    ctx.beginPath();
+    ctx.moveTo(cx + c * R, cy - s * R);
+    ctx.lineTo(cx + c * (R - len), cy - s * (R - len));
+    ctx.stroke();
+    if (d % 10 === 0) {
+      ctx.fillStyle = "rgba(255,240,200,0.95)";
+      ctx.font = "bold 15px sans-serif";
+      ctx.fillText(String(d), cx + c * (R - 38), cy - s * (R - 38));
+    }
+  }
+
+  // 0° 基准线（固定边）
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 6; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + R * 0.92, cy); ctx.stroke();
+
+  // 角度扇形（基准线到射线）
+  const ra = rayDeg * Math.PI / 180;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, R * 0.5, 0, -ra, true);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(111,183,255,0.35)";
+  ctx.fill();
+
+  // 可拖动射线（粗大醒目）
+  const ex = cx + Math.cos(ra) * R * 0.92, ey = cy - Math.sin(ra) * R * 0.92;
+  ctx.strokeStyle = "#ff6b6b"; ctx.lineWidth = 8; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ex, ey); ctx.stroke();
+  // 端点大抓手
+  ctx.beginPath(); ctx.arc(ex, ey, 22, 0, 7);
+  ctx.fillStyle = "#ff6b6b"; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 4; ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 18px sans-serif";
+  ctx.fillText("拖", ex, ey);
+  // 中心点
+  ctx.beginPath(); ctx.arc(cx, cy, 8, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+
+  // 实时读数（大字）
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 54px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(`${Math.round(rayDeg)}°`, cx, cy - R - 46);
+
+  // 任务卡（左上区域）
+  const cardX = 16, cardY = 70, cardW = 210;
+  ctx.textAlign = "left";
+  ctx.fillStyle = "rgba(8,25,40,0.8)";
+  roundRect(cardX, cardY, cardW, 44 + TASKS.length * 30, 14, true);
+  ctx.fillStyle = "#ffd54a"; ctx.font = "bold 18px sans-serif";
+  ctx.fillText("📋 任务卡", cardX + 16, cardY + 24);
+  ctx.font = "16px sans-serif";
+  TASKS.forEach((t, i) => {
+    const y = cardY + 54 + i * 30;
+    if (i < taskIdx) {
+      ctx.fillStyle = "#4dd0a6";
+      ctx.fillText(`✔ 转到 ${t}°`, cardX + 16, y);
+    } else if (i === taskIdx) {
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(`▶ 转到 ${t}°`, cardX + 16, y);
+    } else {
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.fillText(`○ 转到 ${t}°`, cardX + 16, y);
+    }
+  });
+}
+
+/* ================= 绘制：角分类 ================= */
+function drawClassify() {
+  const { cx, R } = view;
+  const cy = H * 0.48;               // 顶点上移，给底部按钮留空间
+  const ra = clsAngle * Math.PI / 180;
+  const len = R * 0.6;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(clsRot);
+  // 角内部扇形
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.arc(0, 0, len * 0.5, 0, -ra, true);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(111,183,255,0.3)";
+  ctx.fill();
+  // 两条边
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 8; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(len, 0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, 0);
+  ctx.lineTo(Math.cos(ra) * len, -Math.sin(ra) * len); ctx.stroke();
+  // 直角符号
+  if (clsAngle === 90) {
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(28, 0); ctx.lineTo(28, -28); ctx.lineTo(0, -28);
+    ctx.stroke();
+  } else {
+    // 角度弧线
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(0, 0, 40, 0, -ra, true); ctx.stroke();
+  }
+  // 顶点
+  ctx.beginPath(); ctx.arc(0, 0, 8, 0, 7);
+  ctx.fillStyle = "#ff6b6b"; ctx.fill();
+  ctx.restore();
+
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 34px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("这个角是什么角？", cx, 100);
+}
+
+/* ================= 绘制：钟表 ================= */
+function clockAngleDeg() {
+  const diff = Math.abs(30 * (clockHour + clockMin / 60) - 6 * clockMin);
+  return Math.min(diff, 360 - diff);
+}
+function drawClock() {
+  const { cx, cy, R } = view;
+  // 钟面
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, 7);
+  ctx.fillStyle = "#fdf6e3"; ctx.fill();
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 8; ctx.stroke();
+  // 刻度与数字
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (let i = 1; i <= 12; i++) {
+    const a = i / 12 * Math.PI * 2;
+    const sx = Math.sin(a), sy = -Math.cos(a);
+    ctx.strokeStyle = "#8a6d2f"; ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(cx + sx * R * 0.94, cy + sy * R * 0.94);
+    ctx.lineTo(cx + sx * R * 0.86, cy + sy * R * 0.86);
+    ctx.stroke();
+    ctx.fillStyle = "#12324a";
+    ctx.font = "bold 26px sans-serif";
+    ctx.fillText(String(i), cx + sx * R * 0.74, cy + sy * R * 0.74);
+  }
+  for (let m = 0; m < 60; m++) {
+    if (m % 5 === 0) continue;
+    const a = m / 60 * Math.PI * 2;
+    ctx.strokeStyle = "rgba(138,109,47,0.5)"; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.sin(a) * R * 0.94, cy - Math.cos(a) * R * 0.94);
+    ctx.lineTo(cx + Math.sin(a) * R * 0.90, cy - Math.cos(a) * R * 0.90);
+    ctx.stroke();
+  }
+  // 两针夹角扇形
+  const aMin = clockMin / 60 * Math.PI * 2;
+  const aHour = (clockHour + clockMin / 60) / 12 * Math.PI * 2;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, R * 0.34, aHour - Math.PI / 2, aMin - Math.PI / 2,
+          ((aMin - aHour + Math.PI * 3) % (Math.PI * 2)) > Math.PI);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(111,183,255,0.35)";
+  ctx.fill();
+
+  // 时针（短粗）
+  ctx.strokeStyle = "#12324a"; ctx.lineWidth = 12; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + Math.sin(aHour) * R * 0.5, cy - Math.cos(aHour) * R * 0.5);
+  ctx.stroke();
+  // 分针（长，可拖动）
+  const mEndX = cx + Math.sin(aMin) * R * 0.82, mEndY = cy - Math.cos(aMin) * R * 0.82;
+  ctx.strokeStyle = "#ff6b6b"; ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(mEndX, mEndY); ctx.stroke();
+  // 分针端点抓手
+  ctx.beginPath(); ctx.arc(mEndX, mEndY, 22, 0, 7);
+  ctx.fillStyle = "#ff6b6b"; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 4; ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 18px sans-serif";
+  ctx.fillText("拖", mEndX, mEndY);
+  // 中心点
+  ctx.beginPath(); ctx.arc(cx, cy, 10, 0, 7);
+  ctx.fillStyle = "#12324a"; ctx.fill();
+
+  // 时间与夹角读数
+  const ang = clockAngleDeg();
+  const angTxt = ang % 1 === 0 ? String(ang) : ang.toFixed(1);
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 46px sans-serif";
+  ctx.fillText(`夹角 ${angTxt}°`, cx, cy - R - 48);
+  ctx.font = "bold 26px sans-serif";
+  ctx.fillStyle = "#ffd54a";
+  ctx.fillText(`${clockHour} 时 ${String(clockMin).padStart(2,"0")} 分`, cx, cy + R + 40);
+}
+
+/* ================= 绘制：公共 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 背景渐变
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#16405e"); g.addColorStop(1, "#0e2438");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  if (mode === "measure") drawProtractor();
+  else if (mode === "classify") drawClassify();
+  else drawClock();
+  drawParts();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  stepParts(dt);
+  if (taskDoneFlash > 0) taskDoneFlash = Math.max(0, taskDoneFlash - dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 初始化 ================= */
+resize();
+setMode("measure");
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>比一比：长短和轻重</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #tabs {
+    position:absolute; top:12px; left:12px; z-index:20; display:flex; gap:10px;
+  }
+  .tab {
+    font-size:20px; font-weight:bold; padding:12px 24px;
+    border-radius:28px; border:3px solid #f0b13c; background:#fff8e8; color:#8a5a00;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.15); user-select:none;
+  }
+  .tab.active { background:#ffb800; color:#5a3d00; transform:scale(1.05); }
+  .tab:active { transform:scale(1.1); }
+  #regenBtn {
+    font-size:20px; font-weight:bold; padding:12px 20px;
+    border-radius:28px; border:3px solid #7ec850; background:#e8f7d8; color:#3a7a1a;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.15); user-select:none;
+  }
+  #regenBtn:active { transform:scale(1.08); }
+  #palette {
+    position:absolute; left:0; top:0; bottom:0; width:200px;
+    background:linear-gradient(180deg,#fff3d6,#ffe8b8);
+    border-right:3px solid #f0b13c;
+    padding:96px 10px 12px; z-index:10; user-select:none; overflow-y:auto;
+    display:none;
+  }
+  .pal-title { position:absolute; top:64px; left:0; right:0; text-align:center;
+    font-size:18px; font-weight:bold; color:#8a5a00; }
+  .pal-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .pal-item {
+    padding:8px 0 6px; border-radius:16px; background:#fff; border:2px solid #f0b13c;
+    display:flex; flex-direction:column; align-items:center; gap:2px;
+    cursor:grab; touch-action:none;
+    box-shadow:0 2px 5px rgba(0,0,0,0.12);
+  }
+  .pal-item:active { cursor:grabbing; transform:scale(1.06); }
+  .pal-item .pi-emo { font-size:34px; line-height:1.15; }
+  .pal-item span { font-size:13px; color:#8a5a00; font-weight:bold; }
+  #resultBar {
+    position:absolute; top:14px; left:50%; transform:translateX(-50%);
+    background:rgba(46,140,60,0.92); color:#fff; padding:12px 28px;
+    border-radius:28px; font-size:24px; font-weight:bold; z-index:15;
+    pointer-events:none; white-space:nowrap; opacity:0; transition:opacity 0.4s;
+    box-shadow:0 4px 12px rgba(0,0,0,0.25);
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(60,40,10,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:86%; text-align:center;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="tabs">
+  <button id="tabLen" class="tab active">📏 比长短</button>
+  <button id="tabWei" class="tab">⚖️ 比轻重</button>
+  <button id="regenBtn">🔀 换一组</button>
+</div>
+<div id="palette">
+  <div class="pal-title">物品箱</div>
+  <div class="pal-grid" id="palGrid"></div>
+</div>
+<div id="resultBar"></div>
+<div id="hint"></div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+const resultBar = document.getElementById("resultBar");
+const paletteEl = document.getElementById("palette");
+const regenBtn = document.getElementById("regenBtn");
+let W = 0, H = 0, DPR = 1;
+let mode = "length";   // length | weight
+
+/* ================= 布局 ================= */
+// 比长短
+let lineX = 0;           // 起跑线 x
+let maxPencilLen = 300;
+let slotTop = 0, slotGap = 70;
+// 比轻重
+const PALETTE_W = 200;
+let cx = 0, cy = 0;      // 天平横梁支点
+let beamHalf = 300;
+let baseY = 0;           // 底座地面 y
+const STRING_LEN = 95, PAN_R = 58;
+
+function layout() {
+  lineX = Math.max(80, W * 0.13);
+  maxPencilLen = Math.min(W * 0.5, 300);
+  slotTop = H * 0.46;
+  slotGap = Math.min(80, (H * 0.48) / 4.2);
+  cx = PALETTE_W + (W - PALETTE_W) * 0.5;
+  cy = H * 0.40;
+  beamHalf = Math.max(150, Math.min((W - PALETTE_W) / 2 - 80, 300));
+  baseY = H - 110;
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+  scatterPencils();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 比长短：场景数据 ================= */
+const PENCIL_COLORS = [
+  ["#e94b4b", "红色"], ["#3d8bff", "蓝色"],
+  ["#2fbf4a", "绿色"], ["#ffb800", "黄色"],
+];
+let pencils = [];    // {len, color, name, hx, hy, x, y, slot, sortFromY}
+let lenState = "play";   // play | sorting | done
+let sortT = 0;
+let sortTargets = null;  // Map: pencil -> 目标跑道号
+const HOME_CELLS = [[0, 0], [1, 1], [0, 1], [1, 0]]; // [列, 行]，保证互不重叠
+
+function slotY(i) { return slotTop + i * slotGap; }
+
+function newPencils() {
+  const n = Math.random() < 0.5 ? 3 : 4;
+  const minL = maxPencilLen * 0.42;
+  const avail = maxPencilLen - minL;
+  const lens = [];
+  for (let i = 0; i < n; i++) {
+    // 等距拉开 + 小抖动，保证长短一目了然
+    const jit = (Math.random() * 2 - 1) * Math.min(10, avail * 0.04);
+    lens.push(minL + avail * (n === 1 ? 0 : i / (n - 1)) + jit);
+  }
+  // 洗牌后分配给颜色，避免颜色总是对应同一长度
+  for (let i = lens.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [lens[i], lens[j]] = [lens[j], lens[i]];
+  }
+  pencils = [];
+  for (let i = 0; i < n; i++) {
+    const [color, name] = PENCIL_COLORS[i];
+    pencils.push({ len: lens[i], color, name, hx: 0, hy: 0, x: 0, y: 0, slot: null, sortFromY: 0 });
+  }
+  scatterPencils();
+  lenState = "play"; sortTargets = null;
+}
+function scatterPencils() {
+  if (!pencils.length) return;
+  const cellW = (W - 60) / 2;
+  pencils.forEach((p, i) => {
+    if (p.slot !== null) return;   // 已排好的不动
+    const [col, row] = HOME_CELLS[i % HOME_CELLS.length];
+    const minX = 40 + col * cellW + 10;
+    const maxX = Math.max(minX, 40 + (col + 1) * cellW - p.len - 16);
+    p.hx = minX + Math.random() * (maxX - minX);
+    p.hy = 128 + row * 102 + (Math.random() * 2 - 1) * 12;
+    p.x = p.hx; p.y = p.hy;
+  });
+}
+function slotTaken(i, except) {
+  return pencils.some(q => q !== except && q.slot === i);
+}
+// 松手时找可吸附的空跑道；x 是铅笔左端，y 是铅笔中线
+function slotAt(x, y, self) {
+  if (Math.abs(x - lineX) > 110) return -1;
+  const n = pencils.length;
+  if (y < slotTop - 50 || y > slotY(n - 1) + 50) return -1;
+  let best = -1, bd = 1e9;
+  for (let i = 0; i < n; i++) {
+    if (slotTaken(i, self)) continue;
+    const d = Math.abs(y - slotY(i));
+    if (d < bd) { bd = d; best = i; }
+  }
+  return bd <= slotGap * 0.75 ? best : -1;
+}
+function checkAllPlaced() {
+  if (lenState !== "play") return;
+  if (pencils.every(p => p.slot !== null)) {
+    // 全部对齐起跑线：自动按长度排序，长的在上
+    lenState = "sorting"; sortT = 0;
+    sortTargets = new Map();
+    const order = [...pencils].sort((a, b) => b.len - a.len);
+    order.forEach((p, i) => { sortTargets.set(p, i); p.sortFromY = p.y; });
+    pop(880);
+  }
+}
+const ease = t => t * t * (3 - 2 * t);
+
+function lengthPhysics(dt) {
+  if (lenState === "sorting") {
+    sortT += dt / 0.7;
+    const e = ease(Math.min(1, sortT));
+    for (const p of pencils) {
+      const t = sortTargets.get(p);
+      p.y = p.sortFromY + (slotY(t) - p.sortFromY) * e;
+    }
+    if (sortT >= 1) {
+      for (const p of pencils) p.slot = sortTargets.get(p);
+      lenState = "done";
+      fanfare();
+      showHint("🎉 排好啦！看看谁最长、谁最短！");
+    }
+  }
+}
+
+/* ================= 比轻重：场景数据 ================= */
+const ITEMS = {
+  watermelon: { emoji:"🍉", mass:6, size:60, name:"西瓜" },
+  teddy:      { emoji:"🧸", mass:4, size:56, name:"小熊" },
+  apple:      { emoji:"🍎", mass:3, size:48, name:"苹果" },
+  grapes:     { emoji:"🍇", mass:2, size:46, name:"葡萄" },
+  feather:    { emoji:"🪶", mass:1, size:44, name:"羽毛" },
+};
+const PALETTE_ORDER = ["watermelon", "teddy", "apple", "grapes", "feather"];
+const pans = { left: null, right: null };   // null | {type, mass}
+let beamAngle = 0, beamVel = 0;
+let selectedPan = null;    // "left" | "right" | null（显示 ✕ 手柄）
+let lastEqual = false;
+
+const MAX_BEAM_ANGLE = 14 * Math.PI / 180;
+function weightPhysics(dt) {
+  const ml = pans.left ? pans.left.mass : 0;
+  const mr = pans.right ? pans.right.mass : 0;
+  const diff = mr - ml;
+  const target = Math.max(-1, Math.min(1, diff / 5)) * MAX_BEAM_ANGLE;
+  // 弹簧-阻尼动画（同跷跷板）
+  const acc = (target - beamAngle) * 90;
+  beamVel = (beamVel + acc * dt) * Math.exp(-5.5 * dt);
+  beamAngle += beamVel * dt;
+}
+// 盘子中心坐标（盘子始终水平，只随横梁端点上下）
+function panPos(side) {   // side: -1 左 / +1 右
+  const c = Math.cos(beamAngle), s = Math.sin(beamAngle);
+  const lx = side * beamHalf;
+  return [cx + lx * c, cy + lx * s + STRING_LEN];
+}
+function updateCompare() {
+  const L = pans.left, R = pans.right;
+  if (L && R) {
+    let msg;
+    if (L.mass > R.mass) msg = `⚖️ ${ITEMS[L.type].emoji} 比 ${ITEMS[R.type].emoji} 重！`;
+    else if (R.mass > L.mass) msg = `⚖️ ${ITEMS[R.type].emoji} 比 ${ITEMS[L.type].emoji} 重！`;
+    else msg = `⚖️ ${ITEMS[L.type].emoji} 和 ${ITEMS[R.type].emoji} 一样重！`;
+    resultBar.textContent = msg;
+    resultBar.style.opacity = "1";
+    const eq = L.mass === R.mass;
+    if (eq && !lastEqual) fanfare();
+    lastEqual = eq;
+  } else {
+    resultBar.style.opacity = "0";
+    lastEqual = false;
+  }
+}
+
+/* ================= 交互：比长短 ================= */
+let lenDrag = null;   // {p, dx, dy, x0, y0, moved}
+
+function pencilAt(x, y) {
+  for (let i = pencils.length - 1; i >= 0; i--) {
+    const p = pencils[i];
+    if (x > p.x - 16 && x < p.x + p.len + 16 && Math.abs(y - p.y) < 24) return p;
+  }
+  return null;
+}
+function lenPointerDown(e) {
+  const p = pencilAt(e.clientX, e.clientY);
+  if (!p) return;
+  lenDrag = { p, dx: e.clientX - p.x, dy: e.clientY - p.y, x0: e.clientX, y0: e.clientY, moved: false };
+  canvas.setPointerCapture(e.pointerId);
+}
+function lenPointerMove(e) {
+  if (!lenDrag) return;
+  const { p } = lenDrag;
+  if (!lenDrag.moved && Math.hypot(e.clientX - lenDrag.x0, e.clientY - lenDrag.y0) > 8) {
+    lenDrag.moved = true;
+    if (p.slot !== null) { p.slot = null; lenState = "play"; }  // 拿走已排好的铅笔，重新玩
+  }
+  if (lenDrag.moved) {
+    p.x = e.clientX - lenDrag.dx;
+    p.y = e.clientY - lenDrag.dy;
+  }
+}
+function lenPointerUp(e) {
+  if (!lenDrag) return;
+  const { p } = lenDrag;
+  if (lenDrag.moved) {
+    const si = slotAt(p.x, p.y, p);
+    if (si >= 0) {
+      p.slot = si; p.x = lineX; p.y = slotY(si);
+      pop(660);
+      checkAllPlaced();
+    } else {
+      p.x = p.hx; p.y = p.hy;   // 没放到起跑线：回原地
+      pop(240);
+    }
+  } else {
+    pop(880);   // 轻点一下：小音效反馈
+  }
+  lenDrag = null;
+}
+
+/* ================= 交互：比轻重 ================= */
+let drag = null;        // {type, mass, fromPan|null, x, y}
+let pressInfo = null;   // {pan, x0, y0}
+const SNAP_R = 85, ITEM_HIT_R = 50;
+
+function nearestPan(x, y) {
+  let best = null, bd = SNAP_R;
+  for (const [key, side] of [["left", -1], ["right", 1]]) {
+    const [px, py] = panPos(side);
+    const d = Math.hypot(x - px, y - py);
+    if (d < bd) { bd = d; best = key; }
+  }
+  return best;
+}
+function panAt(x, y) {
+  for (const [key, side] of [["left", -1], ["right", 1]]) {
+    if (!pans[key]) continue;
+    const [px, py] = panPos(side);
+    if (Math.hypot(x - px, y - (py - 14)) < ITEM_HIT_R) return key;
+  }
+  return null;
+}
+function handlePos(key) {
+  const side = key === "left" ? -1 : 1;
+  const [px, py] = panPos(side);
+  return [px + 46, py - 66];
+}
+function startDrag(type, fromPan, x, y) {
+  drag = { type, mass: ITEMS[type].mass, fromPan, x, y };
+  if (fromPan) { pans[fromPan] = null; updateCompare(); }
+  selectedPan = null;
+  hintEl.style.opacity = "0";
+}
+function moveDrag(x, y) { if (drag) { drag.x = x; drag.y = y; } }
+function endDrag(x, y) {
+  if (!drag) return;
+  const pan = nearestPan(x, y);
+  if (pan) {
+    pans[pan] = { type: drag.type, mass: drag.mass };  // 盘里有东西会被换下来
+    pop(660);
+    updateCompare();
+  } else {
+    pop(240);   // 拖到盘子外：放回物品箱
+  }
+  drag = null;
+}
+function weiPointerDown(e) {
+  const x = e.clientX, y = e.clientY;
+  // 先判 ✕ 删除手柄
+  if (selectedPan && pans[selectedPan]) {
+    const [hx, hy] = handlePos(selectedPan);
+    if (Math.hypot(x - hx, y - hy) < 22) {
+      pans[selectedPan] = null;
+      selectedPan = null;
+      pop(240);
+      updateCompare();
+      return;
+    }
+  }
+  const pan = panAt(x, y);
+  if (pan) {
+    pressInfo = { pan, x0: x, y0: y };
+    canvas.setPointerCapture(e.pointerId);
+  } else {
+    selectedPan = null;
+  }
+}
+function weiPointerMove(e) {
+  if (pressInfo && !drag) {
+    if (Math.hypot(e.clientX - pressInfo.x0, e.clientY - pressInfo.y0) > 9) {
+      startDrag(pans[pressInfo.pan].type, pressInfo.pan, e.clientX, e.clientY);
+      pressInfo = null;
+    }
+  }
+  if (drag && drag.fromPan) moveDrag(e.clientX, e.clientY);
+}
+function weiPointerUp(e) {
+  if (drag && drag.fromPan) { endDrag(e.clientX, e.clientY); pressInfo = null; return; }
+  if (pressInfo) {
+    // 原地轻点 = 选中/取消选中（出现 ✕ 手柄）
+    selectedPan = (selectedPan === pressInfo.pan) ? null : pressInfo.pan;
+    pop(880);
+    pressInfo = null;
+  }
+}
+
+/* ---- 画布指针事件：按模式分发 ---- */
+canvas.addEventListener("pointerdown", e => {
+  hintEl.style.opacity = "0";
+  if (mode === "length") lenPointerDown(e);
+  else weiPointerDown(e);
+});
+canvas.addEventListener("pointermove", e => {
+  if (mode === "length") lenPointerMove(e);
+  else weiPointerMove(e);
+});
+canvas.addEventListener("pointerup", e => {
+  if (mode === "length") lenPointerUp(e);
+  else weiPointerUp(e);
+});
+canvas.addEventListener("pointercancel", () => {
+  if (lenDrag) { const p = lenDrag.p; p.x = p.slot !== null ? lineX : p.hx; p.y = p.slot !== null ? slotY(p.slot) : p.hy; lenDrag = null; }
+  if (drag && drag.fromPan) { pans[drag.fromPan] = { type: drag.type, mass: drag.mass }; updateCompare(); }
+  drag = null; pressInfo = null;
+});
+
+/* ---- 物品箱：拖出新物品 ---- */
+const palGrid = document.getElementById("palGrid");
+for (const type of PALETTE_ORDER) {
+  const c = ITEMS[type];
+  const el = document.createElement("div");
+  el.className = "pal-item";
+  el.innerHTML = `<div class="pi-emo">${c.emoji}</div><span>${c.name}</span>`;
+  el.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    if (mode !== "weight") return;
+    startDrag(type, null, e.clientX, e.clientY);
+  });
+  palGrid.appendChild(el);
+}
+window.addEventListener("pointermove", e => { if (drag && !drag.fromPan) moveDrag(e.clientX, e.clientY); });
+window.addEventListener("pointerup", e => { if (drag && !drag.fromPan) endDrag(e.clientX, e.clientY); });
+
+/* ================= 模式切换 ================= */
+const tabLen = document.getElementById("tabLen");
+const tabWei = document.getElementById("tabWei");
+function setMode(m) {
+  mode = m;
+  lenDrag = null; drag = null; pressInfo = null; selectedPan = null;
+  tabLen.classList.toggle("active", m === "length");
+  tabWei.classList.toggle("active", m === "weight");
+  paletteEl.style.display = m === "weight" ? "block" : "none";
+  regenBtn.style.display = m === "length" ? "block" : "none";
+  resultBar.style.opacity = "0";
+  hintEl.style.opacity = "1";
+  hintEl.textContent = m === "length"
+    ? "把彩色铅笔拖到下面的起跑线，左边对齐，看看谁最长！"
+    : "把物品箱里的东西拖到天平两边的盘子里，比比谁更重！";
+  if (m === "weight") updateCompare();
+}
+tabLen.addEventListener("click", () => { setMode("length"); pop(700); });
+tabWei.addEventListener("click", () => { setMode("weight"); pop(700); });
+regenBtn.addEventListener("click", () => { newPencils(); pop(880); showHint("新的一组铅笔来啦！"); });
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground(grassTop) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#bfe6ff"); g.addColorStop(0.7, "#e8f7ff"); g.addColorStop(1, "#e2f4d5");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 太阳
+  ctx.beginPath(); ctx.arc(W - 90, 80, 42, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  // 草地
+  ctx.fillStyle = "#8ed07a";
+  ctx.fillRect(0, grassTop, W, H - grassTop);
+}
+
+/* ---- 比长短 ---- */
+function drawTrack() {
+  const n = pencils.length;
+  const top = slotTop - slotGap * 0.55;
+  const bottom = slotY(n - 1) + slotGap * 0.55;
+  // 跑道底色
+  ctx.fillStyle = "rgba(255,255,255,0.45)";
+  roundRect(lineX - 60, top, Math.min(W - lineX + 20, maxPencilLen + 220), bottom - top, 18, true);
+  // 跑道分隔虚线
+  ctx.strokeStyle = "rgba(120,120,120,0.35)";
+  ctx.lineWidth = 3;
+  ctx.setLineDash([12, 10]);
+  for (let i = 1; i < n; i++) {
+    const y = slotTop + (i - 0.5) * slotGap;
+    ctx.beginPath(); ctx.moveTo(lineX + 6, y); ctx.lineTo(lineX + maxPencilLen + 130, y); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  // 拖拽时高亮目标跑道
+  if (lenDrag && lenDrag.moved) {
+    const { p } = lenDrag;
+    const si = slotAt(p.x, p.y, p);
+    if (si >= 0) {
+      ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 6;
+      roundRect(lineX - 8, slotY(si) - slotGap * 0.42, maxPencilLen + 60, slotGap * 0.84, 12, false);
+      ctx.stroke();
+    }
+  }
+  // 起跑线（竖直红白格）
+  const segH = 16;
+  for (let y = top, i = 0; y < bottom; y += segH, i++) {
+    ctx.fillStyle = i % 2 ? "#e94b4b" : "#ffffff";
+    ctx.fillRect(lineX - 5, y, 10, Math.min(segH, bottom - y));
+  }
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2;
+  ctx.strokeRect(lineX - 5, top, 10, bottom - top);
+  // 起跑线标签
+  ctx.fillStyle = "#c0392b";
+  ctx.font = "bold 20px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+  ctx.fillText("🏁 起跑线", lineX, top - 8);
+  ctx.textBaseline = "alphabetic";
+}
+
+function drawPencil(p) {
+  const h = 26;
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  // 影子
+  ctx.fillStyle = "rgba(0,0,0,0.12)";
+  roundRect(2, h / 2 - 2, p.len, 7, 3, true);
+  // 笔杆
+  const bodyEnd = p.len - 40;
+  const g = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+  g.addColorStop(0, "#ffffff"); g.addColorStop(0.18, p.color);
+  g.addColorStop(0.8, p.color); g.addColorStop(1, "rgba(0,0,0,0.28)");
+  ctx.fillStyle = g;
+  ctx.fillRect(14, -h / 2, bodyEnd - 14, h);
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2;
+  ctx.strokeRect(14, -h / 2, bodyEnd - 14, h);
+  // 木质笔头（右端）
+  ctx.beginPath();
+  ctx.moveTo(bodyEnd, -h / 2); ctx.lineTo(p.len - 12, 0); ctx.lineTo(bodyEnd, h / 2);
+  ctx.closePath();
+  ctx.fillStyle = "#f2d8a7"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.2)"; ctx.stroke();
+  // 笔芯
+  ctx.beginPath();
+  ctx.moveTo(p.len - 22, -h * 0.18); ctx.lineTo(p.len - 12, 0); ctx.lineTo(p.len - 22, h * 0.18);
+  ctx.closePath();
+  ctx.fillStyle = p.color; ctx.fill();
+  // 左端金属箍 + 橡皮
+  ctx.fillStyle = "#c9ced6";
+  ctx.fillRect(6, -h / 2, 8, h);
+  ctx.strokeRect(6, -h / 2, 8, h);
+  ctx.fillStyle = "#ff9fb0";
+  roundRect(0, -h / 2 + 2, 7, h - 4, 3, true);
+  ctx.restore();
+}
+
+function drawLengthLabels() {
+  if (lenState !== "done") return;
+  const longest = pencils.find(p => p.slot === 0);
+  const shortest = pencils.find(p => p.slot === pencils.length - 1);
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  for (const [p, text, bg] of [
+    [longest, "🏆 最长", "#ffd54a"],
+    [shortest, "🐣 最短", "#90caf9"],
+  ]) {
+    if (!p) continue;
+    ctx.font = "bold 22px sans-serif";
+    const tw = ctx.measureText(text).width;
+    const tx = p.x + p.len + 16, ty = p.y;
+    ctx.fillStyle = bg;
+    roundRect(tx - 8, ty - 18, tw + 16, 36, 18, true);
+    ctx.strokeStyle = "rgba(0,0,0,0.2)"; ctx.lineWidth = 2;
+    roundRect(tx - 8, ty - 18, tw + 16, 36, 18, false); ctx.stroke();
+    ctx.fillStyle = "#5a3d00";
+    ctx.fillText(text, tx, ty + 1);
+  }
+  ctx.textBaseline = "alphabetic";
+}
+
+function drawLength() {
+  drawBackground(slotY(pencils.length - 1) + slotGap * 0.55 + 14);
+  drawTrack();
+  // 先画排好的，再画散放的，最后画正在拖的
+  for (const p of pencils) if (p.slot !== null && (!lenDrag || lenDrag.p !== p)) drawPencil(p);
+  for (const p of pencils) if (p.slot === null && (!lenDrag || lenDrag.p !== p)) drawPencil(p);
+  if (lenDrag) drawPencil(lenDrag.p);
+  drawLengthLabels();
+}
+
+/* ---- 比轻重 ---- */
+function drawBalance() {
+  // 底座
+  ctx.fillStyle = "#7a5a34";
+  ctx.beginPath();
+  ctx.moveTo(cx - 90, baseY + 20); ctx.lineTo(cx + 90, baseY + 20);
+  ctx.lineTo(cx + 55, baseY - 14); ctx.lineTo(cx - 55, baseY - 14);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 3; ctx.stroke();
+  // 立柱
+  ctx.fillStyle = "#8a6538";
+  roundRect(cx - 14, cy - 4, 28, baseY - 14 - cy + 4, 8, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.2)"; ctx.lineWidth = 2.5;
+  roundRect(cx - 14, cy - 4, 28, baseY - 14 - cy + 4, 8, false); ctx.stroke();
+
+  // 横梁（倾斜）
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(beamAngle);
+  const g = ctx.createLinearGradient(0, -9, 0, 9);
+  g.addColorStop(0, "#ffb74d"); g.addColorStop(1, "#e8873a");
+  ctx.fillStyle = g;
+  roundRect(-beamHalf - 16, -9, (beamHalf + 16) * 2, 18, 9, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2.5;
+  roundRect(-beamHalf - 16, -9, (beamHalf + 16) * 2, 18, 9, false); ctx.stroke();
+  // 中央指针
+  ctx.beginPath();
+  ctx.moveTo(0, 10); ctx.lineTo(-8, 34); ctx.lineTo(8, 34);
+  ctx.closePath();
+  ctx.fillStyle = "#c0392b"; ctx.fill();
+  ctx.restore();
+
+  // 支点顶帽
+  ctx.beginPath(); ctx.arc(cx, cy, 11, 0, 7);
+  ctx.fillStyle = "#5a3d1e"; ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+
+  // 两个吊盘
+  for (const [key, side] of [["left", -1], ["right", 1]]) {
+    const c = Math.cos(beamAngle), s = Math.sin(beamAngle);
+    const ax = cx + side * beamHalf * c, ay = cy + side * beamHalf * s;
+    const [px, py] = panPos(side);
+    // 吊绳
+    ctx.strokeStyle = "#6b4a26"; ctx.lineWidth = 3.5;
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(px - PAN_R * 0.75, py - 6); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(px + PAN_R * 0.75, py - 6); ctx.stroke();
+    // 盘（碗形）
+    ctx.beginPath();
+    ctx.ellipse(px, py, PAN_R, PAN_R * 0.42, 0, 0, Math.PI);
+    ctx.closePath();
+    const pg = ctx.createLinearGradient(0, py - 10, 0, py + PAN_R * 0.45);
+    pg.addColorStop(0, "#ffe082"); pg.addColorStop(1, "#d9a13c");
+    ctx.fillStyle = pg; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse(px, py, PAN_R, PAN_R * 0.42, 0, 0, Math.PI, true);
+    ctx.stroke();
+    // 拖拽时空盘高亮
+    if (drag) {
+      const near = nearestPan(drag.x, drag.y);
+      if (near === key) {
+        ctx.beginPath(); ctx.arc(px, py - 12, PAN_R + 8, 0, 7);
+        ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 6; ctx.stroke();
+      }
+    }
+    // 盘里的物品（保持直立）
+    const obj = pans[key];
+    if (obj && (!drag || drag.fromPan !== key)) drawPanItem(key, obj);
+    // 选中圈 + ✕ 手柄
+    if (selectedPan === key && obj) {
+      ctx.beginPath(); ctx.arc(px, py - 14, 48, 0, 7);
+      ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 4;
+      ctx.setLineDash([8, 6]); ctx.stroke(); ctx.setLineDash([]);
+      const [hx, hy] = handlePos(key);
+      ctx.beginPath(); ctx.arc(hx, hy, 17, 0, 7);
+      ctx.fillStyle = "#e93b3b"; ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 20px sans-serif";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("✕", hx, hy + 1);
+      ctx.textBaseline = "alphabetic";
+    }
+  }
+}
+
+function drawPanItem(key, obj) {
+  const side = key === "left" ? -1 : 1;
+  const [px, py] = panPos(side);
+  const c = ITEMS[obj.type];
+  ctx.font = c.size + "px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(c.emoji, px, py - 16);
+  ctx.textBaseline = "alphabetic";
+}
+
+function drawWeightHint() {
+  // 底部小提示：重的一边会低下去
+  ctx.fillStyle = "rgba(90,50,10,0.7)";
+  ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+  const L = pans.left, R = pans.right;
+  let t = "每个盘子放 1 个物品，再拖一个新物品上去可以替换";
+  if (L && R) {
+    t = L.mass === R.mass ? "两边一样重，天平平衡啦！"
+      : (L.mass > R.mass ? "左边低下去 → 左边更重" : "右边低下去 → 右边更重");
+  }
+  ctx.fillText(t, cx, H - 56);
+  ctx.textBaseline = "alphabetic";
+}
+
+function drawDragGhost() {
+  if (!drag) return;
+  const c = ITEMS[drag.type];
+  ctx.globalAlpha = 0.9;
+  ctx.font = c.size + "px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(c.emoji, drag.x, drag.y - 10);
+  ctx.globalAlpha = 1;
+  ctx.textBaseline = "alphabetic";
+}
+
+function drawWeight() {
+  drawBackground(baseY + 20);
+  drawBalance();
+  drawWeightHint();
+  drawDragGhost();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (mode === "length") drawLength();
+  else drawWeight();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  if (mode === "length") lengthPhysics(dt);
+  else weightPhysics(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type, freqEnd) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    if (freqEnd) o.frequency.exponentialRampToValueAtTime(freqEnd, actx.currentTime + dur);
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+
+/* ================= 启动 ================= */
+resize();
+newPencils();
+setMode("length");
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>滴定曲线探秘</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#eef4f8; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(255,255,255,0.9); color:#1f4e79; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,0.12);
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(31,78,121,0.9); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.5s; white-space:nowrap; max-width:94vw;
+  }
+  .ctlBtn {
+    position:absolute; z-index:10; font-size:19px; font-weight:bold;
+    padding:14px 30px; border-radius:32px; border:none; cursor:pointer;
+    box-shadow:0 4px 12px rgba(0,0,0,0.25); user-select:none;
+    -webkit-user-select:none; touch-action:none;
+  }
+  .ctlBtn:active { transform:scale(1.05); }
+  #dripBtn { background:#1f6fd0; color:#fff; display:none; }
+  #dripBtn.holding { background:#0f4fa8; transform:scale(0.96); }
+  #doneBtn { background:#ff9f1a; color:#5a3200; display:none; }
+  #replayBtn { background:#d6306e; color:#fff; display:none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar"></div>
+<div id="hint"></div>
+<button id="dripBtn" class="ctlBtn">💧 按住滴加 NaOH</button>
+<button id="doneBtn" class="ctlBtn">✔ 停止滴加，去标注</button>
+<button id="replayBtn" class="ctlBtn">🔄 再玩一次</button>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const dripBtn = document.getElementById("dripBtn");
+const doneBtn = document.getElementById("doneBtn");
+const replayBtn = document.getElementById("replayBtn");
+let W = 0, H = 0, DPR = 1;
+let hintTimer = null;
+
+/* ================= 场景数据 ================= */
+// 两次实验：0.1 mol/L 酸 25 mL，用 0.1 mol/L NaOH 滴定 → 当量点 25 mL
+const EXPS = [
+  { name:"盐酸 HCl", sub:"强酸",  Ca:0.1, Va:25, Cb:0.1, Ka:1e6,   color:"#1f6fd0" },
+  { name:"醋酸 CH₃COOH", sub:"弱酸", Ca:0.1, Va:25, Cb:0.1, Ka:1.8e-5, color:"#d6306e" },
+];
+const VEQ = 25;            // 当量点体积 mL
+const VMAX = 40;           // 横轴最大体积 mL
+const DROP_VOL = 0.1;      // 每滴体积 mL
+const DROP_MS = 90;        // 按住时每滴间隔 ms
+
+// 布局（resize 时重算）
+const lay = {};
+function layout() {
+  lay.appW = W * 0.40;                       // 左侧装置区
+  lay.chart = { x0: W * 0.45, y0: 88, x1: W - 28, y1: H - 240 };
+  lay.dockY = H - 100;                       // 标记停靠区中心 y
+  lay.tipX = lay.appW * 0.5;                 // 滴定管尖端 x
+  lay.tipY = H * 0.30;
+  lay.flaskCX = lay.appW * 0.5;
+  lay.flaskTopY = H * 0.40;
+  lay.flaskBotY = H * 0.86;
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+  placeButtons();
+}
+window.addEventListener("resize", resize);
+
+function placeButtons() {
+  dripBtn.style.left = (lay.appW * 0.5) + "px";
+  dripBtn.style.transform = "translateX(-50%)";
+  dripBtn.style.bottom = "126px";
+  doneBtn.style.left = (lay.appW * 0.5) + "px";
+  doneBtn.style.transform = "translateX(-50%)";
+  doneBtn.style.bottom = "62px";
+  replayBtn.style.left = (lay.appW * 0.5) + "px";
+  replayBtn.style.transform = "translateX(-50%)";
+  replayBtn.style.bottom = "64px";
+}
+resize();
+
+/* ================= 化学计算 ================= */
+// 用电荷守恒 + 物料守恒对 pH 二分求解，强酸弱酸通用
+function pHof(VmL, exp) {
+  const Vt = exp.Va + VmL;
+  const CNa = exp.Cb * VmL / Vt;       // Na⁺ 浓度
+  const CA  = exp.Ca * exp.Va / Vt;    // 酸总浓度
+  const Kw = 1e-14, Ka = exp.Ka;
+  let lo = -1, hi = 15;
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2, h = Math.pow(10, -mid);
+    const f = h + CNa - Kw / h - CA * Ka / (Ka + h);
+    if (f > 0) lo = mid; else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+// 数值导数 dpH/dV
+function slopeAt(VmL, exp) {
+  const d = 0.05;
+  return (pHof(Math.min(VMAX, VmL + d), exp) - pHof(Math.max(0, VmL - d), exp)) / (2 * d);
+}
+
+/* ================= 游戏状态 ================= */
+// phase: drip1 → mark1 → drip2 → mark2 → compare
+let phase = "drip1";
+let expIdx = 0;
+let volume = 0;             // 已加 NaOH mL
+let pH = 1;
+let samples = [];           // 本次实验 [{V, pH}]
+let history = [];           // 已完成实验的 samples
+let drops = [];             // 下落水滴 {y}
+let ripples = [];           // 液面波纹 {r, a}
+let dripping = false, dripAcc = 0;
+let shownColor = 0;         // 粉色程度（动画插值）
+let pinkTold = false;       // 酚酞变色提示是否已出
+
+// 三个标注点
+const MARK_DEFS = [
+  { key:"start", label:"① 起点",     target:0,    tol:1.5, tip:"起点：一滴 NaOH 都还没加的时候（V = 0）" },
+  { key:"half",  label:"② 半中和点", target:VEQ/2, tol:2.0, tip:"半中和点：酸刚好被中和一半，V = 当量点的一半（12.5 mL）" },
+  { key:"eq",    label:"③ 当量点",   target:VEQ,  tol:2.0, tip:"当量点：酸碱恰好完全反应，在曲线突跃最陡的地方（25 mL）" },
+];
+let marks = [];             // 当前轮的标记实例
+function makeMarks() {
+  return MARK_DEFS.map(d => ({ def:d, state:"dock", V:0, ok:false, x:0, y:0, shake:0 }));
+}
+function dockPos(m) {   // 停靠位实时计算，窗口变化不错位
+  const i = marks.indexOf(m);
+  return { x: lay.chart.x0 + 80 + i * 150, y: lay.dockY };
+}
+
+function curExp() { return EXPS[expIdx]; }
+
+function startRun(idx) {
+  expIdx = idx; volume = 0; samples = [];
+  pH = pHof(0, curExp());
+  samples.push({ V:0, pH });
+  drops = []; ripples = []; pinkTold = false; shownColor = 0;
+  marks = makeMarks();
+  phase = idx === 0 ? "drip1" : "drip2";
+  updateUI();
+}
+function updateUI() {
+  const inDrip = phase === "drip1" || phase === "drip2";
+  dripBtn.style.display = inDrip ? "block" : "none";
+  doneBtn.style.display = inDrip ? "block" : "none";
+  replayBtn.style.display = phase === "compare" ? "block" : "none";
+  const e = curExp();
+  if (inDrip) {
+    scorebar.textContent = `实验${expIdx+1}：${e.name}（${e.sub}）· 已加 ${volume.toFixed(1)} mL · pH = ${pH.toFixed(2)}`;
+  } else if (phase === "mark1" || phase === "mark2") {
+    const n = marks.filter(m => m.ok).length;
+    scorebar.textContent = `实验${expIdx+1}：${e.name} · 拖动标记到曲线上 · 已标对 ${n} / 3`;
+  } else {
+    scorebar.textContent = "🔬 对比两条滴定曲线";
+  }
+}
+startRun(0);
+showHint("实验一：锥形瓶里是盐酸 + 酚酞。按住左下角按钮逐滴加入 NaOH，观察右侧 pH 曲线！");
+
+/* ================= 滴定过程 ================= */
+function addDrop() {
+  drops.push({ y: lay.tipY });
+  plip();
+}
+function stepDrip(dt) {
+  if (dripping && volume < VMAX) {
+    dripAcc += dt * 1000;
+    while (dripAcc >= DROP_MS && volume < VMAX) {
+      dripAcc -= DROP_MS;
+      addDrop();
+      if (volume >= VMAX) showHint("已到最大体积，点「停止滴加」去标注曲线吧");
+    }
+  } else {
+    dripAcc = 0;
+  }
+  // 水滴下落
+  const surfY = liquidSurfY();
+  for (let i = drops.length - 1; i >= 0; i--) {
+    const d = drops[i];
+    d.y += 620 * dt;
+    if (d.y >= surfY) {
+      drops.splice(i, 1);
+      ripples.push({ r:4, a:0.6 });
+      // 滴入体积，重算 pH
+      volume = Math.min(VMAX, volume + DROP_VOL);
+      pH = pHof(volume, curExp());
+      samples.push({ V:volume, pH });
+      if (!pinkTold && pH >= 8.3) {
+        pinkTold = true;
+        showHint("🌸 酚酞变粉了！留意此刻的体积 —— 它就在当量点附近");
+        pop(660);
+      }
+      updateUI();
+    }
+  }
+  for (let i = ripples.length - 1; i >= 0; i--) {
+    ripples[i].r += 60 * dt;
+    ripples[i].a -= 1.6 * dt;
+    if (ripples[i].a <= 0) ripples.splice(i, 1);
+  }
+  // 溶液颜色平滑过渡
+  const target = Math.max(0, Math.min(1, (pH - 8.2) / 1.8));
+  shownColor += (target - shownColor) * Math.min(1, dt * 6);
+}
+
+/* ================= 坐标换算 ================= */
+function vx(V)  { const c = lay.chart; return c.x0 + V / VMAX * (c.x1 - c.x0); }
+function py(p)  { const c = lay.chart; return c.y1 - p / 14 * (c.y1 - c.y0); }
+function toV(x) { const c = lay.chart; return (x - c.x0) / (c.x1 - c.x0) * VMAX; }
+function inChart(x, y) { const c = lay.chart; return x >= c.x0 - 10 && x <= c.x1 + 10 && y >= c.y0 - 10 && y <= c.y1 + 30; }
+function liquidSurfY() {
+  const frac = Math.min(1, (curExp().Va + volume) / 80);   // 80 mL 装满
+  const h = lay.flaskBotY - lay.flaskTopY - 46;
+  return lay.flaskBotY - 14 - h * Math.max(0.12, frac);
+}
+
+/* ================= 绘制：装置 ================= */
+function drawApparatus() {
+  const cx = lay.flaskCX;
+  // 背景
+  ctx.fillStyle = "#e4edf4";
+  ctx.fillRect(0, 0, lay.appW, H);
+
+  // --- 滴定管 ---
+  const btX = cx - 26, btW = 52, btTop = 66, btBot = lay.tipY - 26;
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.strokeStyle = "#7a93a8"; ctx.lineWidth = 2;
+  roundRect(btX, btTop, btW, btBot - btTop, 8); ctx.fill(); ctx.stroke();
+  // 管内 NaOH 液柱
+  const fillFrac = Math.max(0.06, 1 - volume / VMAX);
+  const fh = (btBot - btTop - 8) * fillFrac;
+  ctx.fillStyle = "rgba(120,180,255,0.55)";
+  ctx.fillRect(btX + 3, btBot - 4 - fh, btW - 6, fh);
+  // 刻度
+  ctx.strokeStyle = "#7a93a8"; ctx.lineWidth = 1;
+  ctx.fillStyle = "#4a6a82"; ctx.font = "11px sans-serif"; ctx.textAlign = "left";
+  for (let i = 0; i <= 4; i++) {
+    const y = btTop + 8 + (btBot - btTop - 16) * i / 4;
+    ctx.beginPath(); ctx.moveTo(btX + btW - 12, y); ctx.lineTo(btX + btW - 4, y); ctx.stroke();
+    ctx.fillText(String(i * 10), btX + btW + 4, y + 4);
+  }
+  ctx.save();
+  ctx.translate(btX - 12, (btTop + btBot) / 2); ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "center"; ctx.fillStyle = "#4a6a82"; ctx.font = "13px sans-serif";
+  ctx.fillText("NaOH 标准溶液 (mL)", 0, 0);
+  ctx.restore();
+  // 活塞
+  ctx.fillStyle = "#9fb6c6";
+  ctx.fillRect(btX - 8, btBot - 4, btW + 16, 10);
+  // 尖端
+  ctx.beginPath();
+  ctx.moveTo(cx - 7, btBot + 6); ctx.lineTo(cx + 7, btBot + 6);
+  ctx.lineTo(cx + 2, lay.tipY); ctx.lineTo(cx - 2, lay.tipY);
+  ctx.closePath(); ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.fill(); ctx.stroke();
+
+  // --- 锥形瓶 ---
+  const fTopY = lay.flaskTopY, fBotY = lay.flaskBotY;
+  const neckW = 26, botW = Math.min(150, lay.appW * 0.33);
+  ctx.beginPath();
+  ctx.moveTo(cx - neckW / 2, fTopY);
+  ctx.lineTo(cx - neckW / 2, fTopY + 30);
+  ctx.lineTo(cx - botW, fBotY - 14);
+  ctx.quadraticCurveTo(cx - botW, fBotY, cx - botW + 14, fBotY);
+  ctx.lineTo(cx + botW - 14, fBotY);
+  ctx.quadraticCurveTo(cx + botW, fBotY, cx + botW, fBotY - 14);
+  ctx.lineTo(cx + neckW / 2, fTopY + 30);
+  ctx.lineTo(cx + neckW / 2, fTopY);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.fill();
+  ctx.strokeStyle = "#7a93a8"; ctx.lineWidth = 2.5; ctx.stroke();
+  // 液体（裁剪到瓶形）
+  ctx.save(); ctx.clip();
+  const surfY = liquidSurfY();
+  const c0 = [232, 240, 248], c1 = [255, 105, 165];   // 无色→酚酞粉
+  const mix = shownColor;
+  ctx.fillStyle = `rgb(${Math.round(c0[0]+(c1[0]-c0[0])*mix)},${Math.round(c0[1]+(c1[1]-c0[1])*mix)},${Math.round(c0[2]+(c1[2]-c0[2])*mix)})`;
+  ctx.fillRect(cx - botW - 4, surfY, botW * 2 + 8, fBotY - surfY + 4);
+  // 搅拌旋涡
+  const t = performance.now() / 300;
+  ctx.strokeStyle = "rgba(255,255,255,0.65)"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.ellipse(cx, surfY + (fBotY - surfY) * 0.55, 30 + 16 * Math.sin(t), 8, 0, t % (Math.PI * 2), t % (Math.PI * 2) + 3.6);
+  ctx.stroke();
+  // 波纹
+  for (const r of ripples) {
+    ctx.strokeStyle = `rgba(255,255,255,${r.a})`; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.ellipse(cx, surfY + 3, r.r, r.r * 0.3, 0, 0, 7); ctx.stroke();
+  }
+  ctx.restore();
+  // 下落水滴
+  ctx.fillStyle = "#7db8ff";
+  for (const d of drops) {
+    ctx.beginPath(); ctx.ellipse(cx, d.y, 3.4, 5.2, 0, 0, 7); ctx.fill();
+  }
+  // 瓶标签
+  ctx.fillStyle = "#33506a"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(curExp().name + " + 酚酞", cx, fBotY + 24);
+
+  // --- pH 计读数 ---
+  const mx = 16, my = H * 0.52, mw = Math.min(150, lay.appW * 0.3), mh = 74;
+  ctx.fillStyle = "#2c3e50"; roundRect(mx, my, mw, mh, 10); ctx.fill();
+  ctx.fillStyle = "#9fe6a0"; roundRect(mx + 10, my + 10, mw - 20, 34, 6); ctx.fill();
+  ctx.fillStyle = "#123d12"; ctx.font = "bold 22px monospace"; ctx.textAlign = "center";
+  ctx.fillText("pH " + pH.toFixed(2), mx + mw / 2, my + 35);
+  ctx.fillStyle = "#cfe3ee"; ctx.font = "12px sans-serif";
+  ctx.fillText(`V(NaOH) = ${volume.toFixed(1)} mL`, mx + mw / 2, my + 62);
+}
+
+/* ================= 绘制：曲线图 ================= */
+function drawAxes() {
+  const c = lay.chart;
+  ctx.fillStyle = "#ffffff";
+  roundRect(c.x0 - 34, c.y0 - 34, c.x1 - c.x0 + 62, c.y1 - c.y0 + 66, 12); ctx.fill();
+  ctx.strokeStyle = "#c8d6e2"; ctx.lineWidth = 1.5;
+  roundRect(c.x0 - 34, c.y0 - 34, c.x1 - c.x0 + 62, c.y1 - c.y0 + 66, 12); ctx.stroke();
+  // 酚酞变色范围色带 pH 8.2~10
+  ctx.fillStyle = "rgba(255,105,165,0.12)";
+  ctx.fillRect(c.x0, py(10), c.x1 - c.x0, py(8.2) - py(10));
+  ctx.fillStyle = "rgba(214,48,110,0.55)"; ctx.font = "12px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("酚酞变色范围", c.x1 - 106, py(10) + 15);
+  // 网格 + 刻度
+  ctx.strokeStyle = "#e3ecf3"; ctx.lineWidth = 1;
+  ctx.fillStyle = "#5a7288"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+  for (let v = 0; v <= VMAX; v += 5) {
+    ctx.beginPath(); ctx.moveTo(vx(v), c.y0); ctx.lineTo(vx(v), c.y1); ctx.stroke();
+    ctx.fillText(String(v), vx(v), c.y1 + 18);
+  }
+  ctx.textAlign = "right";
+  for (let p = 0; p <= 14; p += 2) {
+    ctx.beginPath(); ctx.moveTo(c.x0, py(p)); ctx.lineTo(c.x1, py(p)); ctx.stroke();
+    ctx.fillText(String(p), c.x0 - 8, py(p) + 4);
+  }
+  // pH = 7 虚线
+  ctx.setLineDash([6, 5]); ctx.strokeStyle = "rgba(80,120,150,0.5)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(c.x0, py(7)); ctx.lineTo(c.x1, py(7)); ctx.stroke();
+  ctx.setLineDash([]);
+  // 轴标签
+  ctx.fillStyle = "#33506a"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("V(NaOH) / mL", (c.x0 + c.x1) / 2, c.y1 + 40);
+  ctx.save();
+  ctx.translate(c.x0 - 26, (c.y0 + c.y1) / 2); ctx.rotate(-Math.PI / 2);
+  ctx.fillText("pH", 0, 0);
+  ctx.restore();
+  // 当量点参考竖线（标注阶段才显示）
+  if (phase === "mark1" || phase === "mark2" || phase === "compare") {
+    ctx.setLineDash([4, 6]); ctx.strokeStyle = "rgba(214,48,110,0.35)";
+    ctx.beginPath(); ctx.moveTo(vx(VEQ), c.y0); ctx.lineTo(vx(VEQ), c.y1); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function drawCurve(pts, color, width, dashed) {
+  if (pts.length < 2) return;
+  ctx.save();
+  if (dashed) ctx.setLineDash([7, 6]);
+  ctx.strokeStyle = color; ctx.lineWidth = width;
+  ctx.lineJoin = "round"; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(vx(pts[0].V), py(pts[0].pH));
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(vx(pts[i].V), py(pts[i].pH));
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawChartContent() {
+  // 历史曲线（实验二及对比阶段淡显实验一）
+  if (history.length > 0 && expIdx === 1) drawCurve(history[0], "rgba(31,111,208,0.35)", 2.5, true);
+  // 当前曲线
+  const e = curExp();
+  drawCurve(samples, e.color, 3.5, false);
+
+  const inDrip = phase === "drip1" || phase === "drip2";
+  if (inDrip && samples.length >= 1) {
+    // 曲线头部亮点 + 切线（导数斜率可视化）
+    const hx = vx(volume), hy = py(pH);
+    const m = slopeAt(volume, e);
+    const dv = 2.2;   // 切线半长（mL）
+    const v0 = Math.max(0, volume - dv), v1 = Math.min(VMAX, volume + dv);
+    ctx.strokeStyle = "rgba(255,159,26,0.9)"; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(vx(v0), py(pH - m * (volume - v0)));
+    ctx.lineTo(vx(v1), py(pH + m * (v1 - volume)));
+    ctx.stroke();
+    ctx.beginPath(); ctx.arc(hx, hy, 7, 0, 7);
+    ctx.fillStyle = "#ff9f1a"; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.stroke();
+    // 斜率数值（橙色小标签）
+    const s = Math.abs(m);
+    const sTxt = `斜率 ${s.toFixed(2)}`;
+    ctx.font = "bold 13px sans-serif"; ctx.textAlign = "left";
+    const sw = ctx.measureText(sTxt).width;
+    const sx = Math.min(hx + 12, lay.chart.x1 - sw - 10), sy = Math.max(hy - 14, lay.chart.y0 + 16);
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    roundRect(sx - 4, sy - 14, sw + 8, 20, 6); ctx.fill();
+    ctx.fillStyle = s > 20 ? "#ff5252" : s > 3 ? "#e08900" : "#2fbf4a";
+    ctx.fillText(sTxt, sx, sy);
+    // 斜率仪表（装置区 pH 计下方，突跃时暴涨）
+    const gx = 16, gy = H * 0.52 + 86, gw = Math.min(150, lay.appW * 0.3);
+    const frac = Math.log10(1 + s) / Math.log10(1 + 130);
+    ctx.fillStyle = "#2c3e50"; roundRect(gx, gy, gw, 56, 10); ctx.fill();
+    ctx.fillStyle = "#cfe3ee"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("曲线斜率 dpH/dV", gx + gw / 2, gy + 17);
+    ctx.fillStyle = "rgba(255,255,255,0.15)";
+    roundRect(gx + 10, gy + 26, gw - 20, 16, 8); ctx.fill();
+    ctx.fillStyle = s > 20 ? "#ff5252" : s > 3 ? "#ffb800" : "#2fbf4a";
+    if (frac > 0.01) { roundRect(gx + 11, gy + 27, (gw - 22) * Math.min(1, frac), 14, 7); ctx.fill(); }
+  }
+
+  // 对比阶段的完整双曲线与标注
+  if (phase === "compare") {
+    drawCurve(history[0], EXPS[0].color, 3.5, false);
+    drawCurve(history[1], EXPS[1].color, 3.5, false);
+    anno(vx(0), py(pHof(0, EXPS[0])), "强酸起点 pH≈1.0", EXPS[0].color, 1);
+    anno(vx(0), py(pHof(0, EXPS[1])), "弱酸起点 pH≈2.9", EXPS[1].color, 1);
+    anno(vx(VEQ/2), py(4.74), "半中和点 pH=pKa≈4.74", EXPS[1].color, 1);
+    anno(vx(VEQ), py(7),   "盐酸当量点 pH=7", EXPS[0].color, 1);
+    anno(vx(VEQ), py(8.7), "醋酸当量点 pH≈8.7", EXPS[1].color, 1);
+  }
+}
+function anno(x, y, text, color, dir) {
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(x, y, 5, 0, 7); ctx.fill();
+  ctx.font = "bold 13px sans-serif"; ctx.textAlign = "left";
+  const tx = x + 10 * dir, ty = y - 8;
+  const w = ctx.measureText(text).width;
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  roundRect(tx - 4, ty - 14, w + 8, 20, 6); ctx.fill();
+  ctx.fillStyle = color; ctx.fillText(text, tx, ty);
+}
+
+/* ================= 绘制：标注标记 ================= */
+function drawMarks() {
+  if (phase !== "mark1" && phase !== "mark2") return;
+  // 停靠区提示
+  ctx.fillStyle = "#5a7288"; ctx.font = "14px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("把下面三个标记拖到曲线上对应的位置：", lay.chart.x0 - 20, lay.dockY - 40);
+  for (const m of marks) {
+    if (m.state === "drag") continue;
+    drawChip(m);
+  }
+  const drag = marks.find(m => m.state === "drag");
+  if (drag) drawChip(drag);
+}
+function drawChip(m) {
+  const r = 24;
+  let x, y;
+  if (m.state === "dock") { const p = dockPos(m); x = p.x; y = p.y; }
+  else { x = m.x; y = m.y; }
+  let color = "#8fa8bd";
+  if (m.state === "placed" || m.state === "locked") {
+    x = vx(m.V); y = py(pHof(m.V, curExp()));
+    color = m.ok ? "#2fbf4a" : "#ff7043";
+    // 旗杆指到曲线点
+    ctx.strokeStyle = color; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y - 26); ctx.stroke();
+    y -= 26;
+  }
+  if (m.shake > 0) x += Math.sin(m.shake * 40) * 4 * m.shake;
+  ctx.save();
+  ctx.shadowColor = "rgba(0,0,0,0.25)"; ctx.shadowBlur = 6; ctx.shadowOffsetY = 2;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+  ctx.fillStyle = m.state === "dock" ? "#ffffff" : color;
+  ctx.fill();
+  ctx.restore();
+  ctx.strokeStyle = color; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.stroke();
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillStyle = m.state === "dock" ? "#33506a" : "#ffffff";
+  ctx.fillText(m.def.label.slice(0, 1), x, y + 5);
+  ctx.fillStyle = "#33506a"; ctx.font = "13px sans-serif";
+  ctx.fillText(m.def.label.slice(2), x, y + r + 16);
+  if (m.ok && (m.state === "locked" || m.state === "placed")) {
+    ctx.fillStyle = "#2fbf4a"; ctx.font = "bold 13px sans-serif";
+    ctx.fillText(`✔ V=${m.V.toFixed(1)} mL`, x, y - r - 8);
+  }
+}
+
+/* ================= 绘制：对比讨论 ================= */
+function drawComparePanel() {
+  if (phase !== "compare") return;
+  const x = 20, y = H * 0.34, w = lay.appW - 40, lineH = 26;
+  const lines = [
+    "🔍 两条曲线比一比：",
+    "• 起点：强酸 pH≈1，弱酸 pH≈2.9（弱酸只部分电离）",
+    "• 前半段：醋酸曲线有一段平缓的「缓冲平台」",
+    "• 半中和点：弱酸的 pH 恰好等于它的 pKa ≈ 4.74",
+    "• 突跃：盐酸的突跃又高又陡（pH 4→10），",
+    "　醋酸的突跃明显变缓（约 pH 7→10）",
+    "• 当量点：盐酸 pH=7；醋酸 pH≈8.7，",
+    "　因为生成的 Ac⁻ 会水解使溶液显碱性",
+    "• 相同点：当量点都在 V = 25 mL！",
+    "　（酸的总量相同，需要的 NaOH 一样多）",
+  ];
+  const h = 40 + lines.length * lineH;
+  ctx.fillStyle = "rgba(255,255,255,0.94)";
+  roundRect(x, y, w, h, 14); ctx.fill();
+  ctx.strokeStyle = "#c8d6e2"; ctx.lineWidth = 1.5;
+  roundRect(x, y, w, h, 14); ctx.stroke();
+  ctx.textAlign = "left";
+  lines.forEach((s, i) => {
+    ctx.fillStyle = i === 0 ? "#1f4e79" : "#33506a";
+    ctx.font = (i === 0 ? "bold 17px" : "15px") + " sans-serif";
+    ctx.fillText(s, x + 18, y + 32 + i * lineH);
+  });
+}
+
+/* ================= 绘制总入口 ================= */
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#eef4f8";
+  ctx.fillRect(0, 0, W, H);
+  if (phase === "compare") {
+    // 对比阶段不画装置，图表区可以更大方地展示
+    drawAxes();
+    drawChartContent();
+    drawComparePanel();
+  } else {
+    drawApparatus();
+    drawAxes();
+    drawChartContent();
+    drawMarks();
+  }
+}
+
+/* ================= 交互 ================= */
+let dragMark = null;
+canvas.addEventListener("pointerdown", e => {
+  if (phase !== "mark1" && phase !== "mark2") return;
+  const x = e.clientX, y = e.clientY;
+  for (const m of marks) {
+    if (m.ok) continue;
+    let mx, my;
+    if (m.state === "dock") { const p = dockPos(m); mx = p.x; my = p.y; }
+    else { mx = vx(m.V); my = py(pHof(m.V, curExp())) - 26; }
+    if (Math.hypot(x - mx, y - my) < 34) {
+      dragMark = m; m.state = "drag";
+      canvas.setPointerCapture(e.pointerId);
+      pop(500);
+      break;
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragMark) return;
+  dragMark.x = e.clientX; dragMark.y = e.clientY;
+});
+window.addEventListener("pointerup", e => {
+  if (!dragMark) return;
+  const m = dragMark; dragMark = null;
+  if (inChart(e.clientX, e.clientY)) {
+    m.V = Math.max(0, Math.min(VMAX, toV(e.clientX)));
+    m.state = "placed";
+    const err = Math.abs(m.V - m.def.target);
+    if (err <= m.def.tol) {
+      m.ok = true; m.state = "locked";
+      pop(880); pop(1320);
+      const names = { start:"起点", half:"半中和点", eq:"当量点" };
+      showHint(`✔ ${names[m.def.key]}标对了！V = ${m.def.target} mL`);
+      updateUI();
+      if (marks.every(mm => mm.ok)) {
+        fanfare();
+        setTimeout(nextPhase, 1400);
+      }
+    } else {
+      m.shake = 1;
+      tone(220, 0.2, 0.1);
+      showHint("还不对哦 —— " + m.def.tip);
+    }
+  } else {
+    m.state = "dock";
+  }
+});
+// 抖动画衰减
+setInterval(() => { for (const m of marks) if (m.shake > 0) m.shake = Math.max(0, m.shake - 0.06); }, 30);
+
+function nextPhase() {
+  history[expIdx] = samples.slice();
+  if (expIdx === 0) {
+    startRun(1);
+    showHint("实验二：换成醋酸（弱酸），浓度体积都一样。再滴一次，注意曲线哪里不一样！");
+  } else {
+    phase = "compare";
+    updateUI();
+    fanfare();
+    showHint("🎉 两次滴定都完成了！看看左边总结的两条曲线差异");
+  }
+}
+
+// 按住滴加（DOM 按钮 + Pointer Events）
+dripBtn.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  dripping = true;
+  dripBtn.classList.add("holding");
+  dripBtn.setPointerCapture(e.pointerId);
+  ensureAudio();
+});
+function stopDrip() { dripping = false; dripBtn.classList.remove("holding"); }
+dripBtn.addEventListener("pointerup", stopDrip);
+dripBtn.addEventListener("pointercancel", stopDrip);
+dripBtn.addEventListener("lostpointercapture", stopDrip);
+
+doneBtn.addEventListener("click", () => {
+  if (volume < VEQ + 1) {
+    showHint(`再多加一点：要超过当量点（25 mL）才能看清完整突跃，现在是 ${volume.toFixed(1)} mL`);
+    tone(220, 0.2, 0.1);
+    return;
+  }
+  stopDrip();
+  phase = expIdx === 0 ? "mark1" : "mark2";
+  marks = makeMarks();
+  updateUI();
+  pop(660);
+  showHint("观察这条 S 形曲线：把三个标记拖到曲线上正确的位置");
+});
+replayBtn.addEventListener("click", () => {
+  history = [];
+  startRun(0);
+  pop(880);
+  showHint("实验一：盐酸 + 酚酞。按住按钮滴加 NaOH！");
+});
+
+// 提示条可点击关闭
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 4200);
+}
+hintEl.addEventListener("pointerdown", () => { hintEl.style.opacity = "0"; });
+showHint("实验一：锥形瓶里是盐酸 + 酚酞。按住左下角按钮逐滴加入 NaOH，观察右侧 pH 曲线！");
+
+/* ================= 音效 ================= */
+let actx = null;
+function ensureAudio() {
+  try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+}
+function tone(freq, dur, vol, type) {
+  try {
+    ensureAudio();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+const plip = () => tone(850 + Math.random() * 350, 0.06, 0.06, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  if (phase === "drip1" || phase === "drip2") stepDrip(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

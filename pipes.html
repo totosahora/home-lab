@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>水管小工匠</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #palette {
+    position:absolute; left:0; top:0; bottom:0; width:168px;
+    background:linear-gradient(180deg,#e5f7ee,#cdeede);
+    border-right:3px solid #6fc795;
+    padding:46px 8px 12px; z-index:10; user-select:none; overflow-y:auto;
+  }
+  .pal-title { position:absolute; top:12px; left:0; right:0; text-align:center;
+    font-size:18px; font-weight:bold; color:#1a6b3a; }
+  .pal-sec { font-size:12px; color:#3a7a50; font-weight:bold; margin:8px 0 4px 6px; }
+  .pal-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:0 4px; }
+  .pal-item {
+    padding:6px 0; border-radius:14px; background:#fff; border:2px solid #6fc795;
+    display:flex; flex-direction:column; align-items:center; gap:1px;
+    font-size:24px; cursor:grab; touch-action:none;
+    box-shadow:0 2px 5px rgba(0,0,0,0.12);
+  }
+  .pal-item:active { cursor:grabbing; transform:scale(1.05); }
+  .pal-item span { font-size:11px; color:#1a6b3a; font-weight:bold; }
+  .pal-item.active { background:#ffd54a; border-color:#e0a800; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,40,0.88); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:20;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,40,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:20; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:80%; text-align:center;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="palette">
+  <div class="pal-title">工具箱</div>
+</div>
+<div id="scorebar">🌱 已浇灌：0 株</div>
+<div id="hint">接管子、挖地道，把水引到每一株植物！点零件：↻ 转 90°、✕ 删除</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const paletteEl = document.getElementById("palette");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 棋盘 ================= */
+const COLS = 8, ROWS = 6;
+let CELL = 90, GX = 0, GY = 0;
+function fitView() {
+  const pw = paletteEl.offsetWidth;
+  CELL = Math.min((W - pw - 50) / COLS, (H - 50) / ROWS, 104);
+  GX = pw + (W - pw - CELL * COLS) / 2;
+  GY = (H - CELL * ROWS) / 2;
+  for (const p of pieces) if (!p.dragging && p.col >= 0) { const c = cellCenter(p.col, p.row); p.x = c[0]; p.y = c[1]; }
+}
+function cellCenter(col, row) { return [GX + col * CELL + CELL / 2, GY + row * CELL + CELL / 2]; }
+function cellAt(x, y) {
+  const col = Math.floor((x - GX) / CELL), row = Math.floor((y - GY) / CELL);
+  if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return null;
+  return [col, row];
+}
+
+/* ================= 地形与零件 ================= */
+// 地形: grass 草地 / dirt 泥土(可挖) / dug 地道 / cement 水泥(挖不动) / wall 砖墙(不通水)
+let terrain = [];
+// 开口方向位：N=1 E=2 S=4 W=8
+const BITS = [1, 2, 4, 8];
+const DIRS = [[0,-1],[1,0],[0,1],[-1,0]];
+const TYPES = {
+  straight:  { open:2|8,   name:"直管" },
+  elbow:     { open:1|2,   name:"弯管" },
+  tee:       { open:1|2|4, name:"三通" },
+  cross:     { open:15,    name:"四通" },
+  source:    { open:2,     name:"水龙头" },
+  fountain:  { open:8,     name:"喷泉" },
+  sprinkler: { open:8,     name:"灌溉喷头" },
+  plant:     { open:15,    name:"植物" }
+};
+const PLANTS = {
+  flower: { small:"🌱", big:"🌻", name:"小花" },
+  carrot: { small:"🥕", big:"🥕", name:"胡萝卜" },
+  tomato: { small:"🍅", big:"🍅", name:"番茄" },
+  cactus: { small:"🌵", big:"🌵", name:"仙人掌" }
+};
+const PIPE_COLORS = ["#ff9f43", "#2fbf4a", "#9b3de0", "#ff6b9d", "#2f7fe9"];
+function openBits(p) {
+  let b = 0;
+  for (let i = 0; i < 4; i++)
+    if (TYPES[p.type].open & BITS[i]) b |= BITS[(i + p.rot) % 4];
+  return b;
+}
+
+let pieces = [];   // {id, type, rot, col, row, x, y, color, plantKind, grownSince}
+let nextId = 1;
+let selected = null;
+let drag = null;
+let shovelMode = false;
+
+function pieceAtCell(col, row) { return pieces.find(p => p.col === col && p.row === row) || null; }
+function terrainAt(col, row) { return (terrain[row] || [])[col] || "grass"; }
+
+function addPiece(type, col, row, rot, extra) {
+  const p = Object.assign({
+    id:nextId++, type, rot:rot || 0, col, row, x:0, y:0,
+    color: PIPE_COLORS[Math.floor(Math.random() * PIPE_COLORS.length)],
+    plantKind: null, grownSince: 0
+  }, extra || {});
+  const c = cellCenter(col, row);
+  p.x = c[0]; p.y = c[1];
+  pieces.push(p);
+  return p;
+}
+
+function addInitialScene() {
+  // 地形：一条泥土带通向小花（需要孩子挖地道），砖墙挡路，水泥地做装饰
+  const set = (c, r, t) => { terrain[r][c] = t; };
+  [[3,2],[4,2],[5,2],[6,2],[5,3]].forEach(([c,r]) => set(c, r, "dirt"));
+  [[4,1],[6,1]].forEach(([c,r]) => set(c, r, "wall"));
+  [[3,4],[4,4]].forEach(([c,r]) => set(c, r, "cement"));
+  // 零件
+  addPiece("source", 0, 2, 0, { color:"#90a4ae" });
+  addPiece("straight", 1, 2, 0);
+  addPiece("straight", 2, 2, 0);
+  addPiece("sprinkler", 5, 4, 1, { color:"#90a4ae" });   // 开口朝北，等地道来水
+  addPiece("plant", 7, 2, 0, { plantKind:"flower", color:"#90a4ae" });
+  addPiece("plant", 6, 4, 0, { plantKind:"carrot", color:"#90a4ae" });
+  addPiece("plant", 1, 0, 0, { plantKind:"cactus", color:"#90a4ae" });
+}
+
+/* ================= 水流 ================= */
+let water = new Map();    // "col,row" -> depth
+let leaks = [];
+let flowStart = 0;
+let wateredPlants = 0, totalPlants = 0;
+let wonLast = false;
+
+function connects(p, d) { return (openBits(p) & BITS[d]) !== 0; }
+
+function recomputeFlow() {
+  const now = performance.now();
+  water = new Map();
+  leaks = [];
+  flowStart = now;
+  const key = (c, r) => c + "," + r;
+  const q = [];
+  for (const p of pieces) {
+    if (p.type === "source" && terrainAt(p.col, p.row) !== "wall") {
+      water.set(key(p.col, p.row), 0);
+      q.push({ col:p.col, row:p.row, piece:p, dug:false });
+    }
+  }
+  while (q.length) {
+    const cur = q.shift();
+    const depth = water.get(key(cur.col, cur.row));
+    for (let d = 0; d < 4; d++) {
+      // 当前格向 d 方向出水：地道四面通；零件要有开口
+      const aOut = cur.dug ? true : (cur.piece ? connects(cur.piece, d) : false);
+      if (!aOut) continue;
+      const nc = cur.col + DIRS[d][0], nr = cur.row + DIRS[d][1];
+      if (nc < 0 || nc >= COLS || nr < 0 || nr >= ROWS) { if (!cur.dug) addLeak(cur, d); continue; }
+      const nt = terrainAt(nc, nr);
+      if (nt === "wall") { if (!cur.dug) addLeak(cur, d); continue; }
+      const nb = pieceAtCell(nc, nr);
+      const bDug = nt === "dug" && !nb;
+      const bIn = bDug ? true : (nb ? connects(nb, (d + 2) % 4) : false);
+      if (!bIn) { if (!cur.dug) addLeak(cur, d); continue; }
+      if (water.has(key(nc, nr))) continue;
+      water.set(key(nc, nr), depth + 1);
+      // 植物是终点，不继续传水
+      if (nb && nb.type === "plant") continue;
+      q.push({ col:nc, row:nr, piece:nb || null, dug:bDug });
+    }
+  }
+  function addLeak(cell, d) {
+    const cx = cell.piece ? cell.piece.x : cellCenter(cell.col, cell.row)[0];
+    const cy = cell.piece ? cell.piece.y : cellCenter(cell.col, cell.row)[1];
+    leaks.push([cx + DIRS[d][0] * CELL / 2, cy + DIRS[d][1] * CELL / 2]);
+  }
+  // 植物浇灌统计（灌溉喷头可浇到相邻植物）
+  let grown = 0;
+  totalPlants = 0;
+  for (const p of pieces) {
+    if (p.type !== "plant") continue;
+    totalPlants++;
+    let ok = water.has(key(p.col, p.row));
+    if (!ok) {
+      for (let d = 0; d < 4; d++) {
+        const nb = pieceAtCell(p.col + DIRS[d][0], p.row + DIRS[d][1]);
+        if (nb && nb.type === "sprinkler" && water.has(key(nb.col, nb.row))) { ok = true; break; }
+      }
+    }
+    if (ok) {
+      grown++;
+      if (!p.grownSince) p.grownSince = now;
+    } else {
+      p.grownSince = 0;
+    }
+  }
+  wateredPlants = grown;
+  scorebar.textContent = `🌱 已浇灌：${grown} / ${totalPlants} 株`;
+  const won = totalPlants > 0 && grown >= totalPlants;
+  if (won && !wonLast) { fanfare(); showHint("🎉 所有植物都喝到水啦！了不起的小工匠！"); }
+  wonLast = won;
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawBackground() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#bfe3ff"); g.addColorStop(1, "#8fc7f0");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 草坪底板（带立体感：底部阴影）
+  ctx.fillStyle = "rgba(0,60,20,0.35)";
+  roundRect(GX - 10, GY - 4, CELL * COLS + 20, CELL * ROWS + 20, 20); ctx.fill();
+  const lg = ctx.createLinearGradient(0, GY, 0, GY + CELL * ROWS);
+  lg.addColorStop(0, "#8fd460"); lg.addColorStop(1, "#6fb844");
+  ctx.fillStyle = lg;
+  roundRect(GX - 10, GY - 10, CELL * COLS + 20, CELL * ROWS + 20, 20); ctx.fill();
+}
+
+// 地形（3D 立体：砖墙凸起有投影，地道凹陷有内阴影）
+function drawTerrain() {
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const t = terrain[r][c];
+    if (t === "grass") continue;
+    const x = GX + c * CELL, y = GY + r * CELL, m = 4, s = CELL - m * 2;
+    if (t === "dirt") {
+      ctx.fillStyle = "#a9743f";
+      roundRect(x + m, y + m, s, s, 8); ctx.fill();
+      ctx.fillStyle = "rgba(80,50,20,0.5)";
+      for (const [dx, dy] of [[0.25,0.3],[0.6,0.2],[0.45,0.6],[0.75,0.7],[0.2,0.75]]) {
+        ctx.beginPath(); ctx.arc(x + CELL * dx, y + CELL * dy, 3, 0, 7); ctx.fill();
+      }
+    } else if (t === "dug") {
+      // 凹陷：深色底 + 上/左内阴影 + 下/右亮边
+      ctx.fillStyle = "#4a3018";
+      roundRect(x + m, y + m, s, s, 8); ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,0.55)"; ctx.lineWidth = 5;
+      ctx.beginPath(); ctx.moveTo(x + m + 2, y + m + s); ctx.lineTo(x + m + 2, y + m + 2); ctx.lineTo(x + m + s, y + m + 2); ctx.stroke();
+      ctx.strokeStyle = "rgba(255,220,160,0.3)"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(x + m + s - 2, y + m + 4); ctx.lineTo(x + m + s - 2, y + m + s - 2); ctx.lineTo(x + m + 4, y + m + s - 2); ctx.stroke();
+    } else if (t === "cement") {
+      ctx.fillStyle = "#b9c0c7";
+      roundRect(x + m, y + m, s, s, 4); ctx.fill();
+      ctx.strokeStyle = "rgba(90,100,110,0.6)"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x + CELL/2, y + m + 4); ctx.lineTo(x + CELL/2 - 6, y + CELL - m - 6); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x + m + 4, y + CELL/2); ctx.lineTo(x + CELL - m - 4, y + CELL/2 + 5); ctx.stroke();
+    } else if (t === "wall") {
+      // 凸起投影
+      ctx.fillStyle = "rgba(0,0,0,0.3)";
+      roundRect(x + m + 3, y + m + 5, s, s, 6); ctx.fill();
+      ctx.fillStyle = "#b0552f";
+      roundRect(x + m, y + m, s, s, 6); ctx.fill();
+      ctx.strokeStyle = "#e8c8a8"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(x + m, y + CELL/2); ctx.lineTo(x + m + s, y + CELL/2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x + CELL/2, y + m); ctx.lineTo(x + CELL/2, y + CELL/2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x + CELL*0.25, y + CELL/2); ctx.lineTo(x + CELL*0.25, y + CELL - m); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x + CELL*0.75, y + CELL/2); ctx.lineTo(x + CELL*0.75, y + CELL - m); ctx.stroke();
+    }
+  }
+  // 地道之间的连接通道（深色宽条）
+  ctx.lineCap = "round";
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (terrain[r][c] !== "dug" || pieceAtCell(c, r)) continue;
+    const [cx, cy] = cellCenter(c, r);
+    ctx.strokeStyle = "#4a3018"; ctx.lineWidth = 26;
+    for (let d = 0; d < 4; d++) {
+      const nc = c + DIRS[d][0], nr = r + DIRS[d][1];
+      if (nc < 0 || nc >= COLS || nr < 0 || nr >= ROWS) continue;
+      const nb = pieceAtCell(nc, nr);
+      if (terrain[nr][nc] === "dug" || (nb && connects(nb, (d + 2) % 4))) {
+        ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + DIRS[d][0] * CELL / 2, cy + DIRS[d][1] * CELL / 2); ctx.stroke();
+      }
+    }
+  }
+}
+
+// 3D 水管：描边 → 管体 → 顶部高光 → 底部阴影
+function pipeStroke(p, frac) {
+  const ob = openBits(p);
+  const half = CELL / 2;
+  for (let d = 0; d < 4; d++) {
+    if (!(ob & BITS[d])) continue;
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.lineTo(p.x + DIRS[d][0] * half * frac, p.y + DIRS[d][1] * half * frac);
+    ctx.stroke();
+  }
+  ctx.beginPath(); ctx.arc(p.x, p.y, 14 * frac + 0.01, 0, 7); ctx.fill();
+}
+
+function drawPipePiece(p, now) {
+  const wDepth = water.has(p.col + "," + p.row) ? water.get(p.col + "," + p.row) : null;
+  ctx.save();
+  ctx.lineCap = "round";
+  // 立体层次
+  ctx.strokeStyle = "rgba(0,0,0,0.28)"; ctx.lineWidth = 30; ctx.fillStyle = "rgba(0,0,0,0.28)";
+  ctx.save(); ctx.translate(0, 2); pipeStroke(p, 1); ctx.restore();
+  ctx.strokeStyle = p.color; ctx.lineWidth = 26; ctx.fillStyle = p.color;
+  pipeStroke(p, 1);
+  ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 8; ctx.fillStyle = "rgba(255,255,255,0.4)";
+  ctx.save(); ctx.translate(0, -6); pipeStroke(p, 0.9); ctx.restore();
+  // 水（带流入动画）
+  if (wDepth !== null) {
+    const t = Math.max(0, Math.min(1, (now - flowStart - wDepth * 350) / 320));
+    if (t > 0) {
+      ctx.strokeStyle = "#35b6ff"; ctx.lineWidth = 15; ctx.fillStyle = "#35b6ff";
+      pipeStroke(p, t);
+      ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 4;
+      ctx.save(); ctx.translate(0, -3); pipeStroke(p, t * 0.9); ctx.restore();
+    }
+  }
+  ctx.restore();
+}
+
+function drawPiece(p, now) {
+  const wDepth = water.has(p.col + "," + p.row) ? water.get(p.col + "," + p.row) : null;
+  const watered = wDepth !== null;
+  const t = watered ? Math.max(0, Math.min(1, (now - flowStart - wDepth * 350) / 320)) : 0;
+  ctx.save();
+  if (p.type === "straight" || p.type === "elbow" || p.type === "tee" || p.type === "cross") {
+    drawPipePiece(p, now);
+  } else if (p.type === "source") {
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "#607d8b"; ctx.lineWidth = 24; ctx.fillStyle = "#607d8b";
+    pipeStroke(p, 1);
+    ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 7;
+    ctx.save(); ctx.translate(0, -5); pipeStroke(p, 0.9); ctx.restore();
+    if (t > 0) {
+      ctx.strokeStyle = "#35b6ff"; ctx.lineWidth = 13; ctx.fillStyle = "#35b6ff";
+      pipeStroke(p, t);
+    }
+    ctx.font = `${CELL * 0.5}px serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("🚰", p.x, p.y + 2);
+  } else if (p.type === "fountain") {
+    // 石盆
+    ctx.beginPath(); ctx.ellipse(p.x, p.y + 8, 26, 14, 0, 0, 7);
+    ctx.fillStyle = "#90a4ae"; ctx.fill();
+    ctx.strokeStyle = "#546e7a"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(p.x, p.y + 4, 20, 9, 0, 0, 7);
+    ctx.fillStyle = watered ? "#35b6ff" : "#78909c"; ctx.fill();
+    // 喷水粒子
+    if (t >= 1) {
+      for (let k = 0; k < 10; k++) {
+        const ph = (now / 700 + k * 0.13) % 1;
+        const side = k % 2 ? 1 : -1;
+        const dx = side * ph * ph * 26;
+        const dy = -ph * 52 + ph * ph * 52;
+        ctx.beginPath(); ctx.arc(p.x + dx, p.y + 2 + dy, 3.2, 0, 7);
+        ctx.fillStyle = `rgba(53,182,255,${0.9 - ph * 0.6})`; ctx.fill();
+      }
+      // 顶部水柱
+      ctx.strokeStyle = "rgba(120,210,255,0.9)"; ctx.lineWidth = 5; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(p.x, p.y + 2); ctx.lineTo(p.x, p.y - 34 - Math.sin(now / 150) * 4); ctx.stroke();
+    }
+  } else if (p.type === "sprinkler") {
+    ctx.beginPath(); ctx.arc(p.x, p.y, 12, 0, 7);
+    ctx.fillStyle = "#546e7a"; ctx.fill();
+    ctx.strokeStyle = "#37474f"; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, 7);
+    ctx.fillStyle = "#35b6ff"; ctx.fill();
+    if (t >= 1) {
+      // 四向旋转喷洒
+      const baseA = now / 500;
+      for (let k = 0; k < 4; k++) {
+        const a = baseA + k * Math.PI / 2;
+        for (let j = 1; j <= 4; j++) {
+          const rr = 14 + j * 7;
+          ctx.beginPath();
+          ctx.arc(p.x + Math.cos(a + j * 0.12) * rr, p.y + Math.sin(a + j * 0.12) * rr * 0.7, 2.6, 0, 7);
+          ctx.fillStyle = `rgba(53,182,255,${0.9 - j * 0.18})`; ctx.fill();
+        }
+      }
+    }
+  } else if (p.type === "plant") {
+    const pl = PLANTS[p.plantKind];
+    const grown = p.grownSince > 0;
+    const gt = grown ? Math.min(1, (now - p.grownSince) / 600) : 0;
+    const s = grown ? 0.55 + 0.45 * gt + (gt >= 1 ? Math.sin(now / 400) * 0.04 : 0) : 0.55;
+    ctx.globalAlpha = grown ? 1 : 0.6;
+    ctx.font = `${CELL * 0.56 * s / 0.55}px serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(grown ? pl.big : pl.small, p.x, p.y + 2);
+    ctx.globalAlpha = 1;
+    if (grown && gt >= 1 && Math.floor(now / 900) % 2 === 0) {
+      ctx.font = `${CELL * 0.2}px serif`;
+      ctx.fillText("✨", p.x + CELL * 0.3, p.y - CELL * 0.28);
+    }
+  }
+  ctx.restore();
+}
+
+// 地道里的水（带蔓延动画）
+function drawTunnelWater(now) {
+  ctx.save();
+  ctx.lineCap = "round";
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (terrain[r][c] !== "dug" || pieceAtCell(c, r)) continue;
+    const key = c + "," + r;
+    if (!water.has(key)) continue;
+    const t = Math.max(0, Math.min(1, (now - flowStart - water.get(key) * 350) / 320));
+    if (t <= 0) continue;
+    const [cx, cy] = cellCenter(c, r);
+    ctx.strokeStyle = "#35b6ff"; ctx.lineWidth = 13;
+    for (let d = 0; d < 4; d++) {
+      const nc = c + DIRS[d][0], nr = r + DIRS[d][1];
+      if (nc < 0 || nc >= COLS || nr < 0 || nr >= ROWS) continue;
+      const nb = pieceAtCell(nc, nr);
+      if (terrain[nr][nc] === "dug" || (nb && connects(nb, (d + 2) % 4))) {
+        ctx.beginPath(); ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + DIRS[d][0] * CELL / 2 * t, cy + DIRS[d][1] * CELL / 2 * t);
+        ctx.stroke();
+      }
+    }
+    ctx.beginPath(); ctx.arc(cx, cy, 9 * t + 0.01, 0, 7);
+    ctx.fillStyle = "#35b6ff"; ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawLeaks(now) {  for (const [x, y] of leaks) {
+    ctx.fillStyle = "rgba(53,182,255,0.35)";
+    ctx.beginPath(); ctx.ellipse(x, y, 18, 10, 0, 0, 7); ctx.fill();
+    for (let k = 0; k < 3; k++) {
+      const ph = (now / 300 + k * 0.37) % 1;
+      ctx.beginPath();
+      ctx.arc(x + (k - 1) * 8, y - 14 * Math.sin(ph * Math.PI), 3.5, 0, 7);
+      ctx.fillStyle = "rgba(53,182,255,0.8)"; ctx.fill();
+    }
+  }
+}
+
+function drawKnob(x, y, color, ring, icon) {
+  ctx.save();
+  ctx.beginPath(); ctx.arc(x, y, 16, 0, 7);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = ring; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = ring; ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(icon, x, y + 1);
+  ctx.restore();
+}
+function drawHandles() {
+  if (!selected || drag) return;
+  drawKnob(selected.x, selected.y - CELL / 2 - 22, "#ffd54a", "#a87800", "↻");
+  drawKnob(selected.x - CELL / 2 - 22, selected.y, "#ff5252", "#7f0000", "✕");
+  ctx.save();
+  ctx.setLineDash([8, 6]);
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3;
+  roundRect(selected.x - CELL / 2 + 3, selected.y - CELL / 2 + 3, CELL - 6, CELL - 6, 12);
+  ctx.stroke();
+  ctx.restore();
+}
+function drawDropHint() {
+  if (!drag || drag.mode !== "move") return;
+  const c = cellAt(drag.item.x, drag.item.y);
+  if (!c) return;
+  const [cx, cy] = cellCenter(c[0], c[1]);
+  const blocked = pieceAtCell(c[0], c[1]) || terrainAt(c[0], c[1]) === "wall" ||
+                  (drag.item.terrainTile ? false : terrainAt(c[0], c[1]) === "dug");
+  ctx.save();
+  ctx.fillStyle = blocked ? "rgba(255,82,82,0.25)" : "rgba(47,191,74,0.3)";
+  roundRect(cx - CELL / 2 + 3, cy - CELL / 2 + 3, CELL - 6, CELL - 6, 12);
+  ctx.fill();
+  ctx.restore();
+}
+function drawShovelCursor() {
+  if (!shovelMode) return;
+  ctx.save();
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.font = "28px serif";
+  ctx.fillText("🪏", mouseX + 10, mouseY + 24);
+  ctx.restore();
+}
+
+function draw(now) {
+  drawBackground();
+  drawTerrain();
+  drawTunnelWater(now);
+  for (const p of pieces) drawPiece(p, now);
+  drawLeaks(now);
+  drawDropHint();
+  drawHandles();
+  drawShovelCursor();
+  requestAnimationFrame(draw);
+}
+let mouseX = -100, mouseY = -100;
+
+/* ================= 音效 ================= */
+let actx = null;
+function pop(freq) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.12, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.15);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + 0.16);
+  } catch (e) {}
+}
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 交互 ================= */
+function canvasPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+}
+function hitPiece(wx, wy) {
+  for (let i = pieces.length - 1; i >= 0; i--) {
+    const p = pieces[i];
+    if (p.col >= 0 && Math.abs(wx - p.x) < CELL / 2 && Math.abs(wy - p.y) < CELL / 2) return p;
+  }
+  return null;
+}
+function overPalette(x, y) {
+  const r = paletteEl.getBoundingClientRect();
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+function dismissHint() { hintEl.style.opacity = "0"; }
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const [wx, wy] = canvasPos(e);
+  mouseX = e.clientX; mouseY = e.clientY;
+  dismissHint();
+  // 铲子模式：挖泥土 / 填回地道
+  if (shovelMode) {
+    const c = cellAt(wx, wy);
+    if (c) {
+      const t = terrainAt(c[0], c[1]);
+      if (pieceAtCell(c[0], c[1])) showHint("这里有零件，挖不动！");
+      else if (t === "dirt") { terrain[c[1]][c[0]] = "dug"; pop(300); recomputeFlow(); }
+      else if (t === "dug") { terrain[c[1]][c[0]] = "dirt"; pop(500); recomputeFlow(); }
+      else if (t === "cement") { showHint("水泥太硬了，挖不动！"); pop(180); }
+      else if (t === "wall") { showHint("砖墙挖不动！"); pop(180); }
+      else showHint("草地很平整，去挖棕色的泥土吧！");
+    }
+    return;
+  }
+  if (selected) {
+    const near = (x, y) => Math.hypot(wx - x, wy - y) < 22;
+    if (near(selected.x, selected.y - CELL / 2 - 22)) {   // 旋转 90°
+      selected.rot = (selected.rot + 1) % 4;
+      pop(760); recomputeFlow();
+      return;
+    }
+    if (near(selected.x - CELL / 2 - 22, selected.y)) {   // 删除
+      pieces = pieces.filter(i => i !== selected);
+      selected = null;
+      pop(220); recomputeFlow();
+      return;
+    }
+  }
+  const p = hitPiece(wx, wy);
+  if (p) {
+    selected = p;
+    drag = { mode:"move", item:p, offX:wx - p.x, offY:wy - p.y, origCol:p.col, origRow:p.row, isNew:false };
+    p.dragging = true;
+    pop(660);
+    canvas.setPointerCapture(e.pointerId);
+  } else {
+    selected = null;
+  }
+});
+window.addEventListener("pointermove", e => {
+  mouseX = e.clientX; mouseY = e.clientY;
+  if (!drag || drag.mode !== "move") return;
+  const [wx, wy] = canvasPos(e);
+  drag.item.x = wx - drag.offX;
+  drag.item.y = wy - drag.offY;
+});
+window.addEventListener("pointerup", e => {
+  if (drag && drag.mode === "terrainTile") {   // 材料拖放
+    const [wx, wy] = canvasPos(e);
+    placeTerrainTile(drag.kind, wx, wy);
+    drag = null;
+    return;
+  }
+  if (!drag) return;
+  const p = drag.item;
+  p.dragging = false;
+  if (drag.isNew && overPalette(e.clientX, e.clientY)) {
+    pieces = pieces.filter(i => i !== p);
+    if (selected === p) selected = null;
+  } else {
+    const c = cellAt(p.x, p.y);
+    const occupied = c && pieceAtCell(c[0], c[1]) && pieceAtCell(c[0], c[1]) !== p;
+    const badTerrain = c && (terrainAt(c[0], c[1]) === "wall" || terrainAt(c[0], c[1]) === "dug");
+    if (c && !occupied && !badTerrain) {
+      p.col = c[0]; p.row = c[1];
+      pop(880);
+    } else if (drag.isNew) {
+      pieces = pieces.filter(i => i !== p);
+      if (selected === p) selected = null;
+      if (c && badTerrain) showHint(terrainAt(c[0], c[1]) === "wall" ? "砖墙上不能放零件！" : "地道里不能放零件！");
+    } else {
+      p.col = drag.origCol; p.row = drag.origRow;
+      pop(440);
+    }
+    if (p.col >= 0) { const cc = cellCenter(p.col, p.row); p.x = cc[0]; p.y = cc[1]; }
+    recomputeFlow();
+  }
+  drag = null;
+});
+window.addEventListener("pointercancel", () => {
+  if (drag && drag.item) {
+    drag.item.dragging = false;
+    if (drag.isNew) pieces = pieces.filter(i => i !== drag.item);
+    else {
+      drag.item.col = drag.origCol; drag.item.row = drag.origRow;
+      const cc = cellCenter(drag.item.col, drag.item.row);
+      drag.item.x = cc[0]; drag.item.y = cc[1];
+    }
+  }
+  drag = null;
+});
+
+/* ================= 材料拖到棋盘 ================= */
+function placeTerrainTile(kind, wx, wy) {
+  const c = cellAt(wx, wy);
+  if (!c) return false;
+  if (pieceAtCell(c[0], c[1])) { showHint("这个格子有零件，先移开它！"); return false; }
+  terrain[c[1]][c[0]] = kind;
+  pop(700);
+  recomputeFlow();
+  return true;
+}
+
+/* ================= 工具箱 ================= */
+const PAL_SECTIONS = [
+  { sec:"水管", items:[
+    { type:"straight", label:"直管" }, { type:"elbow", label:"弯管" },
+    { type:"tee", label:"三通" }, { type:"cross", label:"四通" } ] },
+  { sec:"工具", items:[
+    { type:"source", label:"水龙头", icon:"🚰" },
+    { type:"fountain", label:"喷泉", icon:"⛲" },
+    { type:"sprinkler", label:"灌溉喷头", icon:"💦" } ] },
+  { sec:"植物", items:[
+    { type:"plant", plant:"flower", label:"小花", icon:"🌻" },
+    { type:"plant", plant:"carrot", label:"胡萝卜", icon:"🥕" },
+    { type:"plant", plant:"tomato", label:"番茄", icon:"🍅" },
+    { type:"plant", plant:"cactus", label:"仙人掌", icon:"🌵" } ] },
+  { sec:"材料", items:[
+    { terrain:"dirt", label:"泥土", icon:"🟤" },
+    { terrain:"cement", label:"水泥", icon:"⬜" },
+    { terrain:"wall", label:"砖墙", icon:"🧱" },
+    { terrain:"grass", label:"草地", icon:"🟩" } ] }
+];
+function buildPalette() {
+  for (const sec of PAL_SECTIONS) {
+    const h = document.createElement("div");
+    h.className = "pal-sec"; h.textContent = sec.sec;
+    paletteEl.appendChild(h);
+    const grid = document.createElement("div");
+    grid.className = "pal-grid";
+    for (const def of sec.items) {
+      const el = document.createElement("div");
+      el.className = "pal-item";
+      if (def.icon) {
+        el.innerHTML = `${def.icon}<span>${def.label}</span>`;
+      } else {
+        const cv = document.createElement("canvas");
+        cv.width = 40; cv.height = 40; cv.style.width = "40px"; cv.style.height = "40px";
+        const c2 = cv.getContext("2d");
+        c2.strokeStyle = "#6fc795"; c2.lineWidth = 9; c2.lineCap = "round";
+        const bits = TYPES[def.type].open;
+        for (let d = 0; d < 4; d++) {
+          if (!(bits & BITS[d])) continue;
+          c2.beginPath(); c2.moveTo(20, 20);
+          c2.lineTo(20 + DIRS[d][0] * 18, 20 + DIRS[d][1] * 18); c2.stroke();
+        }
+        c2.beginPath(); c2.arc(20, 20, 6, 0, 7); c2.fillStyle = "#6fc795"; c2.fill();
+        el.appendChild(cv);
+        const sp = document.createElement("span"); sp.textContent = def.label;
+        el.appendChild(sp);
+      }
+      el.addEventListener("pointerdown", e => {
+        e.preventDefault();
+        dismissHint();
+        if (def.terrain) {   // 材料：拖到格子直接变地形
+          drag = { mode:"terrainTile", kind:def.terrain };
+          return;
+        }
+        const pw = paletteEl.offsetWidth;
+        const x = Math.max(e.clientX, pw + CELL), y = e.clientY;
+        const p = {
+          id:nextId++, type:def.type, rot:0, col:-1, row:-1, x, y,
+          color: (def.type === "source" || def.type === "fountain" || def.type === "sprinkler" || def.type === "plant")
+                 ? "#90a4ae" : PIPE_COLORS[Math.floor(Math.random() * PIPE_COLORS.length)],
+          plantKind: def.plant || null, grownSince:0, dragging:true
+        };
+        pieces.push(p);
+        selected = p;
+        drag = { mode:"move", item:p, offX:0, offY:0, isNew:true };
+        pop(660);
+      });
+      grid.appendChild(el);
+    }
+    paletteEl.appendChild(grid);
+  }
+  // 铲子（挖地道开关）
+  const h = document.createElement("div");
+  h.className = "pal-sec"; h.textContent = "挖掘";
+  paletteEl.appendChild(h);
+  const grid = document.createElement("div");
+  grid.className = "pal-grid";
+  const sh = document.createElement("div");
+  sh.className = "pal-item"; sh.id = "shovelBtn";
+  sh.innerHTML = `🪏<span>挖地道</span>`;
+  sh.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    shovelMode = !shovelMode;
+    sh.classList.toggle("active", shovelMode);
+    showHint(shovelMode ? "铲子拿好了！点棕色泥土挖地道，再点地道填回去" : "放下铲子");
+    pop(shovelMode ? 700 : 400);
+  });
+  grid.appendChild(sh);
+  paletteEl.appendChild(grid);
+}
+buildPalette();
+
+// 材料拖放由上面的 pointerup 统一处理
+
+/* ================= 启动 ================= */
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+for (let r = 0; r < ROWS; r++) terrain.push(new Array(COLS).fill("grass"));
+resize();
+window.addEventListener("resize", resize);
+addInitialScene();
+recomputeFlow();
+requestAnimationFrame(draw);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

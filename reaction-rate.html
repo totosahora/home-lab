@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>反应速率实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#dfe9ee; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,50,0.85); color:#ffe08a; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,50,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10;
+    transition:opacity 0.6s; white-space:nowrap; cursor:pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">CaCO₃ + 2HCl → CaCl₂ + H₂O + CO₂↑ ｜ 曲线斜率 = 反应速率</div>
+<div id="hint">拖动滑杆设置条件，点「开始反应」观察气泡和天平读数；点这里可关闭提示</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 浓度 4 档（mol/L）；每杯初始总质量 100 g（烧杯+盐酸+大理石）
+const CONC_LEVELS = [0.5, 1, 2, 4];
+const M0 = 100;
+const TIME_SCALE = 4;          // 模拟时间 = 真实时间 ×4（慢反应也能看清）
+const CUP_COLORS = ["#e94f3d", "#2f7fe9"];   // 左红 / 右蓝
+const CUP_NAMES = ["左杯", "右杯"];
+
+// 每杯状态
+let cups = [];
+let nCups = 1;                 // 1 = 单杯，2 = 双杯对比
+function newCup() {
+  return {
+    temp: 25,                  // °C，20–60
+    concIdx: 1,                // CONC_LEVELS 下标
+    form: "chunk",             // chunk 块状 | powder 粉末
+    running: false, finished: false,
+    t: 0,                      // 模拟时间 s
+    bubbles: [],
+    history: [],               // [{t, m}]
+    popCd: 0
+  };
+}
+function resetCup(c) {
+  c.running = false; c.finished = false;
+  c.t = 0; c.bubbles = []; c.history = [];
+}
+function setMode(n) {
+  nCups = n;
+  cups = [];
+  for (let i = 0; i < n; i++) cups.push(newCup());
+  if (W > 0) layout();         // 杯数变了，重算布局（首次由 resize 统一算）
+}
+setMode(1);
+
+/* ================= 反应模型 ================= */
+// 速率常数 k：温度越高、浓度越大、接触面积越大，k 越大
+// m(t) = m0 - mMax·(1 - e^(-k·t))，斜率 dm/dt = -k·mMax·e^(-k·t)
+function conc(c) { return CONC_LEVELS[c.concIdx]; }
+function tempFactor(c) { return Math.pow(2, (c.temp - 20) / 20); } // 每 +20°C 约翻倍
+function surfFactor(c) { return c.form === "powder" ? 3 : 1; }
+function rateK(c) {
+  return Math.min(0.15, 0.02 * conc(c) * tempFactor(c) * surfFactor(c));
+}
+function co2Max(c) { return conc(c) * 1.1; }   // 盐酸有限、大理石过量：CO₂ 总量由浓度决定
+function progress(c) { return 1 - Math.exp(-rateK(c) * c.t); }
+function mass(c) { return M0 - co2Max(c) * progress(c); }
+function slopeNow(c) { return -rateK(c) * co2Max(c) * Math.exp(-rateK(c) * c.t); } // g/s
+
+/* ================= 布局 ================= */
+let graph = null;              // 图表面板 rect
+let cupUI = [];                // 每杯的烧杯/天平/控件 rect
+let modeBtns = [];             // 单杯 / 双杯对比 按钮
+
+function layout() {
+  const topBar = 58, bottomBar = 52;
+  const gw = Math.min(430, Math.max(290, W * 0.32));
+  graph = { x: W - gw - 16, y: topBar + 14, w: gw, h: H - topBar - bottomBar - 26 };
+  const areaX = 14, areaY = topBar + 34;
+  const areaW = Math.max(260, graph.x - 30 - areaX);
+  const areaH = H - areaY - bottomBar;
+  modeBtns = [
+    { x: areaX, y: 14, w: 86, h: 32, n: 1, label: "单杯" },
+    { x: areaX + 94, y: 14, w: 110, h: 32, n: 2, label: "双杯对比" }
+  ];
+  cupUI = [];
+  const colW = areaW / nCups;
+  for (let i = 0; i < nCups; i++) {
+    const us = Math.max(0.55, Math.min(1, areaH / 500, colW / 330));
+    const cx = areaX + i * colW + colW / 2;
+    const bw = 200 * us, bh = 200 * us;
+    const bTop = areaY + 4 * us;
+    const beaker = { x: cx - bw / 2, y: bTop, w: bw, h: bh };
+    const bal = { x: cx - 112 * us, y: bTop + bh, w: 224 * us, h: 72 * us };
+    const cy0 = bal.y + bal.h + 12 * us;
+    const slW = 240 * us;
+    cupUI.push({
+      us, cx, beaker, bal,
+      tempSlider: { x: cx - slW / 2, y: cy0 + 26 * us, w: slW, h: 20 * us },
+      concSlider: { x: cx - slW / 2, y: cy0 + 70 * us, w: slW, h: 20 * us },
+      formBtns: [
+        { x: cx - 116 * us, y: cy0 + 100 * us, w: 112 * us, h: 30 * us, form: "chunk", label: "🧱 块状" },
+        { x: cx + 4 * us,   y: cy0 + 100 * us, w: 112 * us, h: 30 * us, form: "powder", label: "🥄 粉末" }
+      ],
+      startBtn: { x: cx - 116 * us, y: cy0 + 140 * us, w: 112 * us, h: 34 * us },
+      resetBtn: { x: cx + 4 * us,   y: cy0 + 140 * us, w: 112 * us, h: 34 * us }
+    });
+  }
+}
+
+/* ================= 物理/反应推进 ================= */
+function physics(dt) {
+  for (let i = 0; i < cups.length; i++) {
+    const c = cups[i];
+    if (!c.running) continue;
+    c.t += dt * TIME_SCALE;
+    // 记录质量曲线（每 0.25 秒模拟时间记一个点）
+    const m = mass(c);
+    const h = c.history;
+    if (h.length === 0 || c.t - h[h.length - 1].t > 0.25) h.push({ t: c.t, m });
+    // 冒气泡：速率越猛泡越多
+    spawnBubbles(c, i, dt);
+    // 反应结束
+    if (progress(c) >= 0.999) {
+      c.running = false; c.finished = true;
+      const h2 = c.history; h2.push({ t: c.t, m: mass(c) });
+      onFinish();
+    }
+  }
+  // 气泡上升
+  for (let i = 0; i < cups.length; i++) {
+    const c = cups[i], ui = cupUI[i];
+    if (!ui) continue;
+    const liq = liquidRect(ui.beaker);
+    for (const b of c.bubbles) {
+      b.y -= b.vy * dt;
+      b.x += Math.sin(b.wob + b.y * 0.08) * 18 * dt;
+      b.wob += dt * 6;
+      if (b.y < liq.y + 4) {
+        b.dead = true;
+        c.popCd -= dt;
+        if (c.popCd <= 0 && c.running) { pop(500 + Math.random() * 700); c.popCd = 0.1 + Math.random() * 0.15; }
+      }
+    }
+    c.bubbles = c.bubbles.filter(b => !b.dead);
+  }
+}
+
+function liquidRect(bk) {
+  // 液面高度约杯身 68%
+  return { x: bk.x + 8, y: bk.y + bk.h * 0.26, w: bk.w - 16, h: bk.h * 0.68 };
+}
+function marbleZone(ui) {
+  const liq = liquidRect(ui.beaker);
+  return { x0: liq.x + 16, x1: liq.x + liq.w - 16, y: liq.y + liq.h - 14 };
+}
+function spawnBubbles(c, i, dt) {
+  const ui = cupUI[i];
+  if (!ui) return;
+  const k = rateK(c);
+  const rate = Math.min(85, 1200 * k * (1 - progress(c)));  // 个/秒
+  c._acc = (c._acc || 0) + rate * dt;
+  const mz = marbleZone(ui);
+  while (c._acc >= 1) {
+    c._acc -= 1;
+    c.bubbles.push({
+      x: mz.x0 + Math.random() * (mz.x1 - mz.x0),
+      y: mz.y - Math.random() * 6,
+      r: 2 + Math.random() * 3.2 * ui.us + Math.min(2.5, k * 14),
+      vy: (34 + Math.random() * 40 + k * 260) * ui.us,
+      wob: Math.random() * 6.28
+    });
+  }
+}
+
+function onFinish() {
+  if (nCups === 2 && cups.every(c => c.finished)) {
+    fanfare();
+    showHint("🎉 两组反应都结束啦！比较两条曲线：斜率越陡，反应越快");
+  } else if (nCups === 1) {
+    fanfare();
+    showHint("🎉 反应结束！曲线先陡后平——盐酸越剩越少，速率越来越慢");
+  } else {
+    pop(880);
+  }
+}
+
+/* ================= 交互 ================= */
+let drag = null;   // {cup, kind:"temp"|"conc"}
+
+function inRect(x, y, r) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+function locked(c) { return c.running || c.finished; }
+
+function startAll() {
+  let any = false;
+  for (const c of cups) {
+    if (!c.finished && !c.running) { c.running = true; any = true; }
+  }
+  if (!any) return;
+  whoosh();
+  if (nCups === 2) {
+    const [a, b] = cups;
+    let diff = 0;
+    if (a.temp !== b.temp) diff++;
+    if (a.concIdx !== b.concIdx) diff++;
+    if (a.form !== b.form) diff++;
+    if (diff === 1) showHint("✅ 只有一个变量不同——这就是标准的对照实验！");
+    else if (diff === 0) showHint("两杯条件完全相同，曲线应该几乎重合。试试只改一个变量！");
+    else showHint("💡 小提示：一次只改一个变量，才知道是谁影响了速率哦");
+  } else {
+    showHint("观察：气泡越猛 → 天平读数掉得越快 → 曲线越陡");
+  }
+}
+function resetAll() {
+  for (const c of cups) resetCup(c);
+  pop(660);
+  showHint("已重置，调好条件再来一次！双杯模式记得一次只改一个变量");
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+  // 模式切换
+  for (const b of modeBtns) {
+    if (inRect(x, y, b)) { setMode(b.n); pop(760); return; }
+  }
+  for (let i = 0; i < nCups; i++) {
+    const c = cups[i], ui = cupUI[i];
+    if (!ui) continue;
+    // 开始 / 重置（双杯时两边按钮等效：同时进行）
+    if (inRect(x, y, ui.startBtn)) { startAll(); return; }
+    if (inRect(x, y, ui.resetBtn)) { resetAll(); return; }
+    if (locked(c)) {
+      if (inRect(x, y, ui.tempSlider) || inRect(x, y, ui.concSlider) ||
+          ui.formBtns.some(b => inRect(x, y, b))) {
+        showHint("反应进行中，先点「重置」再改条件哦");
+        return;
+      }
+      continue;
+    }
+    // 温度滑杆
+    if (inRect(x, y, inflate(ui.tempSlider, 12))) { drag = { cup: i, kind: "temp" }; setTemp(c, ui, x); tick(); return; }
+    // 浓度滑杆
+    if (inRect(x, y, inflate(ui.concSlider, 12))) { drag = { cup: i, kind: "conc" }; setConc(c, ui, x); tick(); return; }
+    // 块状/粉末切换
+    for (const b of ui.formBtns) {
+      if (inRect(x, y, b)) {
+        if (c.form !== b.form) { c.form = b.form; pop(b.form === "powder" ? 980 : 620); }
+        return;
+      }
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const c = cups[drag.cup], ui = cupUI[drag.cup];
+  if (drag.kind === "temp") setTemp(c, ui, e.clientX);
+  else setConc(c, ui, e.clientX);
+});
+window.addEventListener("pointerup", () => { drag = null; });
+
+function inflate(r, d) { return { x: r.x - d, y: r.y - d, w: r.w + 2 * d, h: r.h + 2 * d }; }
+function setTemp(c, ui, x) {
+  const s = ui.tempSlider;
+  const f = Math.max(0, Math.min(1, (x - s.x) / s.w));
+  c.temp = Math.round(20 + f * 40);
+}
+function setConc(c, ui, x) {
+  const s = ui.concSlider;
+  const f = Math.max(0, Math.min(1, (x - s.x) / s.w));
+  c.concIdx = Math.min(3, Math.round(f * 3));
+}
+const tick = () => tone(1500, 0.03, 0.05, "square");
+
+hintEl.addEventListener("pointerdown", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+function drawBackground() {
+  // 墙面
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#e8f1f5"); g.addColorStop(1, "#cfdde4");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 实验台
+  const benchY = H - 150;
+  const g2 = ctx.createLinearGradient(0, benchY, 0, H);
+  g2.addColorStop(0, "#c99a63"); g2.addColorStop(1, "#a3763f");
+  ctx.fillStyle = g2; ctx.fillRect(0, benchY, W, H - benchY);
+  ctx.fillStyle = "rgba(255,255,255,0.25)"; ctx.fillRect(0, benchY, W, 4);
+}
+
+function drawModeButtons() {
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (const b of modeBtns) {
+    const on = nCups === b.n;
+    ctx.fillStyle = on ? "#2f7fe9" : "rgba(255,255,255,0.85)";
+    roundRect(b.x, b.y, b.w, b.h, 16, true);
+    ctx.strokeStyle = on ? "#1a4fa0" : "rgba(0,0,0,0.25)"; ctx.lineWidth = 2;
+    roundRect(b.x, b.y, b.w, b.h, 16, false, true);
+    ctx.fillStyle = on ? "#fff" : "#33414c";
+    ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+  }
+}
+
+function drawBeaker(i) {
+  const c = cups[i], ui = cupUI[i], bk = ui.beaker, us = ui.us;
+  const liq = liquidRect(bk);
+  // 杯名标签
+  ctx.font = `bold ${Math.round(15 * us + 4)}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = CUP_COLORS[i];
+  ctx.fillText(nCups === 2 ? CUP_NAMES[i] : "烧杯", bk.x + bk.w / 2, bk.y - 12 * us);
+  // 温度计（杯左侧）
+  drawThermo(c, bk.x - 20 * us, bk.y + 14 * us, bk.h * 0.6, us);
+  // 液体（浓度越大颜色越深，仅作可视化）
+  const alpha = 0.28 + c.concIdx * 0.13;
+  ctx.fillStyle = `rgba(80,160,235,${alpha})`;
+  ctx.fillRect(liq.x, liq.y, liq.w, liq.h);
+  // 液面
+  ctx.fillStyle = `rgba(140,200,245,${alpha + 0.15})`;
+  ctx.fillRect(liq.x, liq.y, liq.w, 3);
+  // 大理石
+  drawMarble(c, ui, liq);
+  // 气泡
+  for (const b of c.bubbles) {
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, 7);
+    ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.fill();
+    ctx.strokeStyle = "rgba(120,180,230,0.9)"; ctx.lineWidth = 1; ctx.stroke();
+  }
+  // 杯壁（玻璃）
+  ctx.strokeStyle = "rgba(60,90,110,0.75)"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(bk.x + 4, bk.y);
+  ctx.lineTo(bk.x + 4, bk.y + bk.h - 8);
+  ctx.quadraticCurveTo(bk.x + 4, bk.y + bk.h, bk.x + 14, bk.y + bk.h);
+  ctx.lineTo(bk.x + bk.w - 14, bk.y + bk.h);
+  ctx.quadraticCurveTo(bk.x + bk.w - 4, bk.y + bk.h, bk.x + bk.w - 4, bk.y + bk.h - 8);
+  ctx.lineTo(bk.x + bk.w - 4, bk.y);
+  ctx.stroke();
+  // 杯口高光
+  ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(bk.x + 8, bk.y + 6); ctx.lineTo(bk.x + 8, bk.y + bk.h * 0.4); ctx.stroke();
+  // 条件标注（画在杯内液面上方，避免被天平遮挡）
+  ctx.font = `${Math.round(12 * us + 3)}px sans-serif`;
+  ctx.fillStyle = "rgba(40,60,75,0.85)";
+  ctx.fillText(`${c.temp}°C · ${conc(c)} mol/L · ${c.form === "powder" ? "粉末" : "块状"}`,
+    bk.x + bk.w / 2, bk.y + 16 * us);
+  // 结束标记（画在条件标注下方，避免重叠）
+  if (c.finished) {
+    ctx.font = `bold ${Math.round(14 * us + 4)}px sans-serif`;
+    ctx.fillStyle = "#2f9e4f";
+    ctx.fillText("✔ 反应结束", bk.x + bk.w / 2, bk.y + 36 * us);
+  }
+}
+
+function drawThermo(c, x, y, h, us) {
+  const w = 9 * us + 3;
+  ctx.fillStyle = "rgba(255,255,255,0.8)";
+  roundRect(x - w / 2, y, w, h, w / 2, true);
+  ctx.strokeStyle = "rgba(60,90,110,0.6)"; ctx.lineWidth = 1.5;
+  roundRect(x - w / 2, y, w, h, w / 2, false, true);
+  const f = (c.temp - 20) / 40;
+  const mh = (h - 8) * f;
+  ctx.fillStyle = f > 0.6 ? "#e94f3d" : f > 0.3 ? "#ff8a3d" : "#ffb84d";
+  ctx.fillRect(x - w / 2 + 2, y + h - 4 - mh, w - 4, mh);
+  ctx.beginPath(); ctx.arc(x, y + h + 2, w * 0.85, 0, 7); ctx.fill();
+}
+
+function drawMarble(c, ui, liq) {
+  const mz = marbleZone(ui);
+  const midX = (mz.x0 + mz.x1) / 2;
+  if (c.form === "chunk") {
+    // 三块不规则大理石
+    const stones = [[-34, 0, 15], [0, -3, 18], [34, 0, 14]];
+    for (const [dx, dy, r] of stones) {
+      ctx.beginPath();
+      for (let a = 0; a <= 7; a++) {
+        const ang = a / 7 * Math.PI * 2;
+        const rr = r * (0.85 + 0.15 * Math.sin(a * 3 + dx));
+        const px = midX + dx * ui.us + Math.cos(ang) * rr * ui.us;
+        const py = mz.y + dy * ui.us + Math.sin(ang) * rr * 0.7 * ui.us;
+        if (a === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fillStyle = "#d8d4cc"; ctx.fill();
+      ctx.strokeStyle = "rgba(90,90,90,0.5)"; ctx.lineWidth = 1.5; ctx.stroke();
+    }
+  } else {
+    // 粉末堆
+    ctx.beginPath();
+    ctx.ellipse(midX, mz.y + 4 * ui.us, 52 * ui.us, 13 * ui.us, 0, Math.PI, 0);
+    ctx.closePath();
+    ctx.fillStyle = "#e2ded6"; ctx.fill();
+    ctx.strokeStyle = "rgba(90,90,90,0.35)"; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = "rgba(160,155,145,0.6)";
+    for (let k = 0; k < 26; k++) {
+      const px = midX + (Math.sin(k * 12.9898) * 0.5) * 92 * ui.us;
+      const py = mz.y + 3 * ui.us - Math.abs(Math.sin(k * 78.233)) * 10 * ui.us;
+      ctx.beginPath(); ctx.arc(px, py, 1.4, 0, 7); ctx.fill();
+    }
+  }
+}
+
+function drawBalance(i) {
+  const c = cups[i], ui = cupUI[i], bal = ui.bal, us = ui.us;
+  // 秤体
+  ctx.fillStyle = "#3d4854";
+  roundRect(bal.x, bal.y + 10 * us, bal.w, bal.h - 10 * us, 8 * us, true);
+  // 秤盘
+  ctx.fillStyle = "#9aa7b4";
+  roundRect(bal.x + bal.w * 0.18, bal.y, bal.w * 0.64, 12 * us, 5 * us, true);
+  // 液晶屏
+  const lcd = { x: bal.x + bal.w * 0.16, y: bal.y + 24 * us, w: bal.w * 0.68, h: bal.h - 36 * us };
+  ctx.fillStyle = "#0e2a1a";
+  roundRect(lcd.x, lcd.y, lcd.w, lcd.h, 5 * us, true);
+  ctx.font = `bold ${Math.round(lcd.h * 0.62)}px "Courier New",monospace`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = c.running ? "#7dffb0" : "#4fbf7f";
+  ctx.fillText(mass(c).toFixed(2) + " g", lcd.x + lcd.w / 2, lcd.y + lcd.h / 2 + 1);
+}
+
+function drawControls(i) {
+  const c = cups[i], ui = cupUI[i], us = ui.us;
+  const dim = locked(c) ? 0.45 : 1;
+  ctx.save();
+  ctx.globalAlpha = dim;
+  // 温度滑杆
+  drawSlider(ui.tempSlider, (c.temp - 20) / 40, `🌡 温度 ${c.temp}°C`,
+    "#ff8a3d", us);
+  // 浓度滑杆（4 档）
+  drawSlider(ui.concSlider, c.concIdx / 3, `🧪 浓度 ${conc(c)} mol/L（4 档）`,
+    "#2f7fe9", us, 4);
+  // 块状/粉末
+  ctx.font = `bold ${Math.round(13 * us + 3)}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (const b of ui.formBtns) {
+    const on = c.form === b.form;
+    ctx.fillStyle = on ? "#7a4a20" : "rgba(255,255,255,0.9)";
+    roundRect(b.x, b.y, b.w, b.h, 8 * us, true);
+    ctx.strokeStyle = on ? "#5a3010" : "rgba(0,0,0,0.3)"; ctx.lineWidth = 2;
+    roundRect(b.x, b.y, b.w, b.h, 8 * us, false, true);
+    ctx.fillStyle = on ? "#ffe0b0" : "#33414c";
+    ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+  }
+  ctx.restore();
+  // 开始 / 重置
+  ctx.font = `bold ${Math.round(14 * us + 3)}px sans-serif`;
+  const sb = ui.startBtn, rb = ui.resetBtn;
+  const canStart = !c.running && !c.finished;
+  ctx.fillStyle = canStart ? "#2fbf4a" : "#9aa7b4";
+  roundRect(sb.x, sb.y, sb.w, sb.h, 10 * us, true);
+  ctx.fillStyle = "#fff";
+  ctx.fillText(c.running ? "反应中…" : c.finished ? "已结束" : (nCups === 2 ? "▶ 同时开始" : "▶ 开始反应"),
+    sb.x + sb.w / 2, sb.y + sb.h / 2 + 1);
+  ctx.fillStyle = "#e9a13b";
+  roundRect(rb.x, rb.y, rb.w, rb.h, 10 * us, true);
+  ctx.fillStyle = "#fff";
+  ctx.fillText("↺ 重置", rb.x + rb.w / 2, rb.y + rb.h / 2 + 1);
+}
+
+function drawSlider(s, f, label, color, us, notches) {
+  const cy = s.y + s.h / 2;
+  ctx.font = `${Math.round(12 * us + 3)}px sans-serif`;
+  ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+  ctx.fillStyle = "#33414c";
+  ctx.fillText(label, s.x, s.y - 4);
+  // 轨道
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  roundRect(s.x, cy - 4, s.w, 8, 4, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 1.5;
+  roundRect(s.x, cy - 4, s.w, 8, 4, false, true);
+  // 档位刻度
+  if (notches) {
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    for (let k = 0; k < notches; k++) {
+      const nx = s.x + s.w * k / (notches - 1);
+      ctx.beginPath(); ctx.arc(nx, cy, 3, 0, 7); ctx.fill();
+    }
+  }
+  // 已填充段
+  ctx.fillStyle = color;
+  roundRect(s.x, cy - 4, s.w * f, 8, 4, true);
+  // 手柄
+  const kx = s.x + s.w * f;
+  ctx.beginPath(); ctx.arc(kx, cy, 11 * us + 2, 0, 7);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.stroke();
+}
+
+function drawGraph() {
+  const g = graph;
+  // 面板
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  roundRect(g.x, g.y, g.w, g.h, 14, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.2)"; ctx.lineWidth = 2;
+  roundRect(g.x, g.y, g.w, g.h, 14, false, true);
+  ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#33414c";
+  ctx.fillText("📈 质量 – 时间曲线（斜率 = 反应速率）", g.x + g.w / 2, g.y + 20);
+
+  // 绘图区（底部预留图例空间）
+  const p = { x: g.x + 46, y: g.y + 44, w: g.w - 64, h: g.h - 168 };
+  const yTop = M0 + 0.3, yBot = 94.5;                     // g
+  let xMax = 240;
+  for (const c of cups) if (c.t > xMax * 0.9) xMax = Math.ceil(c.t / 120) * 120;
+  const X = t => p.x + p.w * t / xMax;
+  const Y = m => p.y + p.h * (yTop - m) / (yTop - yBot);
+  // 网格与坐标
+  ctx.strokeStyle = "rgba(0,0,0,0.12)"; ctx.lineWidth = 1;
+  ctx.font = "11px sans-serif"; ctx.fillStyle = "#6a7683";
+  for (let m = 95; m <= 100; m++) {
+    ctx.beginPath(); ctx.moveTo(p.x, Y(m)); ctx.lineTo(p.x + p.w, Y(m)); ctx.stroke();
+    ctx.textAlign = "right"; ctx.fillText(m + "", p.x - 5, Y(m));
+  }
+  const xStep = xMax > 120 ? 60 : 30;
+  for (let t = 0; t <= xMax; t += xStep) {
+    ctx.beginPath(); ctx.moveTo(X(t), p.y); ctx.lineTo(X(t), p.y + p.h); ctx.stroke();
+    ctx.textAlign = "center"; ctx.fillText(t + "", X(t), p.y + p.h + 12);
+  }
+  ctx.strokeStyle = "#33414c"; ctx.lineWidth = 2;
+  ctx.strokeRect(p.x, p.y, p.w, p.h);
+  ctx.textAlign = "center"; ctx.fillStyle = "#33414c";
+  ctx.fillText("时间 t / s（×4 加速）", p.x + p.w / 2, p.y + p.h + 28);
+  ctx.save();
+  ctx.translate(g.x + 16, p.y + p.h / 2); ctx.rotate(-Math.PI / 2);
+  ctx.fillText("质量 m / g", 0, 0);
+  ctx.restore();
+
+  // 曲线
+  for (let i = 0; i < cups.length; i++) {
+    const c = cups[i], col = CUP_COLORS[i];
+    if (c.history.length < 2) continue;
+    ctx.strokeStyle = col; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(X(0), Y(M0));
+    for (const pt of c.history) ctx.lineTo(X(pt.t), Y(pt.m));
+    ctx.stroke();
+    // 最新点 + 切线（直观看到"斜率"）
+    const last = c.history[c.history.length - 1];
+    ctx.beginPath(); ctx.arc(X(last.t), Y(last.m), 5, 0, 7);
+    ctx.fillStyle = col; ctx.fill();
+    if (c.running || c.finished) {
+      const slope = slopeNow(c);                            // g/s（负）
+      const dpx = 42;
+      // 切线方向：Δx 取 dpx，Δy = -slope·(px/g)/(px/s)·Δx
+      const pxPerS = p.w / xMax, pxPerG = p.h / (yTop - yBot);
+      const ty = -slope * pxPerG / pxPerS * dpx;
+      ctx.save();
+      ctx.setLineDash([7, 5]);
+      ctx.strokeStyle = col; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(X(last.t) - dpx, Y(last.m) - ty);
+      ctx.lineTo(X(last.t) + dpx, Y(last.m) + ty);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+      // 当前速率读数（左杯标在点上方、右杯标在点下方，避免两个标签打架）
+      ctx.font = "bold 12px sans-serif"; ctx.textAlign = "left";
+      ctx.fillStyle = col;
+      const rate = Math.abs(slopeNow(c));
+      ctx.fillText(c.finished ? "速率≈0（结束）" : `速率≈${rate.toFixed(3)} g/s`,
+        Math.min(X(last.t) + 10, p.x + p.w - 110), Y(last.m) + (i === 0 ? -12 : 18));
+    }
+  }
+  // 空状态提示
+  if (cups.every(c => c.history.length < 2)) {
+    ctx.font = "14px sans-serif"; ctx.textAlign = "center";
+    ctx.fillStyle = "rgba(60,80,95,0.55)";
+    ctx.fillText("点「开始反应」后，这里会实时画出质量下降曲线", p.x + p.w / 2, p.y + p.h / 2 - 10);
+    ctx.fillText("曲线越陡 → 气体逸出越快 → 反应速率越大", p.x + p.w / 2, p.y + p.h / 2 + 12);
+  }
+  // 图例
+  ctx.font = "13px sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  let ly = g.y + g.h - 66;
+  for (let i = 0; i < cups.length; i++) {
+    const c = cups[i];
+    ctx.fillStyle = CUP_COLORS[i];
+    ctx.fillRect(g.x + 20, ly - 6, 22, 5);
+    ctx.fillStyle = "#33414c";
+    const name = nCups === 2 ? CUP_NAMES[i] : "烧杯";
+    ctx.fillText(`${name}：${c.temp}°C · ${conc(c)} mol/L · ${c.form === "powder" ? "粉末" : "块状"}`,
+      g.x + 50, ly - 2);
+    ly += 20;
+  }
+  ctx.fillStyle = "rgba(60,80,95,0.6)"; ctx.font = "12px sans-serif";
+  ctx.fillText("CO₂ 气体逸出 → 天平读数下降；虚线为当前切线", g.x + 20, ly - 2);
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawModeButtons();
+  for (let i = 0; i < nCups; i++) {
+    drawBalance(i);
+    drawBeaker(i);
+    drawControls(i);
+  }
+  drawGraph();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+resize();
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+const whoosh = () => tone(320, 0.25, 0.1, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3200);
+}
+
+// 测试钩子（无头浏览器验证用）
+window.__lab = {
+  get cups() { return cups; },
+  physics, startAll, resetAll, setMode, mass, rateK, slopeNow, draw
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

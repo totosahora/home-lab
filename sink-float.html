@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>沉浮小实验</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#bfe3f2; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,80,0.85); color:#fff; padding:10px 22px;
+    border-radius:24px; font-size:16px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="hint">从左边工具箱把东西拖进大水缸，看看谁会沉、谁会浮！点一下水里的东西可以按 ✕ 拿走</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 布局 ================= */
+// 左侧工具箱 + 中央玻璃水缸 + 底部木台面，全部用屏幕坐标
+const TB = { w: 150 };
+const tank = { x0:0, y0:0, x1:0, y1:0, ix0:0, ix1:0, surface:0, floor:0 };
+let counterTop = 0;
+let slots = [];   // 工具箱格子 {x, y, w, h}
+
+function layout() {
+  TB.w = Math.max(120, Math.min(170, W * 0.15));
+  counterTop = H * 0.85;
+  tank.y1 = counterTop;
+  tank.y0 = H * 0.13;
+  tank.x0 = TB.w + W * 0.09;
+  tank.x1 = W - W * 0.06;
+  tank.ix0 = tank.x0 + 14;
+  tank.ix1 = tank.x1 - 14;
+  tank.floor = tank.y1 - 14;
+  tank.surface = tank.y0 + (tank.y1 - tank.y0) * 0.16;
+  slots = [];
+  const n = ITEMS.length;
+  const slotH = Math.min(82, (H - 96) / n);
+  for (let i = 0; i < n; i++) {
+    slots.push({ x: 12, y: 66 + i * slotH, w: TB.w - 24, h: slotH - 8 });
+  }
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 物体 ================= */
+// kind: sink 沉 / float 浮 / sponge 海绵（先浮后沉）；above = 浮在水面上时露出水面的比例
+const ITEMS = [
+  { emoji:"🔑", name:"钥匙", kind:"sink",   r:21, above:0    },
+  { emoji:"🪵", name:"木头", kind:"float",  r:33, above:0.38 },
+  { emoji:"🪨", name:"石头", kind:"sink",   r:26, above:0    },
+  { emoji:"🍎", name:"苹果", kind:"float",  r:26, above:0.30 },
+  { emoji:"🪶", name:"羽毛", kind:"float",  r:24, above:0.70 },
+  { emoji:"⚓", name:"锚",   kind:"sink",   r:30, above:0    },
+  { emoji:"🧽", name:"海绵", kind:"sponge", r:26, above:0.30 },
+  { emoji:"🎈", name:"气球", kind:"float",  r:30, above:0.60 },
+];
+// 状态: drag 被拖着 / fall 空中下落 / sink 下沉 / rise 上浮 / float 浮在水面
+//       restBottom 躺在缸底 / restCounter 放在台面上
+let objs = [];
+
+function spawn(ti, x, y) {
+  const t = ITEMS[ti];
+  const o = {
+    ti, emoji:t.emoji, name:t.name, kind:t.kind, r:t.r, above:t.above,
+    x, y, vx:0, vy:0, state:"drag",
+    t: Math.random() * 6, phase: Math.random() * 6.28,
+    soak: 0, sinkSpeed: 90, bt: 0,
+  };
+  objs.push(o);
+  return o;
+}
+function floatY(o) { return tank.surface - o.r * o.above; }
+
+/* ================= 粒子（水花、气泡、涟漪） ================= */
+let parts = [];
+let ambT = 0;
+
+function splash(x, y, r) {
+  const n = 10 + Math.floor(r / 3);
+  for (let i = 0; i < n; i++) {
+    const a = -Math.PI / 2 + (Math.random() - 0.5) * 2.2;
+    const sp = 120 + Math.random() * 260;
+    parts.push({ kind:"drop", x, y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp,
+                 r:2 + Math.random()*3, life:0.7 + Math.random()*0.3 });
+  }
+  parts.push({ kind:"ring", x, y, r: r * 0.6, life: 0.6 });
+}
+function bubble(x, y, r) {
+  parts.push({ kind:"bubble", x, y, r: r || 2 + Math.random() * 3.5,
+               vy: 45 + Math.random() * 40, seed: Math.random() * 6.28, life: 9 });
+}
+
+/* ================= 物理 ================= */
+const GRAV = 1500;
+
+function enterWater(o, fromFall) {
+  o.x = Math.max(tank.ix0 + o.r, Math.min(tank.ix1 - o.r, o.x));
+  if (o.kind === "sink") {
+    o.state = "sink"; o.sinkSpeed = 85 + Math.random() * 25;
+    o.vy = Math.min(o.vy * 0.25, 70);
+    showHint(`咕嘟咕嘟…${o.name}沉下去啦！`);
+  } else {
+    if (o.kind === "sponge") { o.soak = 0; showHint("🧽 海绵轻飘飘，先浮在水面上哦"); }
+    else showHint(`哇，${o.name}浮在水面上！`);
+    o.vy = 0;
+    o.state = o.y > floatY(o) + 2 ? "rise" : "float";
+  }
+  pop(880);
+}
+
+function physics(dt) {
+  // 缸里装饰小气泡
+  ambT -= dt;
+  if (ambT <= 0) {
+    ambT = 0.4 + Math.random() * 0.6;
+    bubble(tank.ix0 + 20 + Math.random() * (tank.ix1 - tank.ix0 - 40), tank.floor - 4);
+  }
+  for (const o of objs) {
+    o.t += dt;
+    switch (o.state) {
+      case "fall": {
+        o.vy += GRAV * dt;
+        o.y += o.vy * dt; o.x += o.vx * dt;
+        if (o.vy > 0 && o.y >= tank.surface && o.x > tank.ix0 && o.x < tank.ix1 && o.y < tank.floor) {
+          splash(o.x, tank.surface, o.r);   // 扑通入水
+          plop();
+          enterWater(o, true);
+        } else if (o.y + o.r >= counterTop) {
+          o.y = counterTop - o.r; o.vy = 0; o.vx = 0;
+          o.state = "restCounter";
+          thud();
+        }
+        break;
+      }
+      case "sink": {
+        o.vy = Math.min(o.vy + 300 * dt, o.sinkSpeed);
+        o.y += o.vy * dt;
+        o.x = Math.max(tank.ix0 + o.r, Math.min(tank.ix1 - o.r, o.x));
+        o.bt -= dt;
+        if (o.bt <= 0) { o.bt = 0.12 + Math.random() * 0.15; bubble(o.x + (Math.random()-0.5)*o.r, o.y - o.r*0.5); }
+        // 落到缸底，或叠在别的沉底物体上
+        let target = tank.floor - o.r;
+        for (const p of objs) {
+          if (p === o || p.state !== "restBottom") continue;
+          const dx = Math.abs(o.x - p.x), rr = o.r + p.r;
+          if (dx < rr * 0.75) target = Math.min(target, p.y - rr * 0.8);
+        }
+        if (o.y >= target) { o.y = target; o.vy = 0; o.state = "restBottom"; blip(); }
+        break;
+      }
+      case "rise": {
+        o.y -= 110 * dt;
+        o.bt -= dt;
+        if (o.bt <= 0) { o.bt = 0.2 + Math.random() * 0.2; bubble(o.x + (Math.random()-0.5)*o.r, o.y); }
+        if (o.y <= floatY(o)) { o.y = floatY(o); o.state = "float"; }
+        break;
+      }
+      case "float": {
+        o.y = floatY(o) + Math.sin(o.t * 2.4 + o.phase) * 3.2;   // 轻轻上下浮动
+        o.x += Math.sin(o.t * 0.8 + o.phase) * 9 * dt;
+        o.x = Math.max(tank.ix0 + o.r, Math.min(tank.ix1 - o.r, o.x));
+        // 海绵喝饱水后慢慢下沉
+        if (o.kind === "sponge") {
+          o.soak += dt;
+          if (o.soak > 3) {
+            o.state = "sink"; o.sinkSpeed = 50; o.vy = 0;
+            showHint("🧽 海绵喝饱水了，慢慢沉下去啦！");
+            pop(300);
+          }
+        }
+        break;
+      }
+    }
+  }
+  // 浮着的物体互相轻轻推开，别叠在一起
+  for (let i = 0; i < objs.length; i++) {
+    const a = objs[i];
+    if (a.state !== "float") continue;
+    for (let j = i + 1; j < objs.length; j++) {
+      const b = objs[j];
+      if (b.state !== "float") continue;
+      const dx = b.x - a.x, rr = a.r + b.r + 6;
+      if (Math.abs(dx) < rr) {
+        const push = (rr - Math.abs(dx)) * 0.5 * (dx >= 0 ? 1 : -1);
+        a.x -= push; b.x += push;
+        a.x = Math.max(tank.ix0 + a.r, Math.min(tank.ix1 - a.r, a.x));
+        b.x = Math.max(tank.ix0 + b.r, Math.min(tank.ix1 - b.r, b.x));
+      }
+    }
+  }
+  // 粒子
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.life -= dt;
+    if (p.kind === "drop") {
+      p.vy += GRAV * 0.7 * dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      if (p.y > tank.surface + 6 || p.life <= 0) parts.splice(i, 1);
+    } else if (p.kind === "bubble") {
+      p.y -= p.vy * dt;
+      p.x += Math.sin(p.y * 0.05 + p.seed) * 0.6;
+      if (p.y < tank.surface + 3 || p.life <= 0) parts.splice(i, 1);
+    } else if (p.kind === "ring") {
+      p.r += 90 * dt;
+      if (p.life <= 0) parts.splice(i, 1);
+    }
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#cdeaf7"); g.addColorStop(1, "#a8d8ee");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 标题
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "bold 30px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.fillStyle = "rgba(20,60,100,0.85)";
+  ctx.fillText("🛁 沉浮小实验室", TB.w + (W - TB.w) / 2, H * 0.055);
+}
+
+function drawCounter() {
+  const g = ctx.createLinearGradient(0, counterTop, 0, H);
+  g.addColorStop(0, "#d9a355"); g.addColorStop(1, "#b9823c");
+  ctx.fillStyle = g; ctx.fillRect(0, counterTop, W, H - counterTop);
+  ctx.strokeStyle = "rgba(120,80,30,0.3)"; ctx.lineWidth = 2;
+  for (let y = counterTop + 22; y < H; y += 22) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+  ctx.fillStyle = "rgba(120,80,30,0.5)";
+  ctx.fillRect(0, counterTop, W, 4);
+}
+
+function drawObj(o) {
+  ctx.save();
+  ctx.translate(o.x, o.y);
+  if (o.state === "restBottom") ctx.rotate(Math.sin(o.phase) * 0.15);
+  ctx.font = (o.r * 1.7) + "px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(o.emoji, 0, o.r * 0.06);
+  ctx.restore();
+}
+
+function drawTankBack() {
+  // 玻璃后壁
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.fillRect(tank.x0, tank.y0, tank.x1 - tank.x0, tank.y1 - tank.y0);
+}
+
+function drawWater() {
+  // 半透明蓝色水体
+  const g = ctx.createLinearGradient(0, tank.surface, 0, tank.y1);
+  g.addColorStop(0, "rgba(80,170,235,0.42)");
+  g.addColorStop(1, "rgba(25,100,185,0.48)");
+  ctx.fillStyle = g;
+  ctx.fillRect(tank.ix0, tank.surface, tank.ix1 - tank.ix0, tank.y1 - tank.surface - 8);
+  // 水面波浪线
+  const t = performance.now() / 1000;
+  ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (let x = tank.ix0; x <= tank.ix1; x += 8) {
+    const y = tank.surface + Math.sin(x * 0.06 + t * 2.5) * 2.5;
+    if (x === tank.ix0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function drawTankGlass() {
+  // 玻璃边框（上口敞开）
+  ctx.strokeStyle = "rgba(230,245,255,0.95)"; ctx.lineWidth = 10;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(tank.x0 + 5, tank.y0);
+  ctx.lineTo(tank.x0 + 5, tank.y1 - 5);
+  ctx.lineTo(tank.x1 - 5, tank.y1 - 5);
+  ctx.lineTo(tank.x1 - 5, tank.y0);
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(120,170,210,0.5)"; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(tank.x0 + 11, tank.y0);
+  ctx.lineTo(tank.x0 + 11, tank.y1 - 11);
+  ctx.lineTo(tank.x1 - 11, tank.y1 - 11);
+  ctx.lineTo(tank.x1 - 11, tank.y0);
+  ctx.stroke();
+  // 玻璃高光
+  ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 6;
+  ctx.beginPath();
+  ctx.moveTo(tank.x0 + 26, tank.y0 + 26);
+  ctx.lineTo(tank.x0 + 26, tank.y1 - 60);
+  ctx.stroke();
+}
+
+function drawParts() {
+  for (const p of parts) {
+    if (p.kind === "drop") {
+      ctx.fillStyle = "rgba(220,240,255," + Math.max(0, p.life) + ")";
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+    } else if (p.kind === "bubble") {
+      ctx.strokeStyle = "rgba(255,255,255,0.75)"; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.stroke();
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.beginPath(); ctx.arc(p.x - p.r * 0.3, p.y - p.r * 0.3, p.r * 0.35, 0, 7); ctx.fill();
+    } else if (p.kind === "ring") {
+      ctx.strokeStyle = "rgba(255,255,255," + Math.max(0, p.life) + ")";
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.ellipse(p.x, p.y, p.r, p.r * 0.25, 0, 0, 7); ctx.stroke();
+    }
+  }
+}
+
+function drawToolbox() {
+  ctx.fillStyle = "rgba(255,255,255,0.8)";
+  roundRect(6, 8, TB.w - 12, H - 16, 18); ctx.fill();
+  ctx.strokeStyle = "rgba(90,140,190,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "bold 20px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.fillStyle = "#1c4a75";
+  ctx.fillText("🧰 工具箱", TB.w / 2, 38);
+  slots.forEach((s, i) => {
+    ctx.fillStyle = "rgba(230,243,252,0.95)";
+    roundRect(s.x, s.y, s.w, s.h, 12); ctx.fill();
+    ctx.strokeStyle = "rgba(90,140,190,0.45)"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.font = Math.min(34, s.h * 0.52) + "px sans-serif";
+    ctx.fillText(ITEMS[i].emoji, s.x + s.w / 2, s.y + s.h * 0.36);
+    ctx.font = "13px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.fillStyle = "#2a5a85";
+    ctx.fillText(ITEMS[i].name, s.x + s.w / 2, s.y + s.h * 0.78);
+  });
+}
+
+function drawHandle(o) {
+  const hx = o.x + o.r * 0.95, hy = o.y - o.r * 0.95;
+  ctx.strokeStyle = "rgba(255,82,82,0.8)"; ctx.lineWidth = 2;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.arc(o.x, o.y, o.r + 5, 0, 7); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath(); ctx.moveTo(o.x + o.r * 0.4, o.y - o.r * 0.4); ctx.lineTo(hx, hy); ctx.stroke();
+  ctx.beginPath(); ctx.arc(hx, hy, 17, 0, 7);
+  ctx.fillStyle = "#ff5252"; ctx.fill();
+  ctx.strokeStyle = "#7f0000"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 18px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("✕", hx, hy + 1);
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawCounter();
+  // 台面上的物体（在缸后面）
+  for (const o of objs) if (o.state === "restCounter") drawObj(o);
+  drawTankBack();
+  // 水中物体（水体染色之前画沉底的）
+  for (const o of objs) if (["sink","rise","restBottom"].includes(o.state)) drawObj(o);
+  drawWater();
+  drawParts();
+  // 浮在水面的物体画在水面上层
+  for (const o of objs) if (o.state === "float") drawObj(o);
+  drawTankGlass();
+  // 空中的和被拖着的画最上层
+  for (const o of objs) if (["fall","drag"].includes(o.state)) drawObj(o);
+  if (selected) drawHandle(selected);
+  drawToolbox();
+}
+
+/* ================= 交互 ================= */
+let dragObj = null, activeId = null, selected = null;
+let dragOff = { x:0, y:0 }, downPos = null, moved = false, prevState = null;
+
+function objectHit(x, y) {
+  for (let i = objs.length - 1; i >= 0; i--) {
+    const o = objs[i];
+    if (Math.hypot(x - o.x, y - o.y) < o.r + 8) return o;
+  }
+  return null;
+}
+function toolboxHit(x, y) {
+  for (let i = 0; i < slots.length; i++) {
+    const s = slots[i];
+    if (x >= s.x && x <= s.x + s.w && y >= s.y && y <= s.y + s.h) return i;
+  }
+  return -1;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  // 删除手柄
+  if (selected) {
+    const hx = selected.x + selected.r * 0.95, hy = selected.y - selected.r * 0.95;
+    if (Math.hypot(x - hx, y - hy) < 22) {
+      objs = objs.filter(o => o !== selected);
+      selected = null;
+      pop(280);
+      showHint("拿走啦！");
+      return;
+    }
+  }
+  // 工具箱拖出新物体
+  const ti = toolboxHit(x, y);
+  if (ti >= 0) {
+    const s = slots[ti];
+    const o = spawn(ti, s.x + s.w / 2, s.y + s.h * 0.36);
+    dragObj = o; activeId = e.pointerId; moved = true;
+    dragOff = { x:0, y:0 };
+    selected = null;
+    showHint(`猜猜看：${o.name}会沉到水底，还是浮在水面上？🤔`);
+    pop(660);
+    canvas.setPointerCapture(e.pointerId);
+    hintDismiss();
+    return;
+  }
+  // 舞台上的物体
+  const o = objectHit(x, y);
+  if (o) {
+    dragObj = o; activeId = e.pointerId;
+    downPos = [x, y]; moved = false;
+    prevState = o.state;
+    o.state = "drag"; o.vx = 0; o.vy = 0;
+    dragOff = { x: o.x - x, y: o.y - y };
+    objs = objs.filter(v => v !== o); objs.push(o);   // 提到最上层
+    canvas.setPointerCapture(e.pointerId);
+    return;
+  }
+  selected = null;
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!dragObj || e.pointerId !== activeId) return;
+  const x = e.clientX, y = e.clientY;
+  if (downPos && Math.hypot(x - downPos[0], y - downPos[1]) > 7) moved = true;
+  dragObj.x = Math.max(dragObj.r, Math.min(W - dragObj.r, x + dragOff.x));
+  dragObj.y = Math.max(dragObj.r, Math.min(H - dragObj.r, y + dragOff.y));
+});
+
+function dropObj(o) {
+  if (o.x > tank.ix0 && o.x < tank.ix1 && o.y < tank.surface - o.r * 0.5) {
+    o.state = "fall"; o.vy = 0; o.vx = 0;   // 水面上方松手：自由落体入水
+  } else if (o.x > tank.ix0 && o.x < tank.ix1 && o.y < tank.floor) {
+    enterWater(o, false);                   // 直接放进水里
+  } else {
+    o.state = "fall"; o.vy = 0; o.vx = 0;   // 缸外：落到台面上
+    o.x = Math.max(TB.w + o.r + 4, o.x);    // 别掉到工具箱后面拿不到
+  }
+}
+
+window.addEventListener("pointerup", e => {
+  if (!dragObj || e.pointerId !== activeId) return;
+  const o = dragObj;
+  dragObj = null; activeId = null;
+  if (!moved) {
+    // 轻点：选中/取消选中
+    o.state = prevState;
+    selected = selected === o ? null : o;
+    if (selected) pop(700);
+  } else {
+    selected = null;
+    dropObj(o);
+  }
+});
+window.addEventListener("pointercancel", e => {
+  if (dragObj && e.pointerId === activeId) {
+    dragObj.state = prevState || "restCounter";
+    dragObj = null; activeId = null;
+  }
+});
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+function sweep(f0, f1, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine";
+    o.frequency.setValueAtTime(f0, actx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(f1, actx.currentTime + dur);
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const plop = () => { sweep(520, 110, 0.22, 0.2); tone(90, 0.18, 0.12, "triangle"); };
+const thud = () => tone(130, 0.12, 0.13, "square");
+const blip = () => tone(900 + Math.random() * 300, 0.06, 0.05);
+
+/* ================= 提示条 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2400);
+}
+function hintDismiss() {
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+
+/* ================= 主循环 ================= */
+resize();
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

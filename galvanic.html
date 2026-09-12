@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>原电池与电解</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#dde6ee; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #modebar { position:absolute; top:12px; left:12px; display:flex; gap:8px; z-index:10; }
+  #modebar button {
+    font-size:15px; font-weight:bold; padding:9px 16px; border-radius:22px; border:none;
+    background:rgba(255,255,255,0.88); color:#345; cursor:pointer; box-shadow:0 2px 6px rgba(0,0,0,0.15);
+  }
+  #modebar button.on { background:#2f7fe9; color:#fff; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(25,35,50,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:16px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(25,35,50,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  .gasBtn {
+    position:absolute; z-index:11; display:none; font-size:15px; font-weight:bold;
+    padding:8px 14px; border-radius:20px; border:none; cursor:pointer;
+    transform:translateX(-50%); background:#ffb800; color:#4a3000;
+    box-shadow:0 3px 8px rgba(0,0,0,0.25); white-space:nowrap;
+  }
+  .gasBtn:active { transform:translateX(-50%) scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="modebar">
+  <button id="btnG" class="on">🔋 原电池</button>
+  <button id="btnE">⚡ 电解水</button>
+  <button id="btnReset">🔄 重置</button>
+</div>
+<div id="scorebar"></div>
+<div id="hint">把 3 根导线拖到上面的断口处，接通电路！</div>
+<button id="btnH2" class="gasBtn">🔥 点燃氢气</button>
+<button id="btnO2" class="gasBtn">✨ 木条检验氧气</button>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const btnG = document.getElementById("btnG");
+const btnE = document.getElementById("btnE");
+const btnReset = document.getElementById("btnReset");
+const btnH2 = document.getElementById("btnH2");
+const btnO2 = document.getElementById("btnO2");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 视图 ================= */
+// 世界坐标 1200 x 760，整体缩放居中
+const WORLD_W = 1200, WORLD_H = 760;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / (WORLD_W + 40), H / (WORLD_H + 40));
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function toScreenX(wx) { return view.ox + wx * view.s; }
+function toScreenY(wy) { return view.oy + wy * view.s; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 场景数据 ================= */
+// —— 原电池（铜锌丹尼尔电池）——
+const G = {
+  gaps: [   // 三个断口：锌柱—灯泡、灯泡—电流表、电流表—铜柱
+    { a:[260,120], b:[396,120], wire:null },
+    { a:[464,120], b:[662,120], wire:null },
+    { a:[738,120], b:[940,120], wire:null },
+  ],
+  wires: [  // 导线盒里的三根导线
+    { len:100, home:[440,685], color:"#c0392b", gap:-1, drag:null },
+    { len:120, home:[600,685], color:"#c0392b", gap:-1, drag:null },
+    { len:140, home:[760,685], color:"#c0392b", gap:-1, drag:null },
+  ],
+  on:false, progress:0, glow:0, ePhase:0, ions:[], ionT:0, done:false, half:false,
+};
+const EPATH  = [[260,205],[260,120],[940,120],[940,205]];   // 外电路电子路径（锌→铜）
+const BRIDGE = [[340,470],[340,295],[880,295],[880,470]];   // 盐桥（倒 U 形）
+
+// —— 电解水 ——
+const E = {
+  gaps: [
+    { a:[195,455], b:[940,270], c:[560,180], wire:null },  // 电源 + → 阳极
+    { a:[95,455],  b:[640,270], c:[330,180], wire:null },  // 电源 − → 阴极
+  ],
+  wires: [
+    { len:130, home:[1090,120], color:"#d23c3c", tag:"+", gap:-1, drag:null },
+    { len:130, home:[1090,175], color:"#333333", tag:"−", gap:-1, drag:null },
+  ],
+  on:false, h2:0, o2:0, bubs:[], bubT:0, ePhase:0,
+  done:false, half:false, flame:0, splint:0,
+};
+const TUBE = { cxH:640, cxO:940, top:306, mouth:530, hMax:200 };  // 收集试管
+function levelY(f) { return TUBE.top + TUBE.hMax * f; }           // 管内液面高度
+
+let mode = "g";          // g=原电池 e=电解水
+let confetti = [];       // 庆祝彩纸
+let animT = 0;
+
+/* ================= 几何工具 ================= */
+function polyPoint(path, t) {
+  let total = 0; const segs = [];
+  for (let i = 0; i < path.length - 1; i++) {
+    const L = Math.hypot(path[i+1][0] - path[i][0], path[i+1][1] - path[i][1]);
+    segs.push(L); total += L;
+  }
+  let d = t * total;
+  for (let i = 0; i < segs.length; i++) {
+    if (d <= segs[i] || i === segs.length - 1) {
+      const f = segs[i] ? d / segs[i] : 0;
+      return [path[i][0] + (path[i+1][0] - path[i][0]) * f,
+              path[i][1] + (path[i+1][1] - path[i][1]) * f];
+    }
+    d -= segs[i];
+  }
+  return path[path.length - 1];
+}
+function quadPoint(a, c, b, t) {
+  const u = 1 - t;
+  return [u*u*a[0] + 2*u*t*c[0] + t*t*b[0], u*u*a[1] + 2*u*t*c[1] + t*t*b[1]];
+}
+function gapMid(gp) {
+  if (gp.c) return quadPoint(gp.a, gp.c, gp.b, 0.5);
+  return [(gp.a[0] + gp.b[0]) / 2, (gp.a[1] + gp.b[1]) / 2];
+}
+function wireCenter(S, w) {
+  if (w.drag) return w.drag;
+  if (w.gap >= 0) return gapMid(S.gaps[w.gap]);
+  return w.home;
+}
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill(); else ctx.stroke();
+}
+function line(x1, y1, x2, y2) {
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+}
+
+/* ================= 拖导线交互 ================= */
+let drag = null;   // {S, wire, hover}
+
+function fits(S, wire, idx) {   // 电解模式：红接正极、黑接负极
+  if (S !== E) return true;
+  return wire.tag === "+" ? idx === 0 : idx === 1;
+}
+canvas.addEventListener("pointerdown", e => {
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  hintEl.style.opacity = "0";
+  const S = mode === "g" ? G : E;
+  let best = null, bd = 55;
+  for (const w of S.wires) {
+    const c = wireCenter(S, w);
+    const d = Math.hypot(wx - c[0], wy - c[1]);
+    if (d < bd) { bd = d; best = w; }
+  }
+  if (best) {
+    if (best.gap >= 0) {   // 拔下已接好的导线
+      S.gaps[best.gap].wire = null; best.gap = -1;
+      if (S.on) { S.on = false; showHint("电路断开了"); }
+    }
+    best.drag = [wx, wy];
+    drag = { S, wire: best, hover: -1 };
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    pop(500);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  drag.wire.drag = [wx, wy];
+  drag.hover = -1;
+  let bd = 90;
+  drag.S.gaps.forEach((gp, i) => {
+    if (gp.wire) return;
+    const m = gapMid(gp);
+    const d = Math.hypot(wx - m[0], wy - m[1]);
+    if (d < bd) { bd = d; drag.hover = i; }
+  });
+});
+window.addEventListener("pointerup", () => {
+  if (!drag) return;
+  const { S, wire, hover } = drag;
+  wire.drag = null;
+  if (hover >= 0) {
+    if (fits(S, wire, hover)) {
+      S.gaps[hover].wire = wire; wire.gap = hover;
+      pop(880); checkCircuit();
+    } else {
+      showHint("红色导线接“+”正极，黑色导线接“−”负极哦");
+      pop(300);
+    }
+  }
+  drag = null;
+});
+function checkCircuit() {
+  const S = mode === "g" ? G : E;
+  const on = S.gaps.every(g => g.wire);
+  if (on && !S.on) {
+    S.on = true;
+    pop(660); setTimeout(() => pop(990), 120);
+    showHint(mode === "g" ? "电路接通！电子从锌片经导线流向铜片"
+                          : "电源接通！阴极冒氢气，阳极冒氧气");
+  }
+}
+
+/* ================= 模拟：原电池 ================= */
+function simG(dt) {
+  const g = G;
+  g.glow += ((g.on ? 1 : 0) - g.glow) * Math.min(1, dt * 5);
+  if (g.on) {
+    g.ePhase = (g.ePhase + dt * 0.22) % 1;
+    g.progress = Math.min(1, g.progress + dt / 45);
+    g.ionT -= dt;
+    if (g.ionT <= 0) { g.ionT = 0.12; spawnIon(); }
+    if (!g.half && g.progress >= 0.5) {
+      g.half = true; pop(700);
+      showHint("看！铜片开始变红，锌片在变薄");
+    }
+    if (!g.done && g.progress >= 1) {
+      g.done = true; celebrate();
+      showHint("锌片变薄、铜片披上红衣——化学能变成了电能！🎉");
+    }
+  }
+  for (let i = g.ions.length - 1; i >= 0; i--) {
+    const p = g.ions[i];
+    p.life -= dt;
+    if (p.kind === "kp" || p.kind === "cl") {
+      p.t += p.dir * dt * 0.05;
+      if (p.t > 1 || p.t < 0) { g.ions.splice(i, 1); continue; }
+    } else {
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      if (p.kind === "cu" && Math.abs(p.x - 940) < 17) { g.ions.splice(i, 1); continue; }  // 沉积到铜片
+    }
+    if (p.life <= 0) g.ions.splice(i, 1);
+  }
+}
+function spawnIon() {
+  const g = G, r = Math.random();
+  if (r < 0.3) {         // Zn²⁺ 从锌片溶出
+    const side = Math.random() < 0.5 ? -1 : 1;
+    g.ions.push({ kind:"zn", x:260 + side * 16, y:380 + Math.random() * 130,
+                  vx:side * (8 + Math.random() * 14), vy:6 + Math.random() * 10, life:3 });
+  } else if (r < 0.6) {  // Cu²⁺ 向铜片移动
+    const x = 820 + Math.random() * 240;
+    g.ions.push({ kind:"cu", x, y:380 + Math.random() * 140,
+                  vx:(940 - x) > 0 ? 26 : -26, vy:0, life:9 });
+  } else if (r < 0.8) {  // K⁺ 经盐桥移向正极区（右）
+    g.ions.push({ kind:"kp", t:0.02, dir:1, life:99 });
+  } else {               // Cl⁻ 经盐桥移向负极区（左）
+    g.ions.push({ kind:"cl", t:0.98, dir:-1, life:99 });
+  }
+}
+
+/* ================= 模拟：电解水 ================= */
+function simE(dt) {
+  const e = E;
+  if (e.on) {
+    e.ePhase = (e.ePhase + dt * 0.5) % 1;
+    e.h2 = Math.min(1, e.h2 + dt / 34);
+    e.o2 = e.h2 / 2;                       // 氢气体积恰好是氧气的 2 倍
+    e.bubT -= dt;
+    if (e.bubT <= 0) { e.bubT = 0.09; spawnBubble(); }
+    if (!e.half && e.h2 >= 0.5) {
+      e.half = true; pop(760);
+      showHint("氢气收了 2 格，氧气才 1 格——正好 2 : 1");
+    }
+    if (!e.done && e.h2 >= 1) {
+      e.done = true; celebrate();
+      showHint("氢气体积是氧气的 2 倍！点按钮检验气体吧");
+      showGasButtons();
+    }
+  }
+  for (let i = e.bubs.length - 1; i >= 0; i--) {
+    const b = e.bubs[i];
+    b.y -= b.sp * dt;
+    b.x += Math.sin(b.y * 0.08) * 12 * dt;
+    const lvl = b.side === "H" ? levelY(e.h2) : levelY(e.o2);
+    if (b.y < lvl + 4) e.bubs.splice(i, 1);   // 气泡进入气室
+  }
+  if (e.flame > 0) e.flame -= dt;
+  if (e.splint > 0) e.splint -= dt;
+}
+function spawnBubble() {
+  const e = E;
+  // 阴极（氢）气泡数量约为阳极（氧）的 2 倍
+  e.bubs.push({ side:"H", x:TUBE.cxH + (Math.random() * 36 - 18), y:505 + Math.random() * 15,
+                r:2 + Math.random() * 3, sp:55 + Math.random() * 45 });
+  if (Math.random() < 0.5)
+    e.bubs.push({ side:"O", x:TUBE.cxO + (Math.random() * 36 - 18), y:505 + Math.random() * 15,
+                  r:2 + Math.random() * 2.5, sp:50 + Math.random() * 40 });
+}
+
+/* ================= 庆祝彩纸 ================= */
+function celebrate() { fanfare(); spawnConfetti(600, 240); }
+function spawnConfetti(x, y) {
+  const colors = ["#ff5252","#ffb800","#2fbf4a","#2f7fe9","#9b3de0","#ff7a1a"];
+  for (let i = 0; i < 70; i++)
+    confetti.push({ x, y, vx:(Math.random() - 0.5) * 520, vy:-Math.random() * 420 - 60,
+                    color:colors[i % 6], rot:Math.random() * 7, vr:(Math.random() - 0.5) * 12,
+                    life:2.2 + Math.random() });
+}
+function simConfetti(dt) {
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.vy += 560 * dt; c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += c.vr * dt; c.life -= dt;
+    if (c.life <= 0 || c.y > WORLD_H + 40) confetti.splice(i, 1);
+  }
+}
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.color; ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+}
+
+/* ================= 绘制：通用 ================= */
+function drawLiquid(x, yTop, w, yBot, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x, yTop);
+  for (let i = 0; i <= w; i += 12)
+    ctx.lineTo(x + i, yTop + Math.sin(i * 0.05 + animT * 2) * 2.5);
+  ctx.lineTo(x + w, yBot); ctx.lineTo(x, yBot);
+  ctx.closePath(); ctx.fill();
+}
+function drawBeaker(cx, y, w, h, liquidTop, color, label) {
+  const x = cx - w / 2;
+  drawLiquid(x + 7, liquidTop, w - 14, y + h - 8, color);
+  ctx.fillStyle = "rgba(255,255,255,0.28)";
+  ctx.strokeStyle = "rgba(110,130,150,0.9)"; ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x, y + h - 16); ctx.quadraticCurveTo(x, y + h, x + 16, y + h);
+  ctx.lineTo(x + w - 16, y + h); ctx.quadraticCurveTo(x + w, y + h, x + w, y + h - 16);
+  ctx.lineTo(x + w, y);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.fillRect(x + 10, y + 12, 10, h - 40);   // 玻璃高光
+  ctx.fillStyle = "#345"; ctx.font = "15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(label, cx, y + h - 14);
+}
+function drawTag(x, y, lines, color) {
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  const w = Math.max(...lines.map(l => ctx.measureText(l).width)) + 24;
+  const h = lines.length * 20 + 12;
+  ctx.fillStyle = color;
+  roundRect(x - w / 2, y - h / 2, w, h, 10, true);
+  ctx.fillStyle = "#fff";
+  lines.forEach((l, i) => ctx.fillText(l, x, y - h / 2 + 22 + i * 20));
+}
+function plug(p) {
+  ctx.beginPath(); ctx.arc(p[0], p[1], 6, 0, 7);
+  ctx.fillStyle = "#5a4632"; ctx.fill();
+}
+function socket(p) {
+  ctx.beginPath(); ctx.arc(p[0], p[1], 7, 0, 7);
+  ctx.fillStyle = "#fff"; ctx.fill();
+  ctx.strokeStyle = "#8a94a0"; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.beginPath(); ctx.arc(p[0], p[1], 2.5, 0, 7);
+  ctx.fillStyle = "#8a94a0"; ctx.fill();
+}
+function drawGap(S, gp, i) {
+  const w = gp.wire;
+  if (w) {   // 已接上导线
+    ctx.strokeStyle = w.color; ctx.lineWidth = 6; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(gp.a[0], gp.a[1]);
+    if (gp.c) ctx.quadraticCurveTo(gp.c[0], gp.c[1], gp.b[0], gp.b[1]);
+    else ctx.lineTo(gp.b[0], gp.b[1]);
+    ctx.stroke();
+    plug(gp.a); plug(gp.b);
+  } else {   // 断口：虚线 + 插座
+    ctx.setLineDash([8, 8]);
+    ctx.strokeStyle = "rgba(90,70,50,0.5)"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(gp.a[0], gp.a[1]);
+    if (gp.c) ctx.quadraticCurveTo(gp.c[0], gp.c[1], gp.b[0], gp.b[1]);
+    else ctx.lineTo(gp.b[0], gp.b[1]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    socket(gp.a); socket(gp.b);
+    if (drag && drag.S === S && drag.hover === i) {   // 拖拽吸附高亮
+      ctx.strokeStyle = "#ffb800"; ctx.lineWidth = 5;
+      ctx.setLineDash([8, 8]);
+      ctx.beginPath(); ctx.moveTo(gp.a[0], gp.a[1]);
+      if (gp.c) ctx.quadraticCurveTo(gp.c[0], gp.c[1], gp.b[0], gp.b[1]);
+      else ctx.lineTo(gp.b[0], gp.b[1]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      for (const p of [gp.a, gp.b]) {
+        ctx.beginPath(); ctx.arc(p[0], p[1], 12, 0, 7);
+        ctx.strokeStyle = "#ffb800"; ctx.lineWidth = 4; ctx.stroke();
+      }
+    }
+  }
+}
+function drawLooseWire(w) {
+  if (w.gap >= 0 && !w.drag) return;
+  const c = w.drag || w.home;
+  ctx.strokeStyle = w.color; ctx.lineWidth = 6; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(c[0] - w.len / 2, c[1]);
+  ctx.quadraticCurveTo(c[0], c[1] + 22, c[0] + w.len / 2, c[1]);
+  ctx.stroke();
+  plug([c[0] - w.len / 2, c[1]]);
+  plug([c[0] + w.len / 2, c[1]]);
+}
+
+/* ================= 绘制：原电池 ================= */
+function drawGalvanic() {
+  // 两个烧杯：左 ZnSO₄（无色），右 CuSO₄（蓝色随反应变浅）
+  drawBeaker(260, 320, 280, 260, 360, "rgba(210,228,238,0.9)", "硫酸锌溶液");
+  drawBeaker(940, 320, 280, 260, 360, `rgba(58,134,216,${0.8 - 0.4 * G.progress})`, "硫酸铜溶液");
+  drawBridge();
+  drawPlates();
+  drawIons();
+  drawRail();
+  drawElectronsG();
+  // 导线盒
+  ctx.fillStyle = "#5a4632"; ctx.font = "14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("导线盒：把导线拖到上面的断口", 600, 648);
+  for (const w of G.wires) drawLooseWire(w);
+  drawTagsG();
+}
+function drawPlates() {
+  const p = G.progress;
+  // 锌片（逐渐溶解变薄）
+  const zw = 26 - 14 * p;
+  ctx.fillStyle = "#aab4bd";
+  roundRect(260 - zw / 2, 245, zw, 305, 4, true);
+  ctx.strokeStyle = "rgba(60,70,80,0.6)"; ctx.lineWidth = 2;
+  roundRect(260 - zw / 2, 245, zw, 305, 4, false);
+  // 铜片（析出红色铜，变厚变红）
+  const cw = 26 + 12 * p;
+  ctx.fillStyle = "#c98a5a";
+  roundRect(940 - 13, 245, 26, 305, 4, true);
+  if (p > 0.01) {
+    ctx.fillStyle = `rgba(178,60,40,${0.25 + 0.7 * p})`;
+    roundRect(940 - cw / 2, 245, cw, 305, 4, true);
+  }
+  ctx.strokeStyle = "rgba(90,50,30,0.6)"; ctx.lineWidth = 2;
+  roundRect(940 - cw / 2, 245, cw, 305, 4, false);
+  // 接线柱
+  for (const x of [260, 940]) {
+    ctx.beginPath(); ctx.arc(x, 208, 8, 0, 7);
+    ctx.fillStyle = "#8a94a0"; ctx.fill();
+    ctx.strokeStyle = "#5a646e"; ctx.lineWidth = 2; ctx.stroke();
+  }
+}
+function drawBridge() {
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  const path = () => {
+    ctx.beginPath();
+    ctx.moveTo(BRIDGE[0][0], BRIDGE[0][1]);
+    for (let i = 1; i < BRIDGE.length; i++) ctx.lineTo(BRIDGE[i][0], BRIDGE[i][1]);
+  };
+  path(); ctx.strokeStyle = "rgba(150,170,190,0.55)"; ctx.lineWidth = 30; ctx.stroke();
+  path(); ctx.strokeStyle = "#f0e7c8"; ctx.lineWidth = 22; ctx.stroke();
+  // 两端棉花塞
+  for (const p of [BRIDGE[0], BRIDGE[3]]) {
+    ctx.beginPath(); ctx.arc(p[0], p[1], 12, 0, 7);
+    ctx.fillStyle = "#fffdf2"; ctx.fill();
+    ctx.strokeStyle = "rgba(150,170,190,0.8)"; ctx.lineWidth = 2; ctx.stroke();
+  }
+  ctx.fillStyle = "#567"; ctx.font = "14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("盐桥（KCl 琼脂）", 610, 278);
+  if (G.glow > 0.05) {
+    ctx.globalAlpha = G.glow;
+    ctx.fillStyle = "#6a5a2a"; ctx.font = "13px sans-serif";
+    ctx.fillText("K⁺ 移向正极区 · Cl⁻ 移向负极区", 610, 328);
+    ctx.globalAlpha = 1;
+  }
+}
+function drawIons() {
+  for (const p of G.ions) {
+    let x, y;
+    if (p.kind === "kp" || p.kind === "cl") { const q = polyPoint(BRIDGE, p.t); x = q[0]; y = q[1]; }
+    else { x = p.x; y = p.y; }
+    const col = p.kind === "zn" ? "#7a8a99" : p.kind === "cu" ? "#2f7fe9"
+              : p.kind === "kp" ? "#9b59b6" : "#27ae60";
+    ctx.globalAlpha = Math.min(1, p.life);
+    ctx.beginPath(); ctx.arc(x, y, 6, 0, 7);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.font = "bold 9px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(p.kind === "cl" ? "−" : "+", x, y + 3);
+    ctx.globalAlpha = 1;
+  }
+}
+function drawRail() {
+  ctx.strokeStyle = "#5a4632"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  line(260, 120, 260, 205); line(940, 120, 940, 205);   // 电极引出线
+  G.gaps.forEach((gp, i) => drawGap(G, gp, i));
+  drawBulb(430, 120);
+  drawAmmeter(700, 120);
+  ctx.fillStyle = "#345"; ctx.font = "14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("小灯泡", 430, 182);
+  ctx.fillText("电流表", 700, 185);
+}
+function drawBulb(x, y) {
+  const gl = G.glow;
+  if (gl > 0.02) {
+    const rg = ctx.createRadialGradient(x, y, 5, x, y, 90);
+    rg.addColorStop(0, `rgba(255,220,90,${0.55 * gl})`);
+    rg.addColorStop(1, "rgba(255,220,90,0)");
+    ctx.fillStyle = rg;
+    ctx.beginPath(); ctx.arc(x, y, 90, 0, 7); ctx.fill();
+  }
+  ctx.strokeStyle = "#5a4632"; ctx.lineWidth = 4;
+  line(x - 34, y, x - 22, y); line(x + 22, y, x + 34, y);
+  ctx.beginPath(); ctx.arc(x, y, 26, 0, 7);
+  ctx.fillStyle = gl > 0.5 ? "#fff3b0" : "#fdfdf5"; ctx.fill();
+  ctx.strokeStyle = "#8a94a0"; ctx.lineWidth = 3; ctx.stroke();
+  // 灯丝
+  ctx.strokeStyle = gl > 0.4 ? "#e6a700" : "#9a8a6a"; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(x - 22, y); ctx.lineTo(x - 10, y + 8);
+  ctx.lineTo(x - 5, y + 2); ctx.lineTo(x, y + 8); ctx.lineTo(x + 5, y + 2);
+  ctx.lineTo(x + 10, y + 8); ctx.lineTo(x + 22, y);
+  ctx.stroke();
+}
+function drawAmmeter(x, y) {
+  ctx.strokeStyle = "#5a4632"; ctx.lineWidth = 4;
+  line(x - 38, y, x - 30, y); line(x + 30, y, x + 38, y);
+  ctx.beginPath(); ctx.arc(x, y, 38, 0, 7);
+  ctx.fillStyle = "#ffffff"; ctx.fill();
+  ctx.strokeStyle = "#7a8694"; ctx.lineWidth = 3.5; ctx.stroke();
+  ctx.fillStyle = "#345"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("A", x, y - 13);
+  ctx.strokeStyle = "#aab4c0"; ctx.lineWidth = 1.5;
+  for (let k = -2; k <= 2; k++) {
+    const a = -Math.PI / 2 + k * 0.4;
+    line(x + Math.cos(a) * 25, y + Math.sin(a) * 25, x + Math.cos(a) * 30, y + Math.sin(a) * 30);
+  }
+  // 指针偏转
+  const ang = -Math.PI / 2 - 0.4 + G.glow * 0.85;
+  ctx.strokeStyle = "#d23c3c"; ctx.lineWidth = 3;
+  line(x, y, x + Math.cos(ang) * 27, y + Math.sin(ang) * 27);
+  ctx.beginPath(); ctx.arc(x, y, 3.5, 0, 7);
+  ctx.fillStyle = "#345"; ctx.fill();
+}
+function drawElectronsG() {
+  if (G.glow < 0.05) return;
+  ctx.globalAlpha = G.glow;
+  for (let i = 0; i < 16; i++) {
+    const q = polyPoint(EPATH, (i / 16 + G.ePhase) % 1);
+    ctx.beginPath(); ctx.arc(q[0], q[1], 5, 0, 7);
+    ctx.fillStyle = "#ffd54a"; ctx.fill();
+    ctx.strokeStyle = "#b8860b"; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "#8a6d00"; ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("e⁻ 从锌片流向铜片 →", 585, 100);
+}
+function drawTagsG() {
+  drawTag(148, 170, ["锌片", "负极 −"], "#57606f");
+  drawTag(1052, 170, ["铜片", "正极 +"], "#a04a3a");
+  if (G.glow > 0.05) {
+    ctx.globalAlpha = G.glow;
+    ctx.fillStyle = "#234"; ctx.font = "17px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("负极：Zn − 2e⁻ → Zn²⁺（锌溶解）", 260, 622);
+    ctx.fillText("正极：Cu²⁺ + 2e⁻ → Cu（红色铜析出）", 940, 622);
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ================= 绘制：电解水 ================= */
+function drawElectro() {
+  drawBattery();
+  drawTrough();
+  E.gaps.forEach((gp, i) => drawGap(E, gp, i));
+  drawTubes();
+  drawElectronsE();
+  // 导线盒
+  ctx.fillStyle = "#5a4632"; ctx.font = "14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("导线：红接“+”，黑接“−”", 1090, 88);
+  for (const w of E.wires) drawLooseWire(w);
+  drawTagsE();
+  if (E.flame > 0) drawFlame(TUBE.cxH, 542);
+  if (E.splint > 0) drawSplint(TUBE.cxO, 548);
+}
+function drawBattery() {
+  ctx.fillStyle = "#2f3b4c";
+  roundRect(60, 470, 180, 110, 12, true);
+  ctx.fillStyle = "#ffd54a"; ctx.font = "bold 30px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("⚡", 150, 545);
+  ctx.fillStyle = "#fff"; ctx.font = "14px sans-serif";
+  ctx.fillText("直流电源", 150, 566);
+  // 接线柱（− 左黑，+ 右红）
+  for (const [x, txt, col] of [[95, "−", "#333"], [195, "+", "#d23c3c"]]) {
+    ctx.beginPath(); ctx.arc(x, 455, 10, 0, 7);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.fillStyle = "#fff"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(txt, x, 460);
+  }
+}
+function drawTrough() {
+  const x = 430, y = 400, w = 720, h = 190;
+  drawLiquid(x + 7, 440, w - 14, y + h - 8, "rgba(150,190,220,0.85)");
+  ctx.fillStyle = "rgba(255,255,255,0.25)";
+  ctx.strokeStyle = "rgba(110,130,150,0.9)"; ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x, y + h - 16); ctx.quadraticCurveTo(x, y + h, x + 16, y + h);
+  ctx.lineTo(x + w - 16, y + h); ctx.quadraticCurveTo(x + w, y + h, x + w, y + h - 16);
+  ctx.lineTo(x + w, y);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "#345"; ctx.font = "14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("水（加少量硫酸钠增强导电性）", 790, 582);
+}
+function drawTubes() {
+  drawTube(TUBE.cxH, E.h2, "H₂", "H");
+  drawTube(TUBE.cxO, E.o2, "O₂", "O");
+}
+function drawTube(cx, frac, gasLabel, side) {
+  const { top, mouth, hMax } = TUBE;
+  const lvl = levelY(frac);
+  // 管内水
+  ctx.fillStyle = "rgba(150,190,220,0.55)";
+  ctx.fillRect(cx - 29, lvl, 58, mouth - lvl);
+  // 气室
+  if (frac > 0.005) {
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.fillRect(cx - 29, top, 58, lvl - top);
+  }
+  // 液面线
+  ctx.strokeStyle = "rgba(40,80,120,0.8)"; ctx.lineWidth = 2.5;
+  line(cx - 29, lvl, cx + 29, lvl);
+  // 刻度（同一体积标尺，氢气满 4 格、氧气满 2 格）
+  ctx.strokeStyle = "#78909c"; ctx.lineWidth = 1.5;
+  ctx.font = "12px sans-serif"; ctx.fillStyle = "#567"; ctx.textAlign = "right";
+  for (let k = 1; k <= 4; k++) {
+    const ty = top + hMax * k / 4;
+    line(cx - 36, ty, cx - 29, ty);
+    ctx.fillText(String(k), cx - 40, ty + 4);
+  }
+  // 电极（石墨棒）
+  ctx.fillStyle = "#4a4a52";
+  roundRect(cx - 7, 270, 14, 250, 4, true);
+  // 气泡
+  for (const b of E.bubs) {
+    if (b.side !== side) continue;
+    if (Math.abs(b.x - cx) > 40) continue;
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7);
+    ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.fill();
+    ctx.strokeStyle = "rgba(150,180,210,0.9)"; ctx.lineWidth = 1; ctx.stroke();
+  }
+  // 玻璃管（上口封闭、下口插入水中）
+  ctx.strokeStyle = "rgba(110,130,150,0.95)"; ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(cx - 32, mouth);
+  ctx.lineTo(cx - 32, 308);
+  ctx.quadraticCurveTo(cx - 32, 294, cx - 18, 294);
+  ctx.lineTo(cx + 18, 294);
+  ctx.quadraticCurveTo(cx + 32, 294, cx + 32, 308);
+  ctx.lineTo(cx + 32, mouth);
+  ctx.stroke();
+  // 橡皮塞
+  ctx.fillStyle = "#c9a06a";
+  roundRect(cx - 36, 288, 72, 18, 6, true);
+  // 接线柱
+  ctx.beginPath(); ctx.arc(cx, 270, 8, 0, 7);
+  ctx.fillStyle = "#8a94a0"; ctx.fill();
+  ctx.strokeStyle = "#5a646e"; ctx.lineWidth = 2; ctx.stroke();
+  // 气体名称（画在电极之后，避免被遮挡）
+  if (lvl - top > 32) {
+    ctx.fillStyle = "#345"; ctx.font = "bold 20px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(gasLabel, cx - 17, top + (lvl - top) / 2 + 7);
+  }
+}
+function drawElectronsE() {
+  if (!E.on) return;
+  E.gaps.forEach((gp, i) => {
+    if (!gp.wire) return;
+    for (let k = 0; k < 6; k++) {
+      let t = (k / 6 + E.ePhase) % 1;
+      if (i === 0) t = 1 - t;   // 电子：负极→阴极，阳极→正极
+      const q = quadPoint(gp.a, gp.c, gp.b, t);
+      ctx.beginPath(); ctx.arc(q[0], q[1], 4.5, 0, 7);
+      ctx.fillStyle = "#ffd54a"; ctx.fill();
+      ctx.strokeStyle = "#b8860b"; ctx.lineWidth = 1.2; ctx.stroke();
+    }
+  });
+}
+function drawTagsE() {
+  drawTag(640, 215, ["阴极（接负极）", "产生氢气 H₂"], "#3a6ea5");
+  drawTag(940, 215, ["阳极（接正极）", "产生氧气 O₂"], "#a04a3a");
+  if (E.on) {
+    ctx.fillStyle = "#234"; ctx.font = "16px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("阴极：2H₂O + 2e⁻ → H₂↑ + 2OH⁻", 600, 622);
+    ctx.fillText("阳极：2H₂O − 4e⁻ → O₂↑ + 4H⁺", 980, 622);
+  }
+}
+function drawFlame(x, y) {
+  const fl = Math.min(1, E.flame * 2);
+  const wob = Math.sin(animT * 30) * 3;
+  ctx.globalAlpha = fl;
+  ctx.beginPath();
+  ctx.moveTo(x, y - 46 - wob);
+  ctx.quadraticCurveTo(x + 20 + wob, y - 10, x, y + 6);
+  ctx.quadraticCurveTo(x - 20 - wob, y - 10, x, y - 46 - wob);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(255,120,30,0.9)"; ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(x, y - 30);
+  ctx.quadraticCurveTo(x + 11, y - 8, x, y + 3);
+  ctx.quadraticCurveTo(x - 11, y - 8, x, y - 30);
+  ctx.closePath();
+  ctx.fillStyle = "#ffe27a"; ctx.fill();
+  ctx.globalAlpha = 1;
+}
+function drawSplint(x, y) {
+  const gl = Math.min(1, E.splint);
+  // 木条
+  ctx.strokeStyle = "#8a5a2e"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  line(x + 34, y + 44, x, y);
+  // 复燃的火星
+  const rg = ctx.createRadialGradient(x, y, 1, x, y, 18);
+  rg.addColorStop(0, `rgba(255,240,180,${0.95 * gl})`);
+  rg.addColorStop(0.5, `rgba(255,120,30,${0.7 * gl})`);
+  rg.addColorStop(1, "rgba(255,80,20,0)");
+  ctx.fillStyle = rg;
+  ctx.beginPath(); ctx.arc(x, y, 18, 0, 7); ctx.fill();
+}
+
+/* ================= 绘制：总入口 ================= */
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#f2f6fa"); bg.addColorStop(1, "#dde6ee");
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  // 实验台
+  ctx.fillStyle = "#b08968"; ctx.fillRect(-40, 590, WORLD_W + 80, WORLD_H - 590 + 40);
+  ctx.fillStyle = "#8a6a4f"; ctx.fillRect(-40, 590, WORLD_W + 80, 6);
+  if (mode === "g") drawGalvanic(); else drawElectro();
+  drawConfetti();
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+function updateScore() {
+  if (mode === "g") {
+    scorebar.textContent = G.on
+      ? `🔋 原电池 · 灯泡发光中 · 反应进度 ${(G.progress * 100) | 0}%`
+      : "🔋 原电池 · 用导线接通电路";
+  } else {
+    scorebar.textContent = E.on
+      ? `⚡ 电解水 · H₂ ${(E.h2 * 4).toFixed(1)} 格 : O₂ ${(E.o2 * 4).toFixed(1)} 格`
+      : "⚡ 电解水 · 接上直流电源";
+  }
+}
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now; animT += dt;
+  if (mode === "g") simG(dt); else simE(dt);
+  simConfetti(dt);
+  updateScore();
+  draw();
+  requestAnimationFrame(loop);
+}
+updateScore();
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const bigPop = () => { tone(120, 0.35, 0.25, "square"); tone(80, 0.45, 0.2); };
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+function showGasButtons() {
+  btnH2.style.left = toScreenX(TUBE.cxH) + "px";
+  btnH2.style.top = toScreenY(672) + "px";
+  btnO2.style.left = toScreenX(TUBE.cxO) + "px";
+  btnO2.style.top = toScreenY(672) + "px";
+  btnH2.style.display = "block"; btnO2.style.display = "block";
+}
+btnH2.addEventListener("click", () => {
+  E.flame = 1.2; bigPop();
+  showHint("“噗”的一声，氢气燃烧了！");
+});
+btnO2.addEventListener("click", () => {
+  E.splint = 2.2;
+  tone(880, 0.3, 0.12); setTimeout(() => tone(1318, 0.35, 0.12), 150);
+  showHint("带火星的木条复燃了——是氧气！");
+});
+function switchMode(m) {
+  mode = m;
+  btnG.classList.toggle("on", m === "g");
+  btnE.classList.toggle("on", m === "e");
+  btnH2.style.display = "none"; btnO2.style.display = "none";
+  if (m === "e" && E.done) showGasButtons();
+  hintEl.textContent = m === "g"
+    ? "把 3 根导线拖到上面的断口处，接通电路！"
+    : "把导线拖到断口：红接“+”正极，黑接“−”负极！";
+  hintEl.style.opacity = "1";
+  updateScore();
+}
+btnG.addEventListener("click", () => { switchMode("g"); pop(660); });
+btnE.addEventListener("click", () => { switchMode("e"); pop(660); });
+btnReset.addEventListener("click", () => {
+  if (mode === "g") {
+    G.gaps.forEach(g => g.wire = null);
+    G.wires.forEach(w => { w.gap = -1; w.drag = null; });
+    G.on = false; G.progress = 0; G.glow = 0; G.ions = []; G.done = false; G.half = false;
+  } else {
+    E.gaps.forEach(g => g.wire = null);
+    E.wires.forEach(w => { w.gap = -1; w.drag = null; });
+    E.on = false; E.h2 = 0; E.o2 = 0; E.bubs = [];
+    E.done = false; E.half = false; E.flame = 0; E.splint = 0;
+    btnH2.style.display = "none"; btnO2.style.display = "none";
+  }
+  updateScore(); pop(500);
+});
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

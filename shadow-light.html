@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>影子与光</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#1b2a4a; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,32,0.85); color:#fff; padding:10px 22px;
+    border-radius:24px; font-size:16px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="hint">拖一拖太阳，看看影子怎么变大变小！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+const TOOL_W = 100;     // 左侧工具箱宽度
+const WALL_W = 46;      // 右侧墙的宽度
+let wallX = 0;          // 墙的左边缘 x
+let groundY = 0;        // 地面 y
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  wallX = W - WALL_W - 16;
+  groundY = H - 74;
+  clampAll();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 工具箱里的物体模板
+const ITEMS = [
+  { e:"🌲", name:"树",   size:84 },
+  { e:"🧍", name:"小人", size:76 },
+  { e:"🐶", name:"小狗", size:64 },
+  { e:"🏀", name:"球",   size:52 }
+];
+let objects = [];    // {e, size, cx, cy} 舞台上的物体
+let selected = null; // 当前选中的物体
+const light = { e:"☀️", x:260, y:190, r:44 };  // 光源（太阳），可自由拖动
+
+function clampAll() {
+  light.x = Math.max(TOOL_W + 40, Math.min(wallX - 30, light.x));
+  light.y = Math.max(36, Math.min(groundY - 20, light.y));
+  for (const o of objects) clampObject(o);
+}
+function clampObject(o) {
+  o.cx = Math.max(TOOL_W + 24, Math.min(wallX - 26, o.cx));
+  o.cy = Math.max(44, Math.min(groundY - o.size * 0.3, o.cy));
+}
+function addObject(item, x, y) {
+  const o = { e:item.e, size:item.size, cx:x, cy:y };
+  objects.push(o);
+  return o;
+}
+resize();
+// 初始场景：一个太阳 + 一棵树
+light.x = 300; light.y = 420;
+addObject(ITEMS[0], Math.min(wallX - 260, W * 0.5), groundY - 40);
+
+/* ================= 影子计算（相似三角形） ================= */
+// 光源 L、物体 O、墙 x=wallX。物体挡在光和墙之间时：
+//   放大倍数 k = 光到墙距离 / 光到物体距离
+//   影心高度 Sy = Ly + k * (Oy - Ly)
+function shadowOf(o) {
+  const dObj = o.cx - light.x;          // 光到物体的水平距离
+  if (dObj < 12) return null;           // 光在物体右侧或贴太近：墙上没影子
+  const k = (wallX - light.x) / dObj;
+  if (k <= 0) return null;
+  const kk = Math.min(k, 6);            // 防止贴光时影子爆大
+  return {
+    k: kk,
+    sy: light.y + kk * (o.cy - light.y),
+    size: o.size * kk
+  };
+}
+
+/* ================= 精灵与剪影缓存 ================= */
+// emoji 字形墨迹相对字框有偏移（直接 fillText 会“浮”起来），
+// 所以先离屏渲染、量出真实墨迹边界，之后按视觉中心精确绘制。
+const spriteCache = {};
+function getSprite(emoji, size) {
+  const key = emoji + "@" + size;
+  if (spriteCache[key]) return spriteCache[key];
+  const dim = Math.ceil(size * 1.8);
+  const c = document.createElement("canvas");
+  c.width = c.height = dim;
+  const g = c.getContext("2d");
+  g.font = size + "px 'Apple Color Emoji','Noto Color Emoji',sans-serif";
+  g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText(emoji, dim / 2, dim / 2);
+  const d = g.getImageData(0, 0, dim, dim).data;
+  let x0 = dim, y0 = dim, x1 = 0, y1 = 0;
+  for (let y = 0; y < dim; y++) for (let x = 0; x < dim; x++) {
+    if (d[(y * dim + x) * 4 + 3] > 10) {
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+  }
+  if (x1 <= x0 || y1 <= y0) { x0 = 0; y0 = 0; x1 = dim - 1; y1 = dim - 1; }
+  const sp = { img:c, x:x0, y:y0, w:x1 - x0 + 1, h:y1 - y0 + 1 };
+  spriteCache[key] = sp;
+  return sp;
+}
+// 黑色剪影（影子用），基于 130px 基准精灵，带宽高比
+const silCache = {};
+function getSilhouette(emoji) {
+  if (silCache[emoji]) return silCache[emoji];
+  const sp = getSprite(emoji, 130);
+  const c = document.createElement("canvas");
+  c.width = sp.w; c.height = sp.h;
+  const g = c.getContext("2d");
+  g.drawImage(sp.img, sp.x, sp.y, sp.w, sp.h, 0, 0, sp.w, sp.h);
+  g.globalCompositeOperation = "source-in";   // 只保留 emoji 形状，涂成黑色
+  g.fillStyle = "#000";
+  g.fillRect(0, 0, sp.w, sp.h);
+  const sil = { img:c, aspect:sp.w / sp.h };
+  silCache[emoji] = sil;
+  return sil;
+}
+
+/* ================= 交互（Pointer Events） ================= */
+let drag = null;   // {kind:'light'|'object', obj, dx, dy, isNew}
+let hintShown = true;
+
+function toolboxItemAt(px, py) {
+  for (let i = 0; i < ITEMS.length; i++) {
+    const iy = 130 + i * 96;
+    if (px < TOOL_W && Math.hypot(px - TOOL_W / 2, py - iy) < 40) return ITEMS[i];
+  }
+  return null;
+}
+function objectAt(px, py) {
+  for (let i = objects.length - 1; i >= 0; i--) {
+    const o = objects[i];
+    if (Math.hypot(px - o.cx, py - o.cy) < o.size * 0.62) return o;
+  }
+  return null;
+}
+function deleteBtnPos(o) {
+  const r = o.size * 0.62;
+  return [o.cx + r * 0.8, o.cy - r * 0.8];
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const px = e.clientX, py = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+  if (hintShown) { hintShown = false; hintEl.style.opacity = "0"; }
+
+  // 1) 选中物体的 ✕ 删除手柄
+  if (selected) {
+    const [bx, by] = deleteBtnPos(selected);
+    if (Math.hypot(px - bx, py - by) < 24) {
+      objects = objects.filter(o => o !== selected);
+      selected = null;
+      pop(220);
+      showHint("删掉啦！");
+      return;
+    }
+  }
+  // 2) 拖太阳
+  if (Math.hypot(px - light.x, py - light.y) < light.r) {
+    drag = { kind:"light", dx:px - light.x, dy:py - light.y };
+    blip();
+    return;
+  }
+  // 3) 拖舞台上的物体
+  const o = objectAt(px, py);
+  if (o) {
+    selected = o;
+    objects = objects.filter(x => x !== o); objects.push(o);  // 提到最上层
+    drag = { kind:"object", obj:o, dx:px - o.cx, dy:py - o.cy, isNew:false };
+    blip();
+    return;
+  }
+  // 4) 从工具箱拖出新物体
+  const item = toolboxItemAt(px, py);
+  if (item) {
+    const no = addObject(item, px, py);   // 松手时还在工具箱里会移除
+    selected = no;
+    drag = { kind:"object", obj:no, dx:0, dy:0, isNew:true };
+    pop(660);
+    return;
+  }
+  // 5) 点空白：取消选中
+  selected = null;
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const px = e.clientX, py = e.clientY;
+  if (drag.kind === "light") {
+    light.x = Math.max(TOOL_W + 40, Math.min(wallX - 30, px - drag.dx));
+    light.y = Math.max(36, Math.min(groundY - 20, py - drag.dy));
+  } else {
+    drag.obj.cx = px - drag.dx;
+    drag.obj.cy = py - drag.dy;
+    if (!drag.isNew || drag.obj.cx > TOOL_W + 10) clampObject(drag.obj);
+  }
+});
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  if (drag.kind === "object") {
+    if (drag.isNew && drag.obj.cx < TOOL_W + 10) {
+      // 拖回工具箱 = 不放出来
+      objects = objects.filter(o => o !== drag.obj);
+      if (selected === drag.obj) selected = null;
+    } else {
+      clampObject(drag.obj);
+      if (drag.isNew) { pop(880); showHint("放好啦！拖拖太阳看影子变化"); }
+    }
+  }
+  drag = null;
+});
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  // 夜空渐变
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#1b2a4a"); g.addColorStop(1, "#3a4a72");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 小星星
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  for (const [sx, sy, sr] of [[150,60,2],[420,40,1.6],[700,90,2],[980,50,1.6],[1150,120,2],[560,140,1.4],[860,160,1.4]]) {
+    if (sx < W && sy < groundY - 100) { ctx.beginPath(); ctx.arc(sx, sy, sr, 0, 7); ctx.fill(); }
+  }
+  // 地面
+  ctx.fillStyle = "#4c6b3c";
+  ctx.fillRect(0, groundY, W, H - groundY);
+  ctx.fillStyle = "#5d7f4a";
+  ctx.fillRect(0, groundY, W, 10);
+}
+
+function drawWall() {
+  // 砖墙
+  ctx.fillStyle = "#c9b8a0";
+  ctx.fillRect(wallX, 0, WALL_W, groundY);
+  ctx.fillStyle = "#b3a28a";
+  ctx.fillRect(wallX, 0, 6, groundY);   // 墙左沿描边
+  ctx.strokeStyle = "rgba(120,100,80,0.35)"; ctx.lineWidth = 2;
+  for (let y = 28; y < groundY; y += 34) {
+    ctx.beginPath(); ctx.moveTo(wallX + 6, y); ctx.lineTo(wallX + WALL_W, y); ctx.stroke();
+  }
+}
+
+function drawLightCone() {
+  // 把看不见的“光路”画出来：从太阳掠过每个物体的光锥（照到墙上的亮区）
+  for (const o of objects) {
+    const sh = shadowOf(o);
+    if (!sh) continue;
+    const topY = light.y + sh.k * ((o.cy - o.size / 2) - light.y);
+    const botY = light.y + sh.k * ((o.cy + o.size / 2) - light.y);
+    ctx.beginPath();
+    ctx.moveTo(light.x, light.y);
+    ctx.lineTo(wallX, topY);
+    ctx.lineTo(wallX, botY);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(255,230,130,0.10)";
+    ctx.fill();
+    // 两条光线
+    ctx.strokeStyle = "rgba(255,230,130,0.35)"; ctx.lineWidth = 2;
+    ctx.setLineDash([8, 8]);
+    ctx.beginPath(); ctx.moveTo(light.x, light.y); ctx.lineTo(wallX, topY); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(light.x, light.y); ctx.lineTo(wallX, botY); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function drawShadows() {
+  // 墙上的黑色半透明剪影
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(wallX + 6, 0, WALL_W - 6, groundY);
+  ctx.clip();
+  for (const o of objects) {
+    const sh = shadowOf(o);
+    if (!sh) continue;
+    const sil = getSilhouette(o.e);
+    const h = sh.size, w = h * sil.aspect;
+    ctx.globalAlpha = 0.45;
+    ctx.drawImage(sil.img, wallX + 3 + (WALL_W - 6 - w) / 2, sh.sy - h / 2, w, h);
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+function drawGroundShadows() {
+  // 光线掠过物体顶端射到地面的点 = 地面影子的末端；
+  // 太阳低于物体顶端时，影子一直铺到墙根
+  for (const o of objects) {
+    if (light.x >= o.cx - 2) continue;                       // 光在物体右侧：影子在左边（没墙）
+    const topY = o.cy - o.size / 2;
+    let xEnd;
+    if (light.y < topY - 2) {
+      const t = (groundY - light.y) / (topY - light.y);
+      xEnd = light.x + t * (o.cx - light.x);
+      if (xEnd <= o.cx) continue;
+    } else {
+      xEnd = Infinity;                                       // 低角度：影子铺到墙根
+    }
+    xEnd = Math.min(xEnd, wallX);                            // 影子到墙根后“爬”上墙
+    // 把剪影沿地面剪切压扁，像真影子一样铺在地上
+    const sil = getSilhouette(o.e);
+    const h = o.size, w = o.size * sil.aspect;
+    ctx.save();
+    ctx.globalAlpha = 0.38;
+    ctx.translate(o.cx, groundY + 4);
+    ctx.transform(1, 0, -(xEnd - o.cx) / h, -0.22, 0, 0);
+    ctx.drawImage(sil.img, -w / 2, -h, w, h);
+    ctx.restore();
+  }
+}
+
+function drawObject(o) {
+  ctx.save();
+  // 物体背后淡淡光晕，暗色 emoji 也看得清
+  const g = ctx.createRadialGradient(o.cx, o.cy, 4, o.cx, o.cy, o.size * 0.85);
+  g.addColorStop(0, "rgba(255,245,210,0.30)");
+  g.addColorStop(1, "rgba(255,245,210,0)");
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(o.cx, o.cy, o.size * 0.85, 0, 7); ctx.fill();
+  // 按墨迹边界绘制的精灵，视觉中心精确落在 (cx, cy)
+  const sp = getSprite(o.e, o.size);
+  ctx.drawImage(sp.img, sp.x, sp.y, sp.w, sp.h, o.cx - sp.w / 2, o.cy - sp.h / 2, sp.w, sp.h);
+  ctx.restore();
+}
+
+function drawSelection() {
+  if (!selected) return;
+  const o = selected;
+  const r = o.size * 0.62;
+  // 虚线圈
+  ctx.save();
+  ctx.setLineDash([7, 6]);
+  ctx.strokeStyle = "rgba(255,213,74,0.95)"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(o.cx, o.cy, r, 0, 7); ctx.stroke();
+  ctx.setLineDash([]);
+  // 红色 ✕ 删除手柄
+  const [bx, by] = deleteBtnPos(o);
+  ctx.beginPath(); ctx.arc(bx, by, 17, 0, 7);
+  ctx.fillStyle = "#e93b3b"; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 3.2; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(bx - 6, by - 6); ctx.lineTo(bx + 6, by + 6);
+  ctx.moveTo(bx + 6, by - 6); ctx.lineTo(bx - 6, by + 6);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawLight() {
+  // 光晕
+  const g = ctx.createRadialGradient(light.x, light.y, 6, light.x, light.y, 120);
+  g.addColorStop(0, "rgba(255,235,150,0.75)");
+  g.addColorStop(1, "rgba(255,235,150,0)");
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(light.x, light.y, 120, 0, 7); ctx.fill();
+  // 太阳
+  ctx.save();
+  const sp = getSprite(light.e, 64);
+  ctx.drawImage(sp.img, sp.x, sp.y, sp.w, sp.h, light.x - sp.w / 2, light.y - sp.h / 2, sp.w, sp.h);
+  ctx.restore();
+}
+
+function drawToolbox() {
+  // 半透明面板
+  ctx.fillStyle = "rgba(12,18,38,0.78)";
+  roundRect(8, 12, TOOL_W - 16, H - 24, 18, true);
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 18px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("工具箱", TOOL_W / 2, 44);
+  for (let i = 0; i < ITEMS.length; i++) {
+    const it = ITEMS[i], iy = 130 + i * 96;
+    // 大按钮底
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
+    ctx.beginPath(); ctx.arc(TOOL_W / 2, iy, 36, 0, 7); ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 2; ctx.stroke();
+    const sp = getSprite(it.e, 44);
+    ctx.drawImage(sp.img, sp.x, sp.y, sp.w, sp.h, TOOL_W / 2 - sp.w / 2, iy + 2 - sp.h / 2, sp.w, sp.h);
+    ctx.fillStyle = "#dfe8ff";
+    ctx.font = "14px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.fillText(it.name, TOOL_W / 2, iy + 52);
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawLightCone();
+  drawWall();
+  drawShadows();
+  drawGroundShadows();
+  for (const o of objects) drawObject(o);
+  drawLight();
+  drawSelection();
+  drawToolbox();
+  // 正在从工具箱拖出的新物体画在最上层，拖出过程看得见
+  if (drag && drag.kind === "object" && drag.isNew) {
+    drawObject(drag.obj);
+    drawSelection();
+  }
+}
+
+/* ================= 主循环 ================= */
+function loop() {
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const blip = () => tone(520, 0.07, 0.07, "triangle");
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2000);
+}
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

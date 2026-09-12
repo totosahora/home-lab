@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>力的合成实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#eaf3fb; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; z-index:0; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,70,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,70,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  #toolbox {
+    position:absolute; left:14px; top:50%; transform:translateY(-50%);
+    z-index:10; display:flex; flex-direction:column; gap:14px;
+    background:rgba(255,255,255,0.75); padding:14px 12px; border-radius:18px;
+    box-shadow:0 4px 14px rgba(30,60,100,0.18);
+  }
+  #toolbox .tb-title { font-size:14px; font-weight:bold; color:#34517a; text-align:center; }
+  .force-card {
+    width:86px; height:86px; border-radius:16px; border:none; cursor:grab;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px;
+    font-size:14px; font-weight:bold; color:#fff; font-family:inherit;
+    box-shadow:0 3px 8px rgba(0,0,0,0.25); touch-action:none; user-select:none;
+    -webkit-user-select:none;
+  }
+  .force-card:active { transform:scale(1.07); cursor:grabbing; }
+  .force-card .arrow-glyph { font-size:26px; line-height:1; }
+  #btns {
+    position:absolute; top:12px; right:14px; z-index:10;
+    display:flex; gap:10px;
+  }
+  #btns button {
+    font-size:16px; font-weight:bold; padding:10px 18px; font-family:inherit;
+    border-radius:22px; border:none; cursor:pointer;
+    background:rgba(255,255,255,0.85); color:#34517a;
+    box-shadow:0 3px 8px rgba(30,60,100,0.18);
+  }
+  #btns button:active { transform:scale(1.06); }
+  #btns button.on { background:#34517a; color:#ffd54a; }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(20,40,70,0.45);
+  }
+  #winPanel .msg {
+    font-size:38px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px; font-family:inherit;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar"></div>
+<div id="toolbox">
+  <div class="tb-title">力箭头<br>工具箱</div>
+  <button class="force-card" data-color="#e93b3b" style="background:#e93b3b"><span class="arrow-glyph">➤</span>拖我出去</button>
+  <button class="force-card" data-color="#2f7fe9" style="background:#2f7fe9"><span class="arrow-glyph">➤</span>拖我出去</button>
+  <button class="force-card" data-color="#2fbf4a" style="background:#2fbf4a"><span class="arrow-glyph">➤</span>拖我出去</button>
+</div>
+<div id="btns">
+  <button id="modeBtn">自由探索</button>
+  <button id="clearBtn">清空力</button>
+</div>
+<div id="hint"></div>
+<div id="winPanel">
+  <div class="msg">🎉 全部通关！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const modeBtn = document.getElementById("modeBtn");
+const clearBtn = document.getElementById("clearBtn");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 场景数据 ================= */
+// 物理坐标：x 向东，y 向北（绘制时 y 翻转）；力单位 N，1N = PX_PER_N 像素
+const PX_PER_N = 13;
+const BLOCK_HALF = 38;          // 物块半边长
+const SNAP_N = 1, SNAP_DEG = 5; // 大小/方向吸附
+const MAX_FORCES = 4;
+const FORCE_COLORS = ["#e93b3b", "#2f7fe9", "#2fbf4a", "#ff7a1a"];
+const LOCKED_COLOR = "#9b3de0";
+
+// 物块：cx,cy 是屏幕中心，ox,oy 是被合力推开的位移（屏幕坐标，y 向下）
+const block = { ox: 0, oy: 0, vx: 0, vy: 0 };
+function blockCX() { return W / 2 + block.ox; }
+function blockCY() { return H / 2 + block.oy; }
+
+// 力：{name, color, mag(N), ang(度, 0=东 逆时针), locked}
+let forces = [];
+let nextName = 1;
+
+function addForce(color, mag, ang, locked) {
+  const f = { name: locked ? "题" + (forces.filter(x => x.locked).length + 1) : "F" + nextName++,
+              color, mag, ang, locked: !!locked };
+  forces.push(f);
+  return f;
+}
+function sumForce() {
+  let sx = 0, sy = 0;
+  for (const f of forces) {
+    const r = f.ang * Math.PI / 180;
+    sx += f.mag * Math.cos(r);
+    sy += f.mag * Math.sin(r);
+  }
+  return [sx, sy];
+}
+
+/* ================= 关卡 ================= */
+const LEVELS = [
+  { name: "让物块静止",
+    hint: "紫色两个力正把物块往东北推！拖出第三个力（转尾巴调方向、拉箭头调大小）把它抵消，让金色合力消失！",
+    locked: [[8, 0], [6, 90]],
+    goalText: "目标：合力 = 0（物块不动）",
+    check: (fs, sx, sy) => fs.filter(f => !f.locked).length >= 1 && Math.hypot(sx, sy) <= 0.9 },
+  { name: "合力指向正东 10N",
+    hint: "从左边工具箱拖力箭头到物块上，让金色合力正好指向正东 10N！",
+    locked: [],
+    goalText: "目标：合力 = 正东 10N",
+    check: (fs, sx, sy) => fs.length >= 1 && Math.abs(sx - 10) <= 0.9 && Math.abs(sy) <= 0.9 },
+  { name: "两个力合成 10N 正北",
+    hint: "只用两个力（试试 6N 和 8N 斜着放，看平行四边形虚线！），让合力指向正北 10N！",
+    locked: [],
+    goalText: "目标：恰好两个力，合力 = 正北 10N",
+    check: (fs, sx, sy) => fs.length === 2 && Math.abs(sx) <= 0.9 && Math.abs(sy - 10) <= 0.9 },
+  { name: "三个力的平衡",
+    hint: "放三个力（每个至少 3N），让它们围成一圈互相抵消，物块纹丝不动！",
+    locked: [],
+    goalText: "目标：三个力（各 ≥3N），合力 = 0",
+    check: (fs, sx, sy) => fs.length === 3 && fs.every(f => f.mag >= 3) && Math.hypot(sx, sy) <= 0.9 },
+];
+let mode = "challenge";    // challenge | free
+let levelIdx = 0;
+let holdT = 0;             // 目标达成持续时间
+const HOLD_NEED = 1.4;
+let celebrateT = 0;        // 通关庆祝倒计时
+
+function curLevel() { return LEVELS[levelIdx]; }
+
+function resetBlock() { block.ox = 0; block.oy = 0; block.vx = 0; block.vy = 0; }
+
+function loadLevel(i) {
+  levelIdx = i;
+  forces = [];
+  nextName = 1;
+  holdT = 0; celebrateT = 0;
+  resetBlock();
+  for (const [m, a] of curLevel().locked) addForce(LOCKED_COLOR, m, a, true);
+  updateScore();
+  showHint(curLevel().hint, 6000);
+}
+function enterFree() {
+  mode = "free";
+  forces = [];
+  nextName = 1;
+  holdT = 0; celebrateT = 0;
+  resetBlock();
+  winPanel.style.display = "none";
+  updateScore();
+  showHint("自由探索：拖力箭头到物块上，转尾巴调方向、拉箭头调大小，观察金色合力！", 6000);
+}
+function updateScore() {
+  if (mode === "challenge") {
+    scorebar.textContent = `第 ${levelIdx + 1} / ${LEVELS.length} 关 · ${curLevel().name}`;
+  } else {
+    scorebar.textContent = "🧪 自由探索模式";
+  }
+}
+
+/* ================= 物理：物块被合力缓慢推动 ================= */
+function physics(dt) {
+  const [sx, sy] = sumForce();
+  // 屏幕坐标：x 同向，y 翻转（北 = 屏幕上）
+  const ax = sx * 9, ay = -sy * 9;
+  block.vx += ax * dt;
+  block.vy += ay * dt;
+  // 阻尼 + 轻微回中弹簧（合力小时回到中心）
+  const damp = Math.exp(-1.6 * dt);
+  block.vx *= damp; block.vy *= damp;
+  if (Math.hypot(sx, sy) < 1) {
+    block.vx += -block.ox * 1.5 * dt;
+    block.vy += -block.oy * 1.5 * dt;
+  }
+  const sp = Math.hypot(block.vx, block.vy);
+  const MAXSP = celebrateT > 0 ? 220 : 110;
+  if (sp > MAXSP) { block.vx *= MAXSP / sp; block.vy *= MAXSP / sp; }
+  block.ox += block.vx * dt;
+  block.oy += block.vy * dt;
+  // 限制活动范围
+  const lim = Math.min(W, H) * 0.32;
+  const d = Math.hypot(block.ox, block.oy);
+  if (d > lim) { block.ox *= lim / d; block.oy *= lim / d; block.vx *= 0.5; block.vy *= 0.5; }
+}
+
+/* ================= 拖拽交互 ================= */
+// drag = {type:'new', color, x, y} | {type:'head'|'tail', f}
+let drag = null;
+const TIP_HIT = 22, BASE_HIT = 16, SHAFT_HIT = 16;
+
+// 力箭头的屏幕几何：从物块边缘出发
+function arrowGeom(f) {
+  const r = f.ang * Math.PI / 180;
+  const dx = Math.cos(r), dy = -Math.sin(r);      // 屏幕方向
+  const bx = blockCX() + dx * (BLOCK_HALF - 6);
+  const by = blockCY() + dy * (BLOCK_HALF - 6);
+  const tx = blockCX() + dx * (BLOCK_HALF - 6 + f.mag * PX_PER_N);
+  const ty = blockCY() + dy * (BLOCK_HALF - 6 + f.mag * PX_PER_N);
+  return { bx, by, tx, ty, dx, dy };
+}
+
+function snapMag(m) { return Math.max(SNAP_N, Math.min(20, Math.round(m / SNAP_N) * SNAP_N)); }
+function snapAng(a) {
+  a = Math.round(a / SNAP_DEG) * SNAP_DEG;
+  return ((a % 360) + 360) % 360;
+}
+
+function pointerPos(e) { return [e.clientX, e.clientY]; }
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const [px, py] = pointerPos(e);
+  // 1) 箭头头部手柄：拉伸调大小（也可微调方向）
+  for (let i = forces.length - 1; i >= 0; i--) {
+    const f = forces[i];
+    if (f.locked) continue;
+    const g = arrowGeom(f);
+    if (Math.hypot(px - g.tx, py - g.ty) <= TIP_HIT) {
+      drag = { type: "head", f };
+      canvas.setPointerCapture(e.pointerId);
+      hintEl.style.opacity = "0";
+      pop(500);
+      return;
+    }
+  }
+  // 2) 箭头尾部手柄：旋转调方向
+  for (let i = forces.length - 1; i >= 0; i--) {
+    const f = forces[i];
+    if (f.locked) continue;
+    const g = arrowGeom(f);
+    if (Math.hypot(px - g.bx, py - g.by) <= BASE_HIT) {
+      drag = { type: "tail", f };
+      canvas.setPointerCapture(e.pointerId);
+      hintEl.style.opacity = "0";
+      pop(440);
+      return;
+    }
+  }
+  // 3) 点到箭杆：捏住整条箭头 = 拖头部
+  for (let i = forces.length - 1; i >= 0; i--) {
+    const f = forces[i];
+    if (f.locked) continue;
+    const g = arrowGeom(f);
+    const d = distToSeg(px, py, g.bx, g.by, g.tx, g.ty);
+    if (d <= SHAFT_HIT) {
+      drag = { type: "head", f };
+      canvas.setPointerCapture(e.pointerId);
+      hintEl.style.opacity = "0";
+      pop(500);
+      return;
+    }
+  }
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const [px, py] = pointerPos(e);
+  if (drag.type === "new") { drag.x = px; drag.y = py; return; }
+  const f = drag.f;
+  const dx = px - blockCX(), dy = py - blockCY();
+  const dist = Math.hypot(dx, dy);
+  if (drag.type === "head") {
+    if (dist < BLOCK_HALF + 4) {
+      f.mag = 0;   // 拖回物块中心 = 删除
+    } else {
+      f.mag = snapMag((dist - (BLOCK_HALF - 6)) / PX_PER_N);
+      f.ang = snapAng(Math.atan2(-dy, dx) * 180 / Math.PI);
+    }
+  } else if (drag.type === "tail") {
+    if (dist > 20) f.ang = snapAng(Math.atan2(-dy, dx) * 180 / Math.PI);
+  }
+});
+
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  if (drag.type === "new") {
+    // 拖自工具箱：落在物块附近才吸附
+    if (Math.hypot(drag.x - blockCX(), drag.y - blockCY()) <= 130) {
+      if (forces.length >= MAX_FORCES) {
+        showHint("最多放 4 个力哦，把不要的箭头拖回物块中心删掉");
+      } else {
+        const a = snapAng(Math.atan2(-(drag.y - blockCY()), drag.x - blockCX()) * 180 / Math.PI);
+        addForce(drag.color, 5, a, false);
+        pop(880);
+        showHint("拖箭头尖调大小，拖箭尾小圈转方向；拖回中心可删除", 3000);
+      }
+    } else {
+      pop(220);
+    }
+  } else if (drag.f && drag.f.mag === 0) {
+    forces.splice(forces.indexOf(drag.f), 1);
+    pop(300);
+  }
+  drag = null;
+});
+
+function distToSeg(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const L2 = dx * dx + dy * dy;
+  if (L2 === 0) return Math.hypot(px - x1, py - y1);
+  let t = ((px - x1) * dx + (py - y1) * dy) / L2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
+// 工具箱拖出（DOM 按钮 -> canvas 幽灵箭头）
+document.querySelectorAll(".force-card").forEach(card => {
+  card.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    if (winPanel.style.display === "flex") return;
+    drag = { type: "new", color: card.dataset.color, x: e.clientX, y: e.clientY };
+    card.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(600);
+  });
+  card.addEventListener("pointermove", e => {
+    if (drag && drag.type === "new") { drag.x = e.clientX; drag.y = e.clientY; }
+  });
+});
+
+modeBtn.addEventListener("click", () => {
+  pop(880);
+  if (mode === "challenge") { mode = "free"; modeBtn.textContent = "挑战关卡"; modeBtn.classList.add("on"); enterFree(); }
+  else { mode = "challenge"; modeBtn.textContent = "自由探索"; modeBtn.classList.remove("on"); loadLevel(0); }
+});
+clearBtn.addEventListener("click", () => {
+  forces = forces.filter(f => f.locked);
+  resetBlock(); holdT = 0;
+  pop(300);
+  showHint("已清空你放的力", 1200);
+});
+
+/* ================= 关卡判定 ================= */
+function checkGoal(dt) {
+  if (mode !== "challenge" || celebrateT > 0 || winPanel.style.display === "flex") return;
+  const [sx, sy] = sumForce();
+  if (curLevel().check(forces, sx, sy) && !drag) {
+    holdT += dt;
+    if (holdT >= HOLD_NEED) {
+      celebrateT = 1.6;
+      holdT = 0;
+      fanfare();
+      showHint(`🎉 成功！${curLevel().name} —— 看物块往合力方向移动！`, 2500);
+    }
+  } else {
+    holdT = 0;
+  }
+}
+function celebrate(dt) {
+  if (celebrateT <= 0) return;
+  celebrateT -= dt;
+  if (celebrateT <= 0) {
+    if (levelIdx + 1 < LEVELS.length) {
+      loadLevel(levelIdx + 1);
+    } else {
+      winPanel.querySelector(".msg").innerHTML = "🎉 全部通关！<br>你是力的合成小专家！";
+      winPanel.style.display = "flex";
+      fanfare();
+    }
+  }
+}
+document.getElementById("replayBtn").addEventListener("click", () => {
+  winPanel.style.display = "none";
+  loadLevel(0);
+  pop(880);
+});
+
+/* ================= 绘制 ================= */
+function drawGrid() {
+  ctx.fillStyle = "#eaf3fb";
+  ctx.fillRect(0, 0, W, H);
+  // 点阵纸
+  ctx.fillStyle = "rgba(80,120,170,0.16)";
+  const step = 40;
+  for (let x = step / 2; x < W; x += step)
+    for (let y = step / 2; y < H; y += step) {
+      ctx.beginPath(); ctx.arc(x, y, 1.6, 0, 7); ctx.fill();
+    }
+  // 中心十字参考线（东/北标注）
+  const cx = W / 2, cy = H / 2;
+  ctx.strokeStyle = "rgba(80,120,170,0.22)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 8]);
+  ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(W, cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, H); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "rgba(60,95,140,0.55)";
+  ctx.font = "bold 14px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("东 →", W - 52, cy - 12);
+  ctx.fillText("↑ 北", cx + 8, 20);
+}
+
+function drawArrowShaft(x1, y1, x2, y2, color, width, dashed) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const L = Math.hypot(dx, dy);
+  if (L < 4) return;
+  const ux = dx / L, uy = dy / L;
+  const headL = Math.min(20, L * 0.45), headW = width * 2.6;
+  ctx.save();
+  if (dashed) ctx.setLineDash([8, 7]);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2 - ux * headL * 0.7, y2 - uy * headL * 0.7);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  // 箭头头部
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - ux * headL - uy * headW / 2, y2 - uy * headL + ux * headW / 2);
+  ctx.lineTo(x2 - ux * headL + uy * headW / 2, y2 - uy * headL - ux * headW / 2);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawBlock() {
+  const cx = blockCX(), cy = blockCY();
+  ctx.save();
+  ctx.translate(cx, cy);
+  // 影子
+  ctx.fillStyle = "rgba(30,60,100,0.15)";
+  roundRect(-BLOCK_HALF + 4, -BLOCK_HALF + 7, BLOCK_HALF * 2, BLOCK_HALF * 2, 12, true);
+  // 木块
+  const g = ctx.createLinearGradient(0, -BLOCK_HALF, 0, BLOCK_HALF);
+  g.addColorStop(0, "#d9a355"); g.addColorStop(1, "#b57f35");
+  ctx.fillStyle = g;
+  roundRect(-BLOCK_HALF, -BLOCK_HALF, BLOCK_HALF * 2, BLOCK_HALF * 2, 12, true);
+  ctx.strokeStyle = "rgba(90,55,15,0.6)"; ctx.lineWidth = 2.5;
+  roundRect(-BLOCK_HALF, -BLOCK_HALF, BLOCK_HALF * 2, BLOCK_HALF * 2, 12, false);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(90,55,15,0.75)";
+  ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("物块", 0, 0);
+  ctx.restore();
+}
+
+function drawForce(f) {
+  const g = arrowGeom(f);
+  const beingDragged = drag && drag.f === f;
+  // 吸附区提示（从工具箱拖出时）
+  drawArrowShaft(g.bx, g.by, g.tx, g.ty, f.color, beingDragged ? 9 : 7, false);
+  // 标签：F1 8N · 37°
+  const lx = g.tx + g.dx * 26, ly = g.ty + g.dy * 26;
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const label = `${f.name} ${f.mag}N ${f.ang}°`;
+  const tw = ctx.measureText(label).width;
+  ctx.fillStyle = "rgba(255,255,255,0.88)";
+  roundRect(lx - tw / 2 - 7, ly - 13, tw + 14, 26, 13, true);
+  ctx.fillStyle = f.color;
+  ctx.fillText(label, lx, ly);
+  if (f.locked) return;
+  // 头部手柄（大圆点）
+  ctx.beginPath(); ctx.arc(g.tx, g.ty, 13, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.fill();
+  ctx.strokeStyle = f.color; ctx.lineWidth = 3.5; ctx.stroke();
+  ctx.beginPath(); ctx.arc(g.tx, g.ty, 4.5, 0, 7);
+  ctx.fillStyle = f.color; ctx.fill();
+  // 尾部旋转手柄（小圈）
+  ctx.beginPath(); ctx.arc(g.bx, g.by, 9, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.fill();
+  ctx.strokeStyle = f.color; ctx.lineWidth = 3; ctx.stroke();
+}
+
+function drawResultant() {
+  const [sx, sy] = sumForce();
+  const mag = Math.hypot(sx, sy);
+  if (mag < 0.05) return;
+  const ang = Math.atan2(sy, sx);
+  const cx = blockCX(), cy = blockCY();
+  const ux = Math.cos(ang), uy = -Math.sin(ang);
+  const len = Math.min(mag * PX_PER_N, Math.min(W, H) * 0.36);
+  const x2 = cx + ux * (BLOCK_HALF + len), y2 = cy + uy * (BLOCK_HALF + len);
+  // 金色光晕 + 粗箭头
+  ctx.save();
+  ctx.shadowColor = "rgba(255,190,30,0.85)";
+  ctx.shadowBlur = 16;
+  drawArrowShaft(cx + ux * 6, cy + uy * 6, x2, y2, "#ffc21a", 12, false);
+  ctx.restore();
+  ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const deg = Math.round(((ang * 180 / Math.PI) % 360 + 360) % 360);
+  const label = `合力 ${mag.toFixed(1)}N ${deg}°`;
+  const lx = x2 + ux * 30, ly = y2 + uy * 30;
+  const tw = ctx.measureText(label).width;
+  ctx.fillStyle = "rgba(90,60,0,0.85)";
+  roundRect(lx - tw / 2 - 8, ly - 14, tw + 16, 28, 14, true);
+  ctx.fillStyle = "#ffd54a";
+  ctx.fillText(label, lx, ly);
+}
+
+function drawParallelogram() {
+  // 恰好两个力：画平行四边形法则虚线
+  if (forces.length !== 2) return;
+  const [f1, f2] = forces;
+  const g1 = arrowGeom(f1), g2 = arrowGeom(f2);
+  const [sx, sy] = sumForce();
+  if (Math.hypot(sx, sy) < 0.05) return;
+  const cx = blockCX(), cy = blockCY();
+  const v1x = g1.tx - cx, v1y = g1.ty - cy;
+  const v2x = g2.tx - cx, v2y = g2.ty - cy;
+  ctx.save();
+  ctx.setLineDash([7, 7]);
+  ctx.strokeStyle = "rgba(60,95,140,0.55)";
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(g1.tx, g1.ty); ctx.lineTo(cx + v1x + v2x, cy + v1y + v2y);
+  ctx.moveTo(g2.tx, g2.ty); ctx.lineTo(cx + v1x + v2x, cy + v1y + v2y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawHoldRing() {
+  if (mode !== "challenge" || holdT <= 0) return;
+  const cx = blockCX(), cy = blockCY();
+  ctx.beginPath();
+  ctx.arc(cx, cy, BLOCK_HALF + 22, -Math.PI / 2, -Math.PI / 2 + (holdT / HOLD_NEED) * Math.PI * 2);
+  ctx.strokeStyle = "#2fbf4a"; ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.stroke();
+}
+
+function drawSnapZone() {
+  if (!drag || drag.type !== "new") return;
+  const cx = blockCX(), cy = blockCY();
+  const near = Math.hypot(drag.x - cx, drag.y - cy) <= 130;
+  ctx.beginPath(); ctx.arc(cx, cy, 130, 0, 7);
+  ctx.strokeStyle = near ? "rgba(47,191,74,0.8)" : "rgba(80,120,170,0.4)";
+  ctx.lineWidth = 3; ctx.setLineDash([10, 8]); ctx.stroke();
+  ctx.setLineDash([]);
+  // 幽灵箭头
+  const dx = drag.x - cx, dy = drag.y - cy;
+  if (Math.hypot(dx, dy) > 30) {
+    const a = Math.atan2(-dy, dx);
+    const ux = Math.cos(a), uy = -Math.sin(a);
+    ctx.globalAlpha = 0.7;
+    drawArrowShaft(cx + ux * BLOCK_HALF, cy + uy * BLOCK_HALF,
+                   cx + ux * (BLOCK_HALF + 5 * PX_PER_N), cy + uy * (BLOCK_HALF + 5 * PX_PER_N),
+                   drag.color, 8, false);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawGoalText() {
+  if (mode !== "challenge") return;
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const t = curLevel().goalText;
+  const tw = ctx.measureText(t).width;
+  ctx.fillStyle = "rgba(20,40,70,0.7)";
+  roundRect(W / 2 - tw / 2 - 10, 56, tw + 20, 28, 14, true);
+  ctx.fillStyle = "#fff";
+  ctx.fillText(t, W / 2, 70);
+}
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawGrid();
+  drawGoalText();
+  drawParallelogram();
+  drawBlock();
+  for (const f of forces) drawForce(f);
+  drawResultant();
+  drawHoldRing();
+  drawSnapZone();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  checkGoal(dt);
+  celebrate(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 2500);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+loadLevel(0);
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

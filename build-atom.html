@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>原子搭建工厂</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#141b3d; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,14,40,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:19px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,14,40,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #panel {
+    position:absolute; top:64px; right:14px; width:238px; z-index:10;
+    background:rgba(10,14,40,0.82); border-radius:18px; padding:14px 16px;
+    color:#fff; box-shadow:0 4px 14px rgba(0,0,0,0.4);
+  }
+  #cardTitle { font-size:17px; font-weight:bold; color:#8fd3ff; margin-bottom:6px; }
+  #cardGoal { font-size:19px; font-weight:bold; color:#ffd54a; margin-bottom:10px; }
+  #chips { display:flex; flex-direction:column; gap:5px; font-size:15px; margin-bottom:12px; }
+  #chips .chip { display:flex; align-items:center; gap:8px; }
+  #chips .dot { width:16px; height:16px; border-radius:50%; display:inline-block; }
+  #panel .btnrow { display:flex; gap:8px; }
+  #panel button {
+    flex:1; font-size:15px; font-weight:bold; padding:9px 4px;
+    border-radius:14px; border:none; cursor:pointer;
+    background:#3d5af1; color:#fff;
+  }
+  #panel button.alt { background:#ffb800; color:#5a3d00; }
+  #panel button:active { transform:scale(1.05); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">⚛️ 空空的原子 · 快拖零件进来！</div>
+<div id="panel">
+  <div id="cardTitle">第 1 / 7 关</div>
+  <div id="cardGoal">搭一个氢原子！</div>
+  <div id="chips"></div>
+  <div class="btnrow">
+    <button id="modeBtn">🎨 自由模式</button>
+    <button id="clearBtn" class="alt">🧹 清空</button>
+  </div>
+</div>
+<div id="hint">把左边的零件拖进来：质子和中子放进原子核，电子放到轨道上！</div>
+<div id="winPanel">
+  <div class="msg">🎉 全部关卡完成！<br>你是小小化学家！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const cardTitle = document.getElementById("cardTitle");
+const cardGoal = document.getElementById("cardGoal");
+const chipsEl = document.getElementById("chips");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 场景与视图 ================= */
+// 世界坐标 1280 x 800：左侧零件箱，中央原子
+const WORLD_W = 1280, WORLD_H = 800;
+const CX = 760, CY = 420;           // 原子中心
+const NUC_R = 95;                    // 原子核半径
+const ORBIT_R = [210, 330];          // 两圈电子轨道
+const ORBIT_CAP = [2, 8];            // 每层轨道最多坐几个电子
+const NUC_CAP = 24;                  // 原子核最多容纳 nucleon 数
+const NUCLEON_R = 18, ELECTRON_R = 15;
+// 零件箱：三个盒子（质子 / 中子 / 电子）
+const BIN = { x:24, w:240, h:140, ys:[170, 350, 530] };
+const BIN_TYPES = ["p", "n", "e"];
+
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / (WORLD_W + 40), H / (WORLD_H + 40));
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 元素与关卡数据 ================= */
+const ELEMENTS = [null,
+  {sym:"H", name:"氢"}, {sym:"He", name:"氦"}, {sym:"Li", name:"锂"}, {sym:"Be", name:"铍"},
+  {sym:"B", name:"硼"}, {sym:"C", name:"碳"}, {sym:"N", name:"氮"}, {sym:"O", name:"氧"},
+  {sym:"F", name:"氟"}, {sym:"Ne", name:"氖"}, {sym:"Na", name:"钠"}, {sym:"Mg", name:"镁"},
+  {sym:"Al", name:"铝"}, {sym:"Si", name:"硅"}, {sym:"P", name:"磷"}, {sym:"S", name:"硫"},
+  {sym:"Cl", name:"氯"}, {sym:"Ar", name:"氩"}, {sym:"K", name:"钾"}, {sym:"Ca", name:"钙"}
+];
+// 闯关：H → He → Li → C → N → O → Ne
+const LEVELS = [
+  {p:1, n:0, e:1, name:"氢"},
+  {p:2, n:2, e:2, name:"氦"},
+  {p:3, n:4, e:3, name:"锂"},
+  {p:6, n:6, e:6, name:"碳"},
+  {p:7, n:7, e:7, name:"氮"},
+  {p:8, n:8, e:8, name:"氧"},
+  {p:10, n:10, e:10, name:"氖"}
+];
+
+/* ================= 游戏状态 ================= */
+let nucleons = [];        // {type:'p'|'n'}，位置由序号螺旋排布
+let electrons = [];       // {orbit:0|1}，位置由轨道内序号均布
+let mode = "level";       // level | free
+let levelIdx = 0;
+let celebrating = false;
+let confetti = [];
+let animT = 0;            // 轨道旋转时间
+let lastCharge = null, lastElementP = 0;
+
+function countP() { return nucleons.filter(n => n.type === "p").length; }
+function countN() { return nucleons.filter(n => n.type === "n").length; }
+function clearAtom() {
+  nucleons = []; electrons = [];
+  selected = null; lastCharge = null; lastElementP = 0;
+  updateInfo();
+}
+
+/* ================= 顶部信息栏 ================= */
+function infoText() {
+  const p = countP(), e = electrons.length, A = nucleons.length;
+  if (p === 0 && e === 0) return "⚛️ 空空的原子 · 快拖零件进来！";
+  const el = ELEMENTS[p] || {sym:"?", name:"超级原子"};
+  const c = p - e;
+  let charge;
+  if (c === 0) charge = "😊 中性";
+  else if (c > 0) charge = `⚡ 正离子 +${c}`;
+  else charge = `⚡ 负离子 ${c}`;
+  return `${el.sym} ${el.name} · 质量数 ${A} · ${charge}`;
+}
+function updateInfo() { scorebar.textContent = infoText(); }
+
+/* ================= 关卡面板 ================= */
+function updatePanel() {
+  if (mode === "level") {
+    const L = LEVELS[levelIdx];
+    cardTitle.textContent = `第 ${levelIdx + 1} / ${LEVELS.length} 关`;
+    cardGoal.textContent = `搭一个${L.name}原子！`;
+    chipsEl.innerHTML =
+      chip("#e93b3b", `质子 p⁺ × ${L.p}`) +
+      chip("#9aa0a8", `中子 n × ${L.n}`) +
+      chip("#ffd54a", `电子 e⁻ × ${L.e}`);
+  } else {
+    cardTitle.textContent = "🎨 自由模式";
+    cardGoal.textContent = "随便搭！试试离子吧～";
+    chipsEl.innerHTML =
+      chip("#8fd3ff", "电子少了 → 正离子 ⚡") +
+      chip("#8fd3ff", "电子多了 → 负离子 ⚡");
+  }
+}
+function chip(color, text) {
+  return `<div class="chip"><span class="dot" style="background:${color}"></span>${text}</div>`;
+}
+
+/* ================= 布局计算 ================= */
+// nucleon 在原子核内按黄金角螺旋排布，稳定不重叠
+function nucleonPos(i) {
+  const r = 15 * Math.sqrt(i), a = i * 2.39996;
+  return [CX + r * Math.cos(a), CY + r * Math.sin(a)];
+}
+// 电子在轨道上均布，整圈缓慢旋转
+function electronPos(list, idx) {
+  const orb = list[idx].orbit;
+  const inOrb = list.filter(e => e.orbit === orb);
+  const k = inOrb.indexOf(list[idx]);
+  const rot = orb === 0 ? animT * 0.7 : -animT * 0.45;
+  const a = rot + k * 2 * Math.PI / inOrb.length;
+  return [CX + ORBIT_R[orb] * Math.cos(a), CY + ORBIT_R[orb] * Math.sin(a)];
+}
+
+/* ================= 拖拽交互 ================= */
+let drag = null;       // {type, x, y, moved, orig:{kind:'n'}|{kind:'e',orbit}|null}
+let selected = null;   // {kind:'n'|'e', idx} 点中已放置粒子，出现 ✕ 手柄
+
+function hitBin(wx, wy) {
+  for (let i = 0; i < 3; i++) {
+    if (wx >= BIN.x && wx <= BIN.x + BIN.w && wy >= BIN.ys[i] && wy <= BIN.ys[i] + BIN.h) return i;
+  }
+  return -1;
+}
+function hitElectron(wx, wy) {
+  for (let i = electrons.length - 1; i >= 0; i--) {
+    const [x, y] = electronPos(electrons, i);
+    if (Math.hypot(wx - x, wy - y) < ELECTRON_R + 10) return i;
+  }
+  return -1;
+}
+function hitNucleon(wx, wy) {
+  for (let i = nucleons.length - 1; i >= 0; i--) {
+    const [x, y] = nucleonPos(i);
+    if (Math.hypot(wx - x, wy - y) < NUCLEON_R + 8) return i;
+  }
+  return -1;
+}
+function selectedPos() {
+  if (!selected) return null;
+  if (selected.kind === "n" && selected.idx < nucleons.length) return nucleonPos(selected.idx);
+  if (selected.kind === "e" && selected.idx < electrons.length) return electronPos(electrons, selected.idx);
+  return null;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex" || celebrating) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  hintEl.style.opacity = "0";
+  // 1) 点到 ✕ 删除手柄
+  const sp = selectedPos();
+  if (sp && Math.hypot(wx - (sp[0] + 26), wy - (sp[1] - 26)) < 20) {
+    if (selected.kind === "n") nucleons.splice(selected.idx, 1);
+    else electrons.splice(selected.idx, 1);
+    selected = null;
+    pop(220);
+    afterChange();
+    return;
+  }
+  // 2) 抓起已放置的电子
+  let i = hitElectron(wx, wy);
+  if (i >= 0) {
+    const orb = electrons[i].orbit;
+    electrons.splice(i, 1);
+    drag = { type:"e", x:wx, y:wy, moved:0, orig:{kind:"e", orbit:orb} };
+  } else if ((i = hitNucleon(wx, wy)) >= 0) {
+    // 3) 抓起原子核里的质子/中子
+    const t = nucleons[i].type;
+    nucleons.splice(i, 1);
+    drag = { type:t, x:wx, y:wy, moved:0, orig:{kind:"n"} };
+  } else {
+    // 4) 从零件箱拿新零件
+    const b = hitBin(wx, wy);
+    if (b >= 0) drag = { type:BIN_TYPES[b], x:wx, y:wy, moved:0, orig:null };
+    else selected = null;
+  }
+  if (drag) {
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    selected = null;
+    updateInfo();
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  drag.moved += Math.hypot(wx - drag.x, wy - drag.y);
+  drag.x = wx; drag.y = wy;
+});
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  dropDrag(wx, wy);
+  drag = null;
+});
+
+function dropDrag(wx, wy) {
+  // 已放置的粒子只被轻点（几乎没拖动）= 选中，出现 ✕ 删除手柄
+  if (drag.orig && drag.moved < 8) { restore(); return; }
+  const d = Math.hypot(wx - CX, wy - CY);
+  const t = drag.type;
+  // 拖回零件箱 = 放回去（删除）
+  if (wx < BIN.x + BIN.w + 30 && drag.orig) { pop(200); afterChange(); return; }
+  if (t === "p" || t === "n") {
+    if (d < NUC_R + 40) {
+      if (nucleons.length >= NUC_CAP) { restore(); showHint("原子核挤不下啦！🈵"); toneLow(); return; }
+      nucleons.push({ type:t });
+      pop(t === "p" ? 700 : 500);
+      afterChange();
+    } else restore();
+  } else {
+    // 电子：找最近的轨道
+    let orb = -1, best = 55;
+    for (let k = 0; k < 2; k++) {
+      const dd = Math.abs(d - ORBIT_R[k]);
+      if (dd < best) { best = dd; orb = k; }
+    }
+    if (orb >= 0) {
+      const inOrb = electrons.filter(x => x.orbit === orb).length;
+      const other = 1 - orb;
+      const inOther = electrons.filter(x => x.orbit === other).length;
+      if (inOrb >= ORBIT_CAP[orb]) {
+        // 这层满了，另一层还有空位且不算太远就过去
+        if (inOther < ORBIT_CAP[other] && Math.abs(d - ORBIT_R[other]) < 90) orb = other;
+        else { restore(); showHint("轨道坐满啦，电子没位置了！🈵"); toneLow(); return; }
+      }
+      electrons.push({ orbit:orb });
+      pop(1100);
+      afterChange();
+    } else restore();
+  }
+}
+function restore() {
+  // 放回原来的位置；新零件直接消失（轻轻一声）
+  if (drag.orig) {
+    if (drag.orig.kind === "n") {
+      nucleons.push({ type:drag.type });
+      if (drag.moved < 8) selected = { kind:"n", idx:nucleons.length - 1 };  // 轻点 = 选中
+    } else {
+      electrons.push({ orbit:drag.orig.orbit });
+      if (drag.moved < 8) selected = { kind:"e", idx:electrons.length - 1 };
+    }
+    updateInfo();
+  } else toneLow();
+}
+
+/* ================= 状态变化：信息栏 / 判定 / 提示 ================= */
+function afterChange() {
+  updateInfo();
+  if (mode === "level") { checkLevel(); return; }
+  // 自由模式：有趣的离子 / 元素提示
+  const p = countP(), c = p - electrons.length;
+  if (c !== lastCharge) {
+    lastCharge = c;
+    if (p > 0 && c > 0) showHint(`电子不够啦！它带上正电，变成正离子 ⚡ 好想抓回 ${c} 个电子～`);
+    else if (c < 0) showHint(`电子多出来啦！它带上负电，变成负离子 ⚡ 多了 ${-c} 个电子～`);
+    else if (p > 0) { showHint("正负电荷刚刚好，是中性原子 😊"); fanfareSmall(); }
+  }
+  if (p !== lastElementP) {
+    lastElementP = p;
+    if (p > 0 && p <= 20 && c === 0) showHint(`✨ 这是${ELEMENTS[p].name}（${ELEMENTS[p].sym}），第 ${p} 号元素！`);
+  }
+}
+function checkLevel() {
+  if (celebrating) return;
+  const L = LEVELS[levelIdx];
+  if (countP() === L.p && countN() === L.n && electrons.length === L.e) {
+    celebrating = true;
+    spawnConfetti();
+    fanfare();
+    showHint(`🎉 搭对啦！这就是${L.name}原子！`);
+    setTimeout(() => {
+      celebrating = false;
+      levelIdx++;
+      if (levelIdx >= LEVELS.length) {
+        winPanel.style.display = "flex";
+        fanfare();
+      } else {
+        clearAtom();
+        updatePanel();
+        showHint(`下一关：搭一个${LEVELS[levelIdx].name}原子！`);
+      }
+    }, 1900);
+  }
+}
+
+/* ================= 彩带庆祝 ================= */
+const CONFETTI_COLORS = ["#e93b3b", "#ffd54a", "#2fbf4a", "#3d5af1", "#ff7a1a", "#9b3de0"];
+function spawnConfetti() {
+  for (let i = 0; i < 90; i++) {
+    confetti.push({
+      x: CX + (Math.random() - 0.5) * 500, y: CY - 100 - Math.random() * 150,
+      vx: (Math.random() - 0.5) * 160, vy: 60 + Math.random() * 140,
+      rot: Math.random() * 7, vr: (Math.random() - 0.5) * 10,
+      size: 7 + Math.random() * 7, color: CONFETTI_COLORS[i % CONFETTI_COLORS.length],
+      life: 2.4
+    });
+  }
+}
+function stepConfetti(dt) {
+  for (const c of confetti) {
+    c.x += c.vx * dt; c.y += c.vy * dt; c.vy += 120 * dt;
+    c.rot += c.vr * dt; c.life -= dt;
+  }
+  confetti = confetti.filter(c => c.life > 0);
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+  g.addColorStop(0, "#141b3d"); g.addColorStop(1, "#241a4d");
+  ctx.fillStyle = g;
+  ctx.fillRect(-60, -60, WORLD_W + 120, WORLD_H + 120);
+  // 星星
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  for (let i = 0; i < 60; i++) {
+    const x = (i * 197.3) % WORLD_W, y = (i * 131.7) % WORLD_H;
+    ctx.beginPath(); ctx.arc(x, y, (i % 3) * 0.7 + 0.8, 0, 7); ctx.fill();
+  }
+}
+
+function drawAtomZones() {
+  // 电子轨道（虚线）
+  for (let k = 0; k < 2; k++) {
+    ctx.beginPath();
+    ctx.arc(CX, CY, ORBIT_R[k], 0, 7);
+    ctx.setLineDash([10, 10]);
+    ctx.strokeStyle = drag && drag.type === "e" ? "rgba(143,211,255,0.85)" : "rgba(143,211,255,0.45)";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // 原子核底盘（发光）
+  const glow = ctx.createRadialGradient(CX, CY, 10, CX, CY, NUC_R + 26);
+  glow.addColorStop(0, "rgba(255,120,120,0.30)");
+  glow.addColorStop(1, "rgba(255,120,120,0)");
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(CX, CY, NUC_R + 26, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(CX, CY, NUC_R, 0, 7);
+  ctx.fillStyle = drag && drag.type !== "e" ? "rgba(255,170,170,0.22)" : "rgba(255,255,255,0.10)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,170,170,0.6)"; ctx.lineWidth = 3; ctx.stroke();
+  // 标签
+  ctx.fillStyle = "rgba(255,255,255,0.65)";
+  ctx.font = "bold 20px 'PingFang SC', sans-serif";
+  ctx.textAlign = "center";
+  if (nucleons.length === 0) ctx.fillText("原子核", CX, CY + 7);
+  ctx.fillText("电子轨道", CX + ORBIT_R[0] * 0.72, CY - ORBIT_R[0] * 0.72 - 12);
+}
+
+function drawBins() {
+  const names = ["质子 p⁺", "中子 n", "电子 e⁻"];
+  const subs = ["放进原子核", "也放进原子核", "放到轨道上"];
+  ctx.textAlign = "left";
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.font = "bold 26px 'PingFang SC', sans-serif";
+  ctx.fillText("🧰 零件箱", BIN.x + 8, BIN.ys[0] - 56);
+  ctx.font = "15px 'PingFang SC', sans-serif";
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.fillText("从这里把零件拖过去 →", BIN.x + 8, BIN.ys[0] - 30);
+  for (let i = 0; i < 3; i++) {
+    const y = BIN.ys[i];
+    ctx.fillStyle = "rgba(255,255,255,0.10)";
+    roundRect(BIN.x, y, BIN.w, BIN.h, 22, true);
+    ctx.strokeStyle = ["#e93b3b", "#9aa0a8", "#ffd54a"][i];
+    ctx.lineWidth = 3;
+    roundRect(BIN.x, y, BIN.w, BIN.h, 22, false);
+    ctx.stroke();
+    // 样品球
+    const bx = BIN.x + 58, by = y + BIN.h / 2;
+    drawParticle(BIN_TYPES[i], bx, by, 1.5);
+    // 文字
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 23px 'PingFang SC', sans-serif";
+    ctx.fillText(names[i], BIN.x + 112, y + 58);
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.font = "15px 'PingFang SC', sans-serif";
+    ctx.fillText(subs[i], BIN.x + 112, y + 88);
+  }
+}
+
+function drawParticle(type, x, y, scale) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(scale, scale);
+  if (type === "e") {
+    const g = ctx.createRadialGradient(-4, -5, 2, 0, 0, ELECTRON_R);
+    g.addColorStop(0, "#fff3b0"); g.addColorStop(1, "#f5b800");
+    ctx.beginPath(); ctx.arc(0, 0, ELECTRON_R, 0, 7);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = "rgba(120,70,0,0.5)"; ctx.lineWidth = 1.5; ctx.stroke();
+    // 小闪电标
+    ctx.beginPath();
+    ctx.moveTo(2, -9); ctx.lineTo(-4, 1); ctx.lineTo(-1, 1);
+    ctx.lineTo(-3, 9); ctx.lineTo(4, -2); ctx.lineTo(0, -2);
+    ctx.closePath();
+    ctx.fillStyle = "#a05a00"; ctx.fill();
+  } else {
+    const R = NUCLEON_R;
+    const g = ctx.createRadialGradient(-5, -6, 2, 0, 0, R);
+    if (type === "p") { g.addColorStop(0, "#ff8a80"); g.addColorStop(1, "#d32f2f"); }
+    else { g.addColorStop(0, "#e0e0e0"); g.addColorStop(1, "#757575"); }
+    ctx.beginPath(); ctx.arc(0, 0, R, 0, 7);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 1.5; ctx.stroke();
+    if (type === "p") {
+      // 白色 + 号
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 3.5; ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(-6, 0); ctx.lineTo(6, 0);
+      ctx.moveTo(0, -6); ctx.lineTo(0, 6);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function drawPlaced() {
+  for (let i = 0; i < nucleons.length; i++) {
+    const [x, y] = nucleonPos(i);
+    drawParticle(nucleons[i].type, x, y, 1);
+  }
+  for (let i = 0; i < electrons.length; i++) {
+    const [x, y] = electronPos(electrons, i);
+    drawParticle("e", x, y, 1);
+  }
+  // 选中手柄：白圈 + 红色 ✕
+  const sp = selectedPos();
+  if (sp) {
+    ctx.beginPath(); ctx.arc(sp[0], sp[1], 24, 0, 7);
+    ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 3; ctx.stroke();
+    const hx = sp[0] + 26, hy = sp[1] - 26;
+    ctx.beginPath(); ctx.arc(hx, hy, 15, 0, 7);
+    ctx.fillStyle = "#e93b3b"; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(hx - 5, hy - 5); ctx.lineTo(hx + 5, hy + 5);
+    ctx.moveTo(hx + 5, hy - 5); ctx.lineTo(hx - 5, hy + 5);
+    ctx.stroke();
+  }
+}
+
+function drawDrag() {
+  if (!drag) return;
+  ctx.globalAlpha = 0.95;
+  drawParticle(drag.type, drag.x, drag.y, 1.15);
+  ctx.globalAlpha = 1;
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.size / 2, -c.size / 4, c.size, c.size / 2);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#141b3d";
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  drawBackground();
+  drawAtomZones();
+  drawBins();
+  drawPlaced();
+  drawDrag();
+  drawConfetti();
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  animT += dt;
+  stepConfetti(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const toneLow = () => tone(170, 0.12, 0.06, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+function fanfareSmall() { [659, 880].forEach((f, i) => setTimeout(() => pop(f), i * 110)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+document.getElementById("modeBtn").addEventListener("click", () => {
+  mode = mode === "level" ? "free" : "level";
+  document.getElementById("modeBtn").textContent = mode === "level" ? "🎨 自由模式" : "🚩 闯关模式";
+  clearAtom();
+  updatePanel();
+  pop(880);
+  showHint(mode === "free" ? "自由模式：随便搭，看看会变成什么！" : `闯关模式：搭一个${LEVELS[levelIdx].name}原子！`);
+});
+document.getElementById("clearBtn").addEventListener("click", () => {
+  clearAtom();
+  pop(300);
+  showHint("清空啦，重新搭一个吧！");
+});
+document.getElementById("replayBtn").addEventListener("click", () => {
+  winPanel.style.display = "none";
+  levelIdx = 0;
+  mode = "level";
+  document.getElementById("modeBtn").textContent = "🎨 自由模式";
+  clearAtom();
+  updatePanel();
+  pop(880);
+});
+updatePanel();
+updateInfo();
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

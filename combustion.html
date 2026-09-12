@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>燃烧三要素</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#1a232d; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #hint {
+    position:absolute; bottom:88px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,24,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:16px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:94%;
+  }
+  #board {
+    position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+    display:flex; align-items:center; gap:10px; z-index:10;
+    background:rgba(10,16,24,0.88); padding:10px 18px; border-radius:20px;
+    color:#cfe3f5; font-size:17px; font-weight:bold; white-space:nowrap;
+  }
+  .badge {
+    padding:7px 14px; border-radius:16px; background:#3a4756; color:#8fa3b8;
+    font-size:16px; transition:all 0.3s;
+  }
+  .badge.lit {
+    background:#ffb300; color:#4a2f00; transform:scale(1.08);
+    box-shadow:0 0 14px rgba(255,179,0,0.7);
+  }
+  #resetBtn {
+    font-size:15px; font-weight:bold; padding:8px 14px; border-radius:16px;
+    border:none; background:#4a5a6d; color:#dce8f5; cursor:pointer;
+  }
+  #resetBtn:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="hint">拖动玻璃罩和火柴，玩一玩三个实验台！</div>
+<div id="board">
+  <span>🔥 燃烧三要素：</span>
+  <span class="badge" id="badge-fuel">🪵 可燃物</span>
+  <span class="badge" id="badge-oxy">💨 氧气</span>
+  <span class="badge" id="badge-temp">🌡️ 温度</span>
+  <button id="resetBtn">🔄 再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+const badgeEls = {
+  fuel: document.getElementById("badge-fuel"),
+  oxy: document.getElementById("badge-oxy"),
+  temp: document.getElementById("badge-temp")
+};
+let W = 0, H = 0, DPR = 1;
+let benchY = 0, colW = 0;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景与状态 ================= */
+// A 台：蜡烛 + 玻璃罩（氧气）
+const A = {
+  candle: { x: 0, y: 0 },
+  dome: { x: 0, y: 0, on: false, drag: false, home: { x: 0, y: 0 } },
+  oxygen: 1, flame: 1, out: false,
+  oxyBar: { x: 0, y: 0, w: 20, h: 110 }
+};
+// B 台：水杯 + 湿纸团 vs 干纸团（温度）
+const B = {
+  cup: { x: 0, y: 0 },
+  wet: { x: 0, y: 0, r: 23, heat: 0, capHit: false, sndT: 0 },
+  dry: { x: 0, y: 0, r: 23, heat: 0, state: "idle", t: 0, born: 1, sndT: 0 },
+  match: { tx: 0, ty: 0, drag: false, home: { x: 0, y: 0 } }
+};
+// C 台：石头 vs 木块（可燃物）
+const C = {
+  rock: { x: 0, y: 0, r: 30, heat: 0, cool: 0 },
+  wood: { x: 0, y: 0, heat: 0, state: "idle", t: 0, born: 1, sndT: 0 },
+  match: { tx: 0, ty: 0, drag: false, home: { x: 0, y: 0 } }
+};
+const DOME_W = 126, DOME_H = 140;
+const progress = { fuel: false, oxy: false, temp: false };
+const flags = { dryLit: false, woodLit: false };
+let won = false, wonT = 0;
+
+function layout() {
+  colW = W / 3;
+  benchY = Math.round(H * 0.60);
+  const c = i => i * colW + colW / 2;
+  // A 台
+  A.candle.x = c(0) - 30; A.candle.y = benchY;
+  A.dome.home.x = c(0) + 100; A.dome.home.y = benchY;
+  if (A.dome.on) { A.dome.x = A.candle.x; A.dome.y = benchY; }
+  else if (!A.dome.drag) { A.dome.x = A.dome.home.x; A.dome.y = A.dome.home.y; }
+  A.oxyBar.x = c(0) - 100; A.oxyBar.y = benchY - 150;
+  // B 台
+  B.cup.x = c(1) - 100; B.cup.y = benchY;
+  B.wet.x = c(1) - 5; B.wet.y = benchY;
+  B.dry.x = c(1) + 90; B.dry.y = benchY;
+  B.match.home.x = c(1) + 30; B.match.home.y = benchY + 14;
+  // C 台
+  C.rock.x = c(2) - 70; C.rock.y = benchY;
+  C.wood.x = c(2) + 70; C.wood.y = benchY;
+  C.match.home.x = c(2) + 10; C.match.home.y = benchY + 14;
+}
+function resetGame() {
+  A.oxygen = 1; A.flame = 1; A.out = false;
+  A.dome.on = false; A.dome.drag = false;
+  B.wet.heat = 0; B.wet.capHit = false;
+  B.dry.heat = 0; B.dry.state = "idle"; B.dry.t = 0;
+  C.rock.heat = 0; C.rock.cool = 0;
+  C.wood.heat = 0; C.wood.state = "idle"; C.wood.t = 0;
+  B.match.drag = false; C.match.drag = false;
+  progress.fuel = progress.oxy = progress.temp = false;
+  flags.dryLit = flags.woodLit = false;
+  won = false;
+  parts.length = 0;
+  for (const k in badgeEls) {
+    badgeEls[k].classList.remove("lit");
+    badgeEls[k].textContent = badgeEls[k].textContent.replace(" ✓", "");
+  }
+  layout();
+  B.match.tx = B.match.home.x; B.match.ty = B.match.home.y;
+  C.match.tx = C.match.home.x; C.match.ty = C.match.home.y;
+  showHint("拖动玻璃罩和火柴，玩一玩三个实验台！");
+}
+resize();
+B.match.tx = B.match.home.x; B.match.ty = B.match.home.y;
+C.match.tx = C.match.home.x; C.match.ty = C.match.home.y;
+
+/* ================= 粒子 ================= */
+// type: flame 火焰 / smoke 烟 / steam 蒸汽 / spark 火星 / conf 彩带
+const parts = [];
+function push(p) { if (parts.length < 900) parts.push(p); }
+function emitCount(rate, dt) {
+  const a = rate * dt, n = Math.floor(a);
+  return n + (Math.random() < a - n ? 1 : 0);
+}
+function flameEmit(x, y, s, dt) {
+  const n = emitCount(90 * s, dt);
+  for (let i = 0; i < n; i++) push({
+    type: "flame",
+    x: x + (Math.random() - 0.5) * 10 * s, y: y,
+    vx: (Math.random() - 0.5) * 26 * s,
+    vy: -(40 + Math.random() * 70) * (0.5 + 0.6 * s),
+    life: 0, max: 0.35 + Math.random() * 0.45,
+    size: (2.5 + Math.random() * 4) * (0.5 + 0.7 * s)
+  });
+}
+function burnEmit(x, y, s, dt) {
+  const n = emitCount(70 * s, dt);
+  for (let i = 0; i < n; i++) push({
+    type: "flame",
+    x: x + (Math.random() - 0.5) * 30, y: y + (Math.random() - 0.5) * 8,
+    vx: (Math.random() - 0.5) * 30,
+    vy: -(50 + Math.random() * 80),
+    life: 0, max: 0.4 + Math.random() * 0.5,
+    size: 3.5 + Math.random() * 5
+  });
+}
+function steamEmit(x, y, dt) {
+  const n = emitCount(34, dt);
+  for (let i = 0; i < n; i++) push({
+    type: "steam",
+    x: x + (Math.random() - 0.5) * 18, y: y,
+    vx: (Math.random() - 0.5) * 16, vy: -(40 + Math.random() * 25),
+    life: 0, max: 0.9 + Math.random() * 0.5, size: 5 + Math.random() * 5
+  });
+}
+function smokeBurst(x, y) {
+  for (let i = 0; i < 16; i++) push({
+    type: "smoke",
+    x: x + (Math.random() - 0.5) * 14, y: y,
+    vx: (Math.random() - 0.5) * 30, vy: -(22 + Math.random() * 30),
+    life: 0, max: 1.2 + Math.random() * 0.8, size: 6 + Math.random() * 7
+  });
+}
+function sparkBurst(x, y) {
+  for (let i = 0; i < 18; i++) push({
+    type: "spark",
+    x: x, y: y,
+    vx: (Math.random() - 0.5) * 320, vy: -Math.random() * 200,
+    life: 0, max: 0.35 + Math.random() * 0.3, size: 2 + Math.random() * 2
+  });
+}
+const CONF_COLORS = ["#ff5252", "#ffb300", "#66bb6a", "#42a5f5", "#ab47bc", "#ffee58"];
+function confetti() {
+  for (let i = 0; i < 150; i++) push({
+    type: "conf",
+    x: Math.random() * W, y: -20 - Math.random() * H * 0.4,
+    vx: (Math.random() - 0.5) * 90, vy: 60 + Math.random() * 140,
+    life: 0, max: 3 + Math.random() * 1.5,
+    size: 5 + Math.random() * 5,
+    color: CONF_COLORS[i % CONF_COLORS.length],
+    rot: Math.random() * 7, vr: (Math.random() - 0.5) * 10
+  });
+}
+function updateParts(dt) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.life += dt;
+    if (p.life >= p.max) { parts.splice(i, 1); continue; }
+    if (p.type === "spark") p.vy += 520 * dt;
+    else if (p.type === "conf") { p.vy = Math.min(p.vy + 200 * dt, 240); p.rot += p.vr * dt; p.x += Math.sin(p.rot * 2) * 26 * dt; }
+    else if (p.type === "flame") p.vy -= 40 * dt;
+    if (p.type === "steam" || p.type === "smoke") p.size += 16 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+}
+function drawParts() {
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  for (const p of parts) {
+    const k = p.life / p.max;
+    if (p.type === "flame") {
+      ctx.globalAlpha = (1 - k) * 0.75;
+      ctx.fillStyle = `rgb(255,${Math.round(225 - 165 * k)},${Math.round(120 - 100 * k)})`;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size * (1 - k * 0.5), 0, 7); ctx.fill();
+    } else if (p.type === "spark") {
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = "#ffe082";
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, 7); ctx.fill();
+    }
+  }
+  ctx.restore();
+  for (const p of parts) {
+    const k = p.life / p.max;
+    if (p.type === "steam") {
+      ctx.globalAlpha = (1 - k) * 0.5;
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, 7); ctx.fill();
+    } else if (p.type === "smoke") {
+      ctx.globalAlpha = (1 - k) * 0.45;
+      ctx.fillStyle = "#9e9e9e";
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, 7); ctx.fill();
+    } else if (p.type === "conf") {
+      ctx.globalAlpha = Math.min(1, (p.max - p.life) * 2);
+      ctx.fillStyle = p.color;
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+      ctx.fillRect(-p.size / 2, -p.size / 4, p.size, p.size / 2);
+      ctx.restore();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ================= 物理 / 状态更新 ================= */
+function matchNear(p, m) {
+  const cy = p.y - (p.r || 24);
+  return m.drag && Math.hypot(m.tx - p.x, m.ty - cy) < (p.r || 24) + 44;
+}
+
+function updateA(dt) {
+  const d = A.dome;
+  if (d.on && !d.drag) { d.x = A.candle.x; d.y = benchY; }
+  if (d.on) A.oxygen = Math.max(0, A.oxygen - dt / 4.5);
+  else A.oxygen = Math.min(1, A.oxygen + dt / 1.4);
+  const tf = A.oxygen < 0.05 ? 0 : Math.min(1, 0.2 + A.oxygen);
+  A.flame += (tf - A.flame) * Math.min(1, dt * 4);
+  if (!A.out && A.oxygen <= 0) {
+    A.out = true;
+    smokeBurst(A.candle.x, benchY - 72);
+    unlock("oxy");
+    showHint("罩子里的氧气用完了，蜡烛熄灭了！燃烧需要氧气 💨");
+    pop(160);
+  }
+  if (A.out && A.oxygen > 0.45) { A.out = false; pop(880); }
+  if (A.flame > 0.04) flameEmit(A.candle.x, benchY - 68, A.flame, dt);
+}
+
+function updBurnable(p, m, dt, opts) {
+  // opts: {burnTime, onIgnite, isWood}
+  if (p.state === "idle") {
+    if (p.born < 1) p.born = Math.min(1, p.born + dt * 2);
+    if (matchNear(p, m)) {
+      p.heat = Math.min(1, p.heat + dt / 1.2);
+      if (p.heat >= 1) {
+        p.state = "burning"; p.t = 0;
+        opts.onIgnite();
+      }
+    } else p.heat = Math.max(0, p.heat - dt / 0.8);
+  } else if (p.state === "burning") {
+    p.t += dt;
+    burnEmit(p.x, p.y - (opts.isWood ? 46 : p.r), Math.max(0.25, 1 - Math.max(0, p.t - opts.burnTime + 1)), dt);
+    p.sndT += dt;
+    if (p.sndT > 0.28) { p.sndT = 0; crackle(); }
+    if (p.t > opts.burnTime) { p.state = "ash"; p.t = 0; p.heat = 0; }
+  } else if (p.state === "ash") {
+    p.t += dt;
+    if (p.t > 1.8) { p.state = "idle"; p.heat = 0; p.born = 0; pop(660); }
+  }
+}
+
+function updateB(dt) {
+  const m = B.match;
+  if (!m.drag) {
+    m.tx += (m.home.x - m.tx) * Math.min(1, dt * 7);
+    m.ty += (m.home.y - m.ty) * Math.min(1, dt * 7);
+  } else flameEmit(m.tx, m.ty, 0.5, dt);
+  // 湿纸团：水把热量带走，温度升不到着火点
+  const w = B.wet;
+  if (matchNear(w, m)) {
+    w.heat = Math.min(0.65, w.heat + dt / 2.0);
+    steamEmit(w.x, w.y - w.r * 2, dt);
+    w.sndT += dt;
+    if (w.sndT > 0.45) { w.sndT = 0; hiss(); }
+    if (w.heat >= 0.649 && !w.capHit) {
+      w.capHit = true;
+      unlock("temp");
+      showHint("湿纸团点不着！水把热量带走了，温度达不到着火点 💧");
+    }
+  } else w.heat = Math.max(0, w.heat - dt / 0.8);
+  // 干纸团
+  updBurnable(B.dry, m, dt, {
+    burnTime: 2.6, isWood: false,
+    onIgnite() {
+      crackle();
+      if (!flags.dryLit) {
+        flags.dryLit = true;
+        showHint("干纸团烧起来了！温度达到着火点就会燃烧 🔥 再试试湿纸团呢？");
+      } else showHint("干纸团又烧起来了！🔥");
+    }
+  });
+}
+
+function updateC(dt) {
+  const m = C.match;
+  if (!m.drag) {
+    m.tx += (m.home.x - m.tx) * Math.min(1, dt * 7);
+    m.ty += (m.home.y - m.ty) * Math.min(1, dt * 7);
+  } else flameEmit(m.tx, m.ty, 0.5, dt);
+  // 石头：不是可燃物，再热也不烧
+  const r = C.rock;
+  r.cool = Math.max(0, r.cool - dt);
+  if (matchNear(r, m)) {
+    r.heat = Math.min(1, r.heat + dt / 0.9);
+    if (r.heat >= 1 && r.cool <= 0) {
+      r.cool = 2.5;
+      sparkBurst(r.x, r.y - r.r - 6);
+      clack(0.8);
+      unlock("fuel");
+      showHint("石头点不着！它不是可燃物 🪨 燃烧需要可燃物");
+    }
+  } else r.heat = Math.max(0, r.heat - dt / 0.6);
+  // 木块
+  updBurnable(C.wood, m, dt, {
+    burnTime: 3.4, isWood: true,
+    onIgnite() {
+      crackle();
+      if (!flags.woodLit) {
+        flags.woodLit = true;
+        showHint("木块烧起来了！木块是可燃物 🪵 再试试石头呢？");
+      } else showHint("木块又烧起来了！🪵");
+    }
+  });
+}
+
+function update(dt) {
+  updateA(dt);
+  updateB(dt);
+  updateC(dt);
+  updateParts(dt);
+}
+
+/* ================= 进度 ================= */
+function unlock(k) {
+  if (progress[k]) return;
+  progress[k] = true;
+  badgeEls[k].classList.add("lit");
+  badgeEls[k].textContent += " ✓";
+  pop(1047); setTimeout(() => pop(1319), 130);
+  if (!won && progress.fuel && progress.oxy && progress.temp) {
+    won = true; wonT = performance.now();
+    fanfare();
+    confetti();
+    showHint("🎉 燃烧三要素集齐！燃烧需要：可燃物 + 氧气 + 温度达到着火点！");
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#26313d"); g.addColorStop(1, "#1a232d");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 三个实验台分区
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = i % 2 ? "rgba(255,255,255,0.025)" : "rgba(255,255,255,0.05)";
+    ctx.fillRect(i * colW, 0, colW, H);
+    if (i > 0) {
+      ctx.strokeStyle = "rgba(255,255,255,0.08)"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(i * colW, 30); ctx.lineTo(i * colW, H - 100); ctx.stroke();
+    }
+  }
+}
+
+function drawBench(i, title, subtitle) {
+  const x0 = i * colW + 12, w = colW - 24, cx = x0 + w / 2;
+  // 标题
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = 'bold 21px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText(title, cx, 58);
+  ctx.fillStyle = "#9fb4c8";
+  ctx.font = '15px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText(subtitle, cx, 84);
+  // 台面
+  const g = ctx.createLinearGradient(0, benchY - 8, 0, benchY + 30);
+  g.addColorStop(0, "#9c7242"); g.addColorStop(1, "#7d5831");
+  ctx.fillStyle = g;
+  roundRect(x0, benchY - 8, w, 38, 9, true);
+  // 台身
+  ctx.fillStyle = "#5d4125";
+  ctx.fillRect(x0 + 6, benchY + 30, w - 12, Math.max(0, H - 104 - benchY - 30));
+}
+
+function drawLabel(text, x, y) {
+  ctx.textAlign = "center";
+  ctx.font = 'bold 15px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillStyle = "#e8ddc8";
+  ctx.fillText(text, x, y);
+}
+
+function drawHeatBar(x, y, heat, cap) {
+  if (heat < 0.02) return;
+  const w = 78, h = 11;
+  ctx.fillStyle = "rgba(0,0,0,0.5)";
+  roundRect(x - w / 2, y, w, h, 5, true);
+  const g = ctx.createLinearGradient(x - w / 2, 0, x + w / 2, 0);
+  g.addColorStop(0, "#ffb300"); g.addColorStop(1, "#f44336");
+  ctx.fillStyle = g;
+  roundRect(x - w / 2 + 2, y + 2, (w - 4) * heat, h - 4, 3, true);
+  if (cap < 1) {   // 湿纸团的温度上限刻度
+    ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 2;
+    const tx = x - w / 2 + 2 + (w - 4) * cap;
+    ctx.beginPath(); ctx.moveTo(tx, y - 3); ctx.lineTo(tx, y + h + 3); ctx.stroke();
+  }
+  ctx.textAlign = "center";
+  ctx.font = '12px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillStyle = "#ffd54a";
+  ctx.fillText("温度", x, y - 5);
+}
+
+/* ----- A 台 ----- */
+function drawCandle() {
+  const x = A.candle.x, y = benchY;
+  // 火焰光晕
+  if (A.flame > 0.05) {
+    const g = ctx.createRadialGradient(x, y - 78, 4, x, y - 78, 70 * A.flame);
+    g.addColorStop(0, "rgba(255,180,60,0.35)");
+    g.addColorStop(1, "rgba(255,180,60,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y - 78, 70 * A.flame, 0, 7); ctx.fill();
+  }
+  // 蜡烛身
+  ctx.fillStyle = "#f6e7c8";
+  roundRect(x - 13, y - 58, 26, 58, 6, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.2)"; ctx.lineWidth = 2;
+  roundRect(x - 13, y - 58, 26, 58, 6, false); ctx.stroke();
+  ctx.strokeStyle = "#e57373"; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(x - 12, y - 42); ctx.lineTo(x + 12, y - 50); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x - 12, y - 24); ctx.lineTo(x + 12, y - 32); ctx.stroke();
+  // 烛芯
+  ctx.strokeStyle = "#4a3423"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(x, y - 58); ctx.lineTo(x, y - 66); ctx.stroke();
+  // 火焰核心
+  if (A.flame > 0.05) {
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const fg = ctx.createRadialGradient(x, y - 74, 1, x, y - 74, 14 * A.flame);
+    fg.addColorStop(0, "rgba(255,240,180,0.95)");
+    fg.addColorStop(1, "rgba(255,120,20,0)");
+    ctx.fillStyle = fg;
+    ctx.beginPath(); ctx.arc(x, y - 74, 14 * A.flame, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+  // 底座
+  ctx.fillStyle = "#78909c";
+  ctx.beginPath(); ctx.ellipse(x, y - 2, 24, 7, 0, 0, 7); ctx.fill();
+}
+
+function drawOxyBar() {
+  const b = A.oxyBar;
+  ctx.textAlign = "center";
+  ctx.font = 'bold 14px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillStyle = "#8fd3e8";
+  ctx.fillText("氧气 O₂", b.x + b.w / 2, b.y - 10);
+  ctx.fillStyle = "rgba(0,0,0,0.5)";
+  roundRect(b.x, b.y, b.w, b.h, 9, true);
+  const fh = (b.h - 6) * A.oxygen;
+  if (fh > 1) {
+    ctx.fillStyle = A.oxygen > 0.4 ? "#4dd0e1" : "#ef5350";
+    roundRect(b.x + 3, b.y + b.h - 3 - fh, b.w - 6, fh, 6, true);
+  }
+  ctx.strokeStyle = "rgba(160,220,240,0.7)"; ctx.lineWidth = 2;
+  roundRect(b.x, b.y, b.w, b.h, 9, false); ctx.stroke();
+}
+
+function drawDome() {
+  const d = A.dome;
+  ctx.save();
+  ctx.translate(d.x, d.y);
+  const w = DOME_W, h = DOME_H, r = w / 2;
+  ctx.beginPath();
+  ctx.moveTo(-w / 2, 0);
+  ctx.lineTo(-w / 2, -(h - r));
+  ctx.arc(0, -(h - r), r, Math.PI, 0);
+  ctx.lineTo(w / 2, 0);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(170,215,255,0.15)"; ctx.fill();
+  ctx.strokeStyle = "rgba(210,235,255,0.75)"; ctx.lineWidth = 3; ctx.stroke();
+  // 高光
+  ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(-w / 2 + 15, -12); ctx.lineTo(-w / 2 + 15, -(h - r) - 6); ctx.stroke();
+  // 顶部把手
+  ctx.beginPath(); ctx.arc(0, -h - 6, 9, 0, 7);
+  ctx.fillStyle = "#90b8d8"; ctx.fill();
+  ctx.strokeStyle = "rgba(210,235,255,0.8)"; ctx.lineWidth = 2; ctx.stroke();
+  // 底圈
+  ctx.fillStyle = "rgba(140,180,215,0.55)";
+  roundRect(-w / 2 - 9, -5, w + 18, 10, 5, true);
+  ctx.restore();
+}
+
+/* ----- B 台 ----- */
+function drawCup() {
+  const x = B.cup.x, y = benchY;
+  ctx.beginPath();
+  ctx.moveTo(x - 27, y - 64); ctx.lineTo(x - 20, y);
+  ctx.lineTo(x + 20, y); ctx.lineTo(x + 27, y - 64);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(170,215,255,0.12)"; ctx.fill();
+  ctx.strokeStyle = "rgba(210,235,255,0.65)"; ctx.lineWidth = 3; ctx.stroke();
+  // 水
+  ctx.beginPath();
+  ctx.moveTo(x - 23.5, y - 40); ctx.lineTo(x - 20, y);
+  ctx.lineTo(x + 20, y); ctx.lineTo(x + 23.5, y - 40);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(80,160,230,0.55)"; ctx.fill();
+  ctx.strokeStyle = "rgba(150,210,255,0.8)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x - 23.5, y - 40); ctx.lineTo(x + 23.5, y - 40); ctx.stroke();
+}
+
+function drawPaperBall(p, wet) {
+  const cx = p.x, cy = p.y - p.r;
+  let r = p.r, col = wet ? "#b9c7d8" : "#e8d9b0", line = wet ? "#7f95ad" : "#b09b6a";
+  if (p.state === "ash") {
+    // 灰烬
+    ctx.fillStyle = "#616161";
+    ctx.beginPath(); ctx.ellipse(cx, p.y - 6, r * 0.8, 8, 0, 0, 7); ctx.fill();
+    return;
+  }
+  if (p.state === "burning") {
+    const k = Math.min(1, p.t / 2.6);
+    r = p.r * (1 - 0.45 * k);
+    const dk = Math.round(120 * k);
+    col = wet ? col : `rgb(${232 - dk},${217 - dk},${176 - dk})`;
+  }
+  if (p.born < 1) r *= p.born;
+  ctx.fillStyle = col;
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2; ctx.stroke();
+  // 纸团褶皱
+  ctx.strokeStyle = line; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(cx - r * 0.25, cy - r * 0.15, r * 0.45, 0.4, 2.6); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx + r * 0.3, cy + r * 0.2, r * 0.4, 3.4, 5.6); ctx.stroke();
+  // 湿纸团滴水
+  if (wet) {
+    ctx.fillStyle = "rgba(100,170,235,0.85)";
+    ctx.beginPath(); ctx.ellipse(cx - r * 0.5, cy + r + 5, 3, 5, 0, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(cx + r * 0.4, cy + r + 7, 2.5, 4, 0, 0, 7); ctx.fill();
+  }
+}
+
+/* ----- C 台 ----- */
+const ROCK_SHAPE = [1, 0.88, 1.08, 0.94, 1.06, 0.86, 1.02, 0.92];
+function drawRock() {
+  const cx = C.rock.x, cy = C.rock.y - C.rock.r * 0.75, r = C.rock.r;
+  ctx.beginPath();
+  for (let i = 0; i < ROCK_SHAPE.length; i++) {
+    const a = (i / ROCK_SHAPE.length) * Math.PI * 2 - Math.PI / 2;
+    const px = cx + Math.cos(a) * r * ROCK_SHAPE[i];
+    const py = cy + Math.sin(a) * r * 0.78 * ROCK_SHAPE[i];
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fillStyle = "#8d939c"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.18)";
+  ctx.beginPath(); ctx.arc(cx - r * 0.3, cy - r * 0.3, r * 0.3, 0, 7); ctx.fill();
+}
+
+function drawWood() {
+  const w = C.wood;
+  const x = w.x - 33, y = benchY - 46;
+  if (w.state === "ash") {
+    ctx.fillStyle = "#2e2e2e";
+    roundRect(x + 4, benchY - 30, 58, 30, 8, true);
+    ctx.strokeStyle = "rgba(255,120,40,0.5)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x + 12, benchY - 18); ctx.lineTo(x + 20, benchY - 12); ctx.lineTo(x + 30, benchY - 20); ctx.stroke();
+    return;
+  }
+  let scale = 1, dark = 0;
+  if (w.state === "burning") dark = Math.min(1, w.t / 3.4) * 0.7;
+  if (w.born < 1) scale = w.born;
+  ctx.save();
+  ctx.translate(w.x, benchY - 23);
+  ctx.scale(scale, scale);
+  ctx.translate(-w.x, -(benchY - 23));
+  const dk = Math.round(90 * dark);
+  ctx.fillStyle = `rgb(${160 - dk},${102 - dk * 0.7},${44 - dk * 0.4})`;
+  roundRect(x, y, 66, 46, 8, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2;
+  roundRect(x, y, 66, 46, 8, false); ctx.stroke();
+  // 木纹
+  ctx.strokeStyle = `rgba(90,55,20,${0.5 - dark * 0.3})`; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x + 8, y + 15); ctx.lineTo(x + 58, y + 12); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x + 8, y + 30); ctx.lineTo(x + 58, y + 33); ctx.stroke();
+  ctx.restore();
+}
+
+/* ----- 火柴 ----- */
+const MATCH_ANG = -0.45;
+function matchTail(m) {
+  return [m.tx - Math.cos(MATCH_ANG) * 64, m.ty - Math.sin(MATCH_ANG) * 64];
+}
+function drawMatch(m) {
+  const [ax, ay] = matchTail(m);
+  ctx.lineCap = "round";
+  // 杆
+  ctx.strokeStyle = "#e8c890"; ctx.lineWidth = 7;
+  ctx.beginPath(); ctx.moveTo(ax, ay);
+  ctx.lineTo(m.tx - Math.cos(MATCH_ANG) * 10, m.ty - Math.sin(MATCH_ANG) * 10); ctx.stroke();
+  // 红头
+  ctx.strokeStyle = "#d32f2f"; ctx.lineWidth = 10;
+  ctx.beginPath(); ctx.moveTo(m.tx - Math.cos(MATCH_ANG) * 12, m.ty - Math.sin(MATCH_ANG) * 12);
+  ctx.lineTo(m.tx, m.ty); ctx.stroke();
+  // 拖动时火苗光晕
+  if (m.drag) {
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const g = ctx.createRadialGradient(m.tx, m.ty, 1, m.tx, m.ty, 20);
+    g.addColorStop(0, "rgba(255,220,120,0.9)");
+    g.addColorStop(1, "rgba(255,120,20,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(m.tx, m.ty, 20, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+}
+
+/* ----- 胜利横幅 ----- */
+function drawWinBanner() {
+  if (!won) return;
+  const el = performance.now() - wonT;
+  if (el > 4600) return;
+  const a = Math.min(1, el / 250, (4600 - el) / 500);
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.translate(W / 2, H * 0.32);
+  ctx.fillStyle = "rgba(255,179,0,0.95)";
+  roundRect(-290, -58, 580, 116, 24, true);
+  ctx.strokeStyle = "#fff3c4"; ctx.lineWidth = 4;
+  roundRect(-290, -58, 580, 116, 24, false); ctx.stroke();
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#4a2f00";
+  ctx.font = 'bold 34px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText("🎉 燃烧三要素集齐！", 0, -8);
+  ctx.font = 'bold 19px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText("可燃物 + 氧气 + 温度达到着火点", 0, 30);
+  ctx.restore();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawBench(0, "实验一：蜡烛与玻璃罩", "把玻璃罩拖到蜡烛上，再拿开");
+  drawBench(1, "实验二：湿纸团 vs 干纸团", "拖动火柴，点一点两个纸团");
+  drawBench(2, "实验三：石头 vs 木块", "拖动火柴，点一点石头和木块");
+  // A 台
+  drawOxyBar();
+  drawCandle();
+  drawLabel("蜡烛", A.candle.x, benchY + 56);
+  if (!A.dome.on) drawLabel("玻璃罩", A.dome.x, benchY + 56);
+  // B 台
+  drawCup();
+  drawPaperBall(B.wet, true);
+  drawPaperBall(B.dry, false);
+  drawLabel("一杯水", B.cup.x, benchY + 56);
+  drawLabel("湿纸团", B.wet.x, benchY + 56);
+  drawLabel("干纸团", B.dry.x, benchY + 56);
+  drawHeatBar(B.wet.x, benchY - B.wet.r * 2 - 34, B.wet.heat, 0.65);
+  if (B.dry.state === "idle") drawHeatBar(B.dry.x, benchY - B.dry.r * 2 - 34, B.dry.heat, 1);
+  // C 台
+  drawRock();
+  drawWood();
+  drawLabel("石头", C.rock.x, benchY + 56);
+  drawLabel("木块", C.wood.x, benchY + 56);
+  drawHeatBar(C.rock.x, benchY - C.rock.r * 2 - 24, C.rock.heat, 1);
+  if (C.wood.state === "idle") drawHeatBar(C.wood.x, benchY - 46 - 34, C.wood.heat, 1);
+  // 粒子（火焰透过玻璃罩可见，罩子后画）
+  drawParts();
+  if (!A.dome.drag) drawDome();
+  if (!B.match.drag) drawMatch(B.match);
+  if (!C.match.drag) drawMatch(C.match);
+  // 被拖动的画最上层
+  if (A.dome.drag) drawDome();
+  if (B.match.drag) drawMatch(B.match);
+  if (C.match.drag) drawMatch(C.match);
+  drawWinBanner();
+}
+
+/* ================= 交互 ================= */
+let dragItem = null;   // "dome" | "mB" | "mC"
+let dragDX = 0, dragDY = 0;
+
+function pointSegDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy || 1)));
+  return Math.hypot(px - (ax + dx * t), py - (ay + dy * t));
+}
+function hitDome(x, y) {
+  const d = A.dome;
+  return Math.abs(x - d.x) < DOME_W / 2 + 14 && y > d.y - DOME_H - 20 && y < d.y + 10;
+}
+function hitMatch(m, x, y) {
+  const [ax, ay] = matchTail(m);
+  return pointSegDist(x, y, ax, ay, m.tx, m.ty) < 30;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  if (hitDome(x, y)) {
+    dragItem = "dome";
+    A.dome.drag = true; A.dome.on = false;
+    dragDX = x - A.dome.x; dragDY = y - A.dome.y;
+  } else if (hitMatch(B.match, x, y)) {
+    dragItem = "mB"; B.match.drag = true;
+    B.match.tx = x; B.match.ty = y;
+  } else if (hitMatch(C.match, x, y)) {
+    dragItem = "mC"; C.match.drag = true;
+    C.match.tx = x; C.match.ty = y;
+  } else return;
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+  pop(600);
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragItem) return;
+  const x = e.clientX, y = e.clientY;
+  if (dragItem === "dome") {
+    A.dome.x = Math.max(DOME_W / 2, Math.min(W - DOME_W / 2, x - dragDX));
+    A.dome.y = Math.max(DOME_H + 30, Math.min(H - 90, y - dragDY));
+  } else if (dragItem === "mB") {
+    B.match.tx = x; B.match.ty = y;
+  } else if (dragItem === "mC") {
+    C.match.tx = x; C.match.ty = y;
+  }
+});
+function endDrag() {
+  if (dragItem === "dome") {
+    A.dome.drag = false;
+    if (Math.abs(A.dome.x - A.candle.x) < 60 && Math.abs(A.dome.y - benchY) < 90) {
+      A.dome.on = true;
+      A.dome.x = A.candle.x; A.dome.y = benchY;
+      showHint("罩住了！看看氧气条和火焰的变化 👀");
+      pop(330);
+    } else {
+      A.dome.y = benchY;
+      if (A.out) showHint("拿开罩子，新鲜空气进来，蜡烛又点着了！");
+    }
+  } else if (dragItem === "mB") {
+    B.match.drag = false;
+  } else if (dragItem === "mC") {
+    C.match.drag = false;
+  }
+  dragItem = null;
+}
+window.addEventListener("pointerup", endDrag);
+window.addEventListener("pointercancel", endDrag);
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.12);
+const clack = v => tone(1100 + Math.random() * 500, 0.06, 0.05 + 0.12 * v, "square");
+const crackle = () => tone(70 + Math.random() * 130, 0.07, 0.06, "square");
+const hiss = () => tone(1500 + Math.random() * 700, 0.22, 0.03, "sawtooth");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+document.getElementById("resetBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+/* ================= 测试钩子 ================= */
+window.__comb = { A, B, C, progress, update, draw, isWon: () => won, layout };
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

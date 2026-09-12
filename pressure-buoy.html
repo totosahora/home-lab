@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>压强与浮力实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#0d2b45; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(6,30,50,0.85); color:#7fe0ff; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:128px; left:50%; transform:translateX(-50%);
+    background:rgba(6,30,50,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  /* 底部工具箱 */
+  #toolbox {
+    position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+    display:flex; gap:14px; z-index:10;
+  }
+  .tool {
+    width:104px; height:96px; border-radius:18px; cursor:grab;
+    background:rgba(255,255,255,0.12); border:2px solid rgba(127,224,255,0.45);
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    color:#fff; font-size:16px; font-weight:bold; gap:4px;
+    touch-action:none; user-select:none; -webkit-user-select:none;
+  }
+  .tool .ic { font-size:36px; }
+  .tool:active { transform:scale(1.06); background:rgba(255,255,255,0.22); }
+  #dragGhost {
+    position:absolute; z-index:30; pointer-events:none; opacity:0.85;
+    font-size:44px; transform:translate(-50%,-50%); display:none;
+  }
+  /* 右侧面板按钮 */
+  #panelUI {
+    position:absolute; top:64px; right:16px; width:288px; z-index:10;
+    display:flex; flex-direction:column; gap:8px; align-items:stretch;
+  }
+  .btnRow { display:flex; gap:8px; }
+  .pbtn {
+    flex:1; font-size:17px; font-weight:bold; padding:12px 6px;
+    border-radius:14px; border:2px solid rgba(127,224,255,0.5);
+    background:rgba(255,255,255,0.10); color:#fff; cursor:pointer;
+    touch-action:manipulation; user-select:none; -webkit-user-select:none;
+  }
+  .pbtn:active { transform:scale(1.05); }
+  .pbtn.on { background:#1e90d8; border-color:#9fe8ff; }
+  .pbtn.wide { font-size:15px; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🎯 任务：让潜艇悬浮在水中间</div>
+<div id="hint">把下面的物体拖进大水槽，观察浮力（绿）和重力（红）箭头！</div>
+<div id="toolbox">
+  <div class="tool" data-type="iron"><div class="ic">🔩</div>铁块</div>
+  <div class="tool" data-type="wood"><div class="ic">🪵</div>木块</div>
+  <div class="tool" data-type="ball"><div class="ic">🏓</div>乒乓球</div>
+  <div class="tool" data-type="sub"><div class="ic">🚢</div>潜艇</div>
+</div>
+<div id="dragGhost"></div>
+<div id="panelUI">
+  <div class="btnRow">
+    <button class="pbtn on" id="btnWater">💧 水</button>
+    <button class="pbtn" id="btnSalt">🧂 浓盐水</button>
+  </div>
+  <div class="btnRow">
+    <button class="pbtn wide" id="btnFill">⬇ 加水下沉</button>
+    <button class="pbtn wide" id="btnDrain">⬆ 排水上浮</button>
+  </div>
+  <div class="btnRow">
+    <button class="pbtn wide" id="btnClear">🔄 清空水槽</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景与数据 ================= */
+// 水槽几何（屏幕坐标，y 向下）；设定水槽水深为 1 米
+const tank = { x:24, y:70, r:600, surface:120, bottom:560 };
+const PANEL_W = 320;
+let PX_PER_M = 400;   // 水深 1 米对应的像素数
+
+function layout() {
+  tank.r = Math.max(420, W - PANEL_W - 40);
+  tank.surface = Math.max(96, H * 0.16);
+  tank.bottom = H - 160;
+  PX_PER_M = tank.bottom - tank.surface;   // 水面到槽底 = 1 米
+}
+
+// 液体：水 / 浓盐水（密度科学值，浓盐水约 1.2×10³ kg/m³）
+const LIQUIDS = {
+  water: { name:"水",     rho:1.0, rhoSI:1000, color:"rgba(70,160,230,0.55)" },
+  salt:  { name:"浓盐水", rho:1.2, rhoSI:1200, color:"rgba(120,200,240,0.62)" }
+};
+let liquid = LIQUIDS.water;
+const G_ACC = 10;   // N/kg，初中取值
+
+// 物体定义：体积 vol（升 = kg/水密度），密度 rho（kg/L = g/cm³）
+const DEFS = {
+  iron: { name:"铁块",   w:50,  h:50,  vol:0.2, rho:7.8, icon:"🔩", shape:"box"    },
+  wood: { name:"木块",   w:68,  h:68,  vol:1.0, rho:0.6, icon:"🪵", shape:"box"    },
+  ball: { name:"乒乓球", w:44,  h:44,  vol:0.5, rho:0.08,icon:"🏓", shape:"circle" },
+  sub:  { name:"潜艇",   w:120, h:48,  vol:2.0, rho:0,   icon:"🚢", shape:"sub"    }
+};
+// 潜艇平均密度 = 0.75 + 0.55 × 压载水量(0~1)：空舱上浮、满舱下沉
+const SUB_BASE = 0.75, SUB_RANGE = 0.55;
+
+let objects = [];    // 水中物体
+let sub = null;      // 潜艇（同时只允许一艘）
+let probeFrac = 0.5; // 深度游标（0=水面，1=槽底）
+let bubbles = [], confetti = [];
+let missionDone = false, hoverT = 0;
+
+function subDensity() { return SUB_BASE + SUB_RANGE * sub.ballast; }
+function objDensity(o) { return o.type === "sub" ? subDensity() : DEFS[o.type].rho; }
+function objMass(o) { return objDensity(o) * DEFS[o.type].vol; }          // kg
+function gravityOf(o) { return objMass(o) * G_ACC; }                       // N
+// 浸没比例（屏幕 y 向下：物体底边没入水面的深度占比）
+function subFrac(o) {
+  return Math.max(0, Math.min(1, (o.y + o.h / 2 - tank.surface) / o.h));
+}
+function buoyancyOf(o) { return liquid.rho * DEFS[o.type].vol * subFrac(o) * G_ACC; } // N
+
+function spawnObject(type, x, y) {
+  const d = DEFS[type];
+  const o = { type, x, y, w:d.w, h:d.h, vx:0, vy:0, ballast: type === "sub" ? 0.35 : 0 };
+  if (type === "sub") sub = o;
+  objects.push(o);
+  return o;
+}
+function clearTank() {
+  objects = []; sub = null; bubbles = []; confetti = [];
+  missionDone = false; hoverT = 0;
+  scorebar.textContent = "🎯 任务：让潜艇悬浮在水中间";
+}
+
+/* ================= 物理 ================= */
+function stepAll(dt) {
+  for (const o of objects) {
+    if (o.dragging) continue;
+    const f = subFrac(o);
+    const m = objMass(o);
+    // 合力（向下为正）：重力 - 浮力，换算为像素加速度
+    const a = ((gravityOf(o) - buoyancyOf(o)) / m) * PX_PER_M;
+    o.vy += a * dt;
+    // 水的阻力（浸得越多阻力越强），空气阻力很小
+    const drag = 0.15 + 4.2 * f;
+    o.vy -= o.vy * drag * dt;
+    o.vx -= o.vx * drag * dt;
+    o.x += o.vx * dt;
+    o.y += o.vy * dt;
+    // 槽底与侧壁
+    if (o.y + o.h / 2 > tank.bottom) { o.y = tank.bottom - o.h / 2; o.vy = Math.min(0, -o.vy * 0.2); o.vx *= 0.8; }
+    if (o.y - o.h / 2 < tank.y) { o.y = tank.y + o.h / 2; o.vy = Math.max(0, -o.vy * 0.2); }
+    if (o.x - o.w / 2 < tank.x + 8) { o.x = tank.x + 8 + o.w / 2; o.vx = Math.abs(o.vx) * 0.3; }
+    if (o.x + o.w / 2 > tank.r - 8) { o.x = tank.r - 8 - o.w / 2; o.vx = -Math.abs(o.vx) * 0.3; }
+    // 进入水面溅起气泡
+    if (!o.wasWet && f > 0.1 && o.vy > 60) {
+      o.wasWet = true; blub();
+      for (let i = 0; i < 10; i++) addBubble(o.x + (Math.random()-0.5)*o.w, Math.min(o.y + o.h/2, tank.surface + 8));
+    }
+    if (f < 0.02) o.wasWet = false;
+  }
+  // 任务判定：潜艇完全浸没、停在中间悬浮区、速度足够小，保持 1.5 秒
+  if (sub) {
+    const mid = (tank.surface + tank.bottom) / 2;
+    const band = (tank.bottom - tank.surface) * 0.22;
+    if (subFrac(sub) > 0.95 && Math.abs(sub.y - mid) < band && Math.abs(sub.vy) < 30) {
+      hoverT += dt;
+      if (hoverT > 1.5 && !missionDone) {
+        missionDone = true;
+        scorebar.textContent = "🎉 任务完成：潜艇悬浮成功！浮力 = 重力";
+        showHint("太棒了！浮力和重力正好相等，潜艇就悬浮住啦！");
+        fanfare();
+        for (let i = 0; i < 90; i++) addConfetti(sub.x, sub.y);
+      }
+    } else hoverT = 0;
+  }
+  // 气泡
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.y -= b.sp * dt; b.x += Math.sin(b.y * 0.05 + b.ph) * 0.4; b.life -= dt;
+    if (b.y < tank.surface + 4 || b.life <= 0) bubbles.splice(i, 1);
+  }
+  // 彩带
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.vy += 300 * dt; c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt; c.life -= dt;
+    if (c.life <= 0) confetti.splice(i, 1);
+  }
+}
+
+function addBubble(x, y) {
+  bubbles.push({ x, y, r: 2 + Math.random() * 5, sp: 40 + Math.random() * 70, ph: Math.random() * 7, life: 3 });
+}
+function addConfetti(x, y) {
+  const colors = ["#ffd54a","#ff6b6b","#4ecdc4","#a78bfa","#7fe0ff","#ff9f43"];
+  confetti.push({
+    x, y, vx: (Math.random()-0.5) * 420, vy: -120 - Math.random() * 380,
+    w: 6 + Math.random() * 6, h: 4 + Math.random() * 5,
+    rot: Math.random() * 7, vr: (Math.random()-0.5) * 12,
+    color: colors[(Math.random() * colors.length) | 0], life: 2.2 + Math.random()
+  });
+}
+
+/* ================= 绘制 ================= */
+function drawArrow(x, y, len, dir, color, label) {
+  // dir: -1 向上, +1 向下；len 为像素长度（已按力缩放）
+  if (len < 4) return;
+  const y2 = y + dir * len;
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 6; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y2); ctx.stroke();
+  const ah = 13;
+  ctx.beginPath();
+  ctx.moveTo(x, y2 + dir * ah);
+  ctx.lineTo(x - 8, y2); ctx.lineTo(x + 8, y2);
+  ctx.closePath(); ctx.fill();
+  // 标签
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  const ly = y2 + dir * (ah + 16);
+  ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,20,40,0.85)";
+  ctx.strokeText(label, x, ly);
+  ctx.fillStyle = "#fff"; ctx.fillText(label, x, ly);
+}
+
+function drawObject(o) {
+  const d = DEFS[o.type];
+  ctx.save();
+  ctx.translate(o.x, o.y);
+  if (o.shape === "circle") {
+    // 乒乓球
+    const r = o.w / 2;
+    const g = ctx.createRadialGradient(-r*0.3, -r*0.3, 2, 0, 0, r);
+    g.addColorStop(0, "#fff8ee"); g.addColorStop(1, "#f5b04c");
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, 7);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = "rgba(120,70,10,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+  } else if (o.type === "iron") {
+    // 铁块：深灰金属
+    const g = ctx.createLinearGradient(-o.w/2, -o.h/2, o.w/2, o.h/2);
+    g.addColorStop(0, "#9aa5b1"); g.addColorStop(1, "#4a545e");
+    ctx.fillStyle = g; roundRect(-o.w/2, -o.h/2, o.w, o.h, 8, true);
+    ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 2; roundRect(-o.w/2, -o.h/2, o.w, o.h, 8, false);
+    ctx.fillStyle = "rgba(255,255,255,0.5)"; ctx.fillRect(-o.w/2 + 8, -o.h/2 + 7, o.w - 26, 4);
+  } else if (o.type === "wood") {
+    // 木块：棕色 + 木纹
+    ctx.fillStyle = "#c98d4e"; roundRect(-o.w/2, -o.h/2, o.w, o.h, 8, true);
+    ctx.strokeStyle = "rgba(90,50,10,0.55)"; ctx.lineWidth = 2; roundRect(-o.w/2, -o.h/2, o.w, o.h, 8, false);
+    ctx.strokeStyle = "rgba(120,70,20,0.4)"; ctx.lineWidth = 2;
+    for (let i = -1; i <= 1; i++) {
+      ctx.beginPath(); ctx.moveTo(-o.w/2 + 8, i * 14); ctx.quadraticCurveTo(0, i * 14 + 6, o.w/2 - 8, i * 14); ctx.stroke();
+    }
+  } else if (o.type === "sub") {
+    // 潜艇：艇身 + 指挥塔 + 压载舱水位窗
+    const hw = o.w/2, hh = o.h/2;
+    const g = ctx.createLinearGradient(0, -hh, 0, hh);
+    g.addColorStop(0, "#f6c453"); g.addColorStop(1, "#d98e1b");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.ellipse(0, 0, hw, hh, 0, 0, 7); ctx.fill();
+    ctx.strokeStyle = "rgba(80,50,0,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+    // 尾舵
+    ctx.fillStyle = "#d98e1b";
+    ctx.beginPath(); ctx.moveTo(-hw + 4, 0); ctx.lineTo(-hw - 14, -12); ctx.lineTo(-hw - 14, 12); ctx.closePath(); ctx.fill();
+    // 指挥塔与潜望镜
+    ctx.fillStyle = "#f6c453";
+    roundRect(-12, -hh - 14, 26, 16, 5, true);
+    ctx.fillRect(6, -hh - 26, 5, 14); ctx.fillRect(6, -hh - 26, 12, 5);
+    // 舷窗
+    ctx.fillStyle = "#bfeaff";
+    for (const px of [-34, -8, 18]) { ctx.beginPath(); ctx.arc(px, -4, 5, 0, 7); ctx.fill(); }
+    // 压载舱水位窗（下半部蓝色 = 注入的水）
+    const bw = 44, bh = 16, bx = hw - bw - 14, by = 2;
+    ctx.fillStyle = "rgba(255,255,255,0.85)"; roundRect(bx, by, bw, bh, 5, true);
+    ctx.fillStyle = "#2f9be8";
+    const fh = bh * sub.ballast;
+    roundRect(bx, by + bh - fh, bw, fh, 4, true);
+    ctx.strokeStyle = "rgba(0,40,80,0.6)"; ctx.lineWidth = 2; roundRect(bx, by, bw, bh, 5, false);
+  }
+  ctx.restore();
+  // 力箭头：浮力向上（绿）、重力向下（红），长度与力成正比
+  const Fb = buoyancyOf(o), Gf = gravityOf(o);
+  const SCALE = 6, MAXLEN = 170;
+  drawArrow(o.x - 14, o.y, Math.min(MAXLEN, Fb * SCALE), -1, "#2fd35f", `F浮 ${Fb.toFixed(1)} N`);
+  drawArrow(o.x + 14, o.y, Math.min(MAXLEN, Gf * SCALE), 1, "#ff4d4d", `G ${Gf.toFixed(1)} N`);
+}
+
+function roundRect(x, y, w, h, r, fill) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill(); else ctx.stroke();
+}
+
+function drawTank() {
+  // 槽体背景
+  ctx.fillStyle = "rgba(8,40,66,0.9)";
+  ctx.fillRect(tank.x - 8, tank.y - 8, tank.r - tank.x + 16, tank.bottom - tank.y + 16);
+  // 水
+  ctx.fillStyle = liquid.color;
+  ctx.fillRect(tank.x, tank.surface, tank.r - tank.x, tank.bottom - tank.surface);
+  // 水面波光
+  ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (let x = tank.x; x <= tank.r; x += 8) {
+    const y = tank.surface + Math.sin(x * 0.05 + performance.now() * 0.002) * 2;
+    x === tank.x ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  // 悬浮目标区（中间虚线带）
+  const mid = (tank.surface + tank.bottom) / 2, band = (tank.bottom - tank.surface) * 0.22;
+  ctx.setLineDash([10, 8]);
+  ctx.strokeStyle = missionDone ? "rgba(120,255,150,0.9)" : "rgba(255,255,255,0.5)";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(tank.x + 6, mid - band, tank.r - tank.x - 12, band * 2);
+  ctx.setLineDash([]);
+  ctx.font = "bold 14px sans-serif"; ctx.textAlign = "right";
+  ctx.fillStyle = missionDone ? "#8fff9f" : "rgba(255,255,255,0.75)";
+  ctx.fillText("悬 浮 区", tank.r - 14, mid - band - 8);
+  // 槽壁
+  ctx.strokeStyle = "#9fd8f0"; ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(tank.x, tank.y); ctx.lineTo(tank.x, tank.bottom);
+  ctx.lineTo(tank.r, tank.bottom); ctx.lineTo(tank.r, tank.y);
+  ctx.stroke();
+  ctx.font = "14px sans-serif"; ctx.textAlign = "left"; ctx.fillStyle = "rgba(255,255,255,0.7)";
+  ctx.fillText(`水深 1 米 · ${liquid.name}`, tank.x + 6, tank.y - 16);
+}
+
+function drawProbe() {
+  const py = tank.surface + probeFrac * (tank.bottom - tank.surface);
+  // 深度虚线
+  ctx.setLineDash([8, 8]);
+  ctx.strokeStyle = "rgba(255,230,120,0.75)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(tank.x, py); ctx.lineTo(tank.r, py); ctx.stroke();
+  ctx.setLineDash([]);
+  // 深度标注（左侧：水面到游标）
+  ctx.strokeStyle = "#ffe678"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(tank.x + 4, tank.surface); ctx.lineTo(tank.x + 4, py);
+  ctx.stroke();
+  ctx.save();
+  ctx.translate(tank.x + 18, (tank.surface + py) / 2);
+  ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillStyle = "#ffe678";
+  ctx.fillText(`h=${probeFrac.toFixed(2)}m`, 34, 4);
+  ctx.restore();
+  // 游标手柄
+  ctx.beginPath(); ctx.arc(tank.x + 26, py, 17, 0, 7);
+  ctx.fillStyle = "#ffca28"; ctx.fill();
+  ctx.strokeStyle = "#a06d00"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#5a3d00"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("↕", tank.x + 26, py + 5);
+}
+
+function drawPanel() {
+  const px = W - PANEL_W + 8, pw = PANEL_W - 24;
+  // 面板底
+  ctx.fillStyle = "rgba(255,255,255,0.07)";
+  roundRect(px - 8, 56, pw + 8, tank.bottom - 48, 16, true);
+  ctx.fillStyle = "#9fe8ff"; ctx.font = "bold 18px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("🧪 液体压强计", px, 52);
+  // 压强读数
+  const h = probeFrac;                       // 米
+  const p = liquid.rhoSI * G_ACC * h;        // 帕
+  const gy = 244, gh = 180, gw = 44, gx = px + 10;
+  ctx.fillStyle = "#fff"; ctx.font = "bold 16px sans-serif";
+  ctx.fillText(`深度 h = ${h.toFixed(2)} 米`, px + 72, gy + 4);
+  ctx.font = "15px sans-serif"; ctx.fillStyle = "#dff4ff";
+  ctx.fillText("p = ρgh", px + 72, gy + 34);
+  ctx.fillText(`= ${liquid.rhoSI} × 10 × ${h.toFixed(2)}`, px + 72, gy + 58);
+  ctx.fillStyle = "#ffd54a"; ctx.font = "bold 20px sans-serif";
+  ctx.fillText(`= ${Math.round(p)} 帕(Pa)`, px + 72, gy + 88);
+  ctx.font = "13px sans-serif"; ctx.fillStyle = "rgba(255,255,255,0.7)";
+  ctx.fillText("越深，压强越大！", px + 72, gy + 116);
+  // 竖直压强表
+  const pMax = 1200 * G_ACC * 1;
+  ctx.fillStyle = "rgba(0,0,0,0.4)"; roundRect(gx, gy, gw, gh, 10, true);
+  const fh = gh * (p / pMax);
+  const g2 = ctx.createLinearGradient(0, gy + gh, 0, gy);
+  g2.addColorStop(0, "#ffd54a"); g2.addColorStop(1, "#ff5252");
+  ctx.fillStyle = g2;
+  if (fh > 2) roundRect(gx + 4, gy + gh - fh + 2, gw - 8, fh - 6, 7, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 2; roundRect(gx, gy, gw, gh, 10, false);
+  ctx.save();
+  ctx.translate(gx + gw / 2, gy + gh + 18);
+  ctx.font = "12px sans-serif"; ctx.textAlign = "center"; ctx.fillStyle = "rgba(255,255,255,0.7)";
+  ctx.fillText("压强", 0, 0);
+  ctx.restore();
+  // 压载舱状态条
+  const by = gy + gh + 56;
+  ctx.textAlign = "left"; ctx.font = "bold 16px sans-serif"; ctx.fillStyle = "#9fe8ff";
+  ctx.fillText("🚢 潜艇压载水舱", px, by - 14);
+  ctx.fillStyle = "rgba(0,0,0,0.4)"; roundRect(px, by, pw - 20, 26, 8, true);
+  if (sub) {
+    ctx.fillStyle = "#2f9be8";
+    const fw = (pw - 24) * sub.ballast;
+    if (fw > 2) roundRect(px + 2, by + 2, fw, 22, 6, true);
+    // 悬浮临界刻度
+    const bn = Math.max(0, Math.min(1, (liquid.rho - SUB_BASE) / SUB_RANGE));
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(px + 2 + (pw - 24) * bn, by - 4); ctx.lineTo(px + 2 + (pw - 24) * bn, by + 30); ctx.stroke();
+    ctx.font = "12px sans-serif"; ctx.fillStyle = "#ffd54a";
+    ctx.fillText("悬浮点", px + 4 + (pw - 24) * bn, by + 44);
+    ctx.fillStyle = "#fff"; ctx.font = "13px sans-serif"; ctx.textAlign = "right";
+    ctx.fillText(`水量 ${(sub.ballast * 100) | 0}%`, px + pw - 24, by + 44);
+  } else {
+    ctx.fillStyle = "rgba(255,255,255,0.6)"; ctx.font = "14px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("先把潜艇拖进水里哦", px + (pw - 20) / 2, by + 18);
+  }
+  // 提示：拖游标
+  ctx.fillStyle = "rgba(255,255,255,0.65)"; ctx.font = "13px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("💡 拖动水槽左边的黄色游标，测不同深度的压强", px, tank.bottom - 24);
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 背景渐变
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#10395c"); bg.addColorStop(1, "#0a2338");
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  drawTank();
+  drawProbe();
+  for (const o of objects) drawObject(o);
+  // 气泡
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  for (const b of bubbles) { ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill(); }
+  drawPanel();
+  // 彩带
+  for (const c of confetti) {
+    ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.color; ctx.fillRect(-c.w/2, -c.h/2, c.w, c.h);
+    ctx.restore();
+  }
+}
+
+/* ================= 交互 ================= */
+let dragObj = null;    // 槽内拖动的物体
+let dragProbe = false;
+let lastPX = 0, lastPY = 0, lastPT = 0;
+
+function probeHit(x, y) {
+  const py = tank.surface + probeFrac * (tank.bottom - tank.surface);
+  return Math.hypot(x - (tank.x + 26), y - py) < 26;
+}
+function objectAt(x, y) {
+  for (let i = objects.length - 1; i >= 0; i--) {
+    const o = objects[i];
+    if (Math.abs(x - o.x) < o.w / 2 + 10 && Math.abs(y - o.y) < o.h / 2 + 10) return o;
+  }
+  return null;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  hintEl.style.opacity = "0";
+  if (probeHit(x, y)) {
+    dragProbe = true;
+    canvas.setPointerCapture(e.pointerId);
+    pop(500);
+    return;
+  }
+  const o = objectAt(x, y);
+  if (o) {
+    dragObj = o; o.dragging = true;
+    o.vx = 0; o.vy = 0;
+    lastPX = x; lastPY = y; lastPT = performance.now();
+    canvas.setPointerCapture(e.pointerId);
+    pop(600);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  const x = e.clientX, y = e.clientY;
+  if (dragProbe) {
+    probeFrac = Math.max(0, Math.min(1, (y - tank.surface) / (tank.bottom - tank.surface)));
+    return;
+  }
+  if (dragObj) {
+    const now = performance.now(), dtm = Math.max(1, now - lastPT) / 1000;
+    dragObj.vx = (x - lastPX) / dtm; dragObj.vy = (y - lastPY) / dtm;
+    dragObj.x = Math.max(tank.x + 8 + dragObj.w/2, Math.min(tank.r - 8 - dragObj.w/2, x));
+    dragObj.y = Math.max(tank.y + dragObj.h/2, Math.min(tank.bottom - dragObj.h/2, y));
+    lastPX = x; lastPY = y; lastPT = now;
+  }
+});
+window.addEventListener("pointerup", () => {
+  if (dragObj) {
+    // 松手时带上一点抛出速度
+    const cap = 900;
+    dragObj.vx = Math.max(-cap, Math.min(cap, dragObj.vx * 0.4));
+    dragObj.vy = Math.max(-cap, Math.min(cap, dragObj.vy * 0.4));
+    dragObj.dragging = false;
+    dragObj = null;
+  }
+  dragProbe = false;
+});
+
+/* ---- 工具箱拖入 ---- */
+const ghost = document.getElementById("dragGhost");
+let toolDrag = null;
+document.querySelectorAll(".tool").forEach(el => {
+  el.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    toolDrag = { type: el.dataset.type };
+    ghost.textContent = DEFS[toolDrag.type].icon;
+    ghost.style.display = "block";
+    ghost.style.left = e.clientX + "px";
+    ghost.style.top = e.clientY + "px";
+    hintEl.style.opacity = "0";
+  });
+});
+window.addEventListener("pointermove", e => {
+  if (!toolDrag) return;
+  ghost.style.left = e.clientX + "px";
+  ghost.style.top = e.clientY + "px";
+});
+window.addEventListener("pointerup", e => {
+  if (!toolDrag) return;
+  const type = toolDrag.type;
+  toolDrag = null;
+  ghost.style.display = "none";
+  const x = e.clientX, y = e.clientY;
+  if (x > tank.x + 10 && x < tank.r - 10 && y > tank.y && y < tank.bottom + 10) {
+    if (type === "sub" && sub) {
+      showHint("水槽里已经有一艘潜艇啦，先清空再放新的～");
+      pop(220);
+      return;
+    }
+    if (objects.length >= 12) {
+      showHint("水槽太挤啦，点「清空水槽」再来吧");
+      pop(220);
+      return;
+    }
+    const d = DEFS[type];
+    const o = spawnObject(type,
+      Math.max(tank.x + 12 + d.w/2, Math.min(tank.r - 12 - d.w/2, x)),
+      Math.max(tank.y + d.h/2, Math.min(tank.bottom - d.h/2, y)));
+    pop(700);
+    if (type === "sub") showHint("用右侧按钮给压载舱加水/排水，让潜艇停在悬浮区！");
+    else showHint(`${d.name}密度 ${d.rho} g/cm³，${objDensity(o) > liquid.rho ? "比水重，会下沉" : "比水轻，会上浮"}！`);
+  }
+});
+
+/* ---- 面板按钮 ---- */
+const btnWater = document.getElementById("btnWater");
+const btnSalt = document.getElementById("btnSalt");
+function setLiquid(key) {
+  liquid = LIQUIDS[key];
+  btnWater.classList.toggle("on", key === "water");
+  btnSalt.classList.toggle("on", key === "salt");
+  hoverT = 0;
+  showHint(`换成了${liquid.name}：密度 ${liquid.rhoSI} kg/m³`);
+  blub();
+}
+btnWater.addEventListener("click", () => setLiquid("water"));
+btnSalt.addEventListener("click", () => setLiquid("salt"));
+
+// 压载舱：按住连续加水/排水
+function holdButton(id, fn) {
+  const el = document.getElementById(id);
+  let timer = null;
+  const start = e => {
+    e.preventDefault();
+    if (!sub) { showHint("先把潜艇拖进水里哦！"); pop(220); return; }
+    fn();
+    timer = setInterval(fn, 90);
+  };
+  const stop = () => { clearInterval(timer); timer = null; };
+  el.addEventListener("pointerdown", start);
+  el.addEventListener("pointerup", stop);
+  el.addEventListener("pointerleave", stop);
+  el.addEventListener("pointercancel", stop);
+}
+holdButton("btnFill", () => {
+  sub.ballast = Math.min(1, sub.ballast + 0.03);
+  hoverT = 0;
+  tone(300 + sub.ballast * 100, 0.06, 0.06, "triangle");
+  if (subFrac(sub) > 0.5) addBubble(sub.x + sub.w/2 - 20, sub.y + 6);
+});
+holdButton("btnDrain", () => {
+  sub.ballast = Math.max(0, sub.ballast - 0.03);
+  hoverT = 0;
+  tone(420 - sub.ballast * 100, 0.06, 0.06, "triangle");
+  if (subFrac(sub) > 0.5) { addBubble(sub.x - sub.w/2 + 24, sub.y + 8); addBubble(sub.x - sub.w/2 + 30, sub.y + 10); }
+});
+document.getElementById("btnClear").addEventListener("click", () => { clearTank(); pop(500); showHint("水槽清空啦，重新做实验吧"); });
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.14);
+const blub = () => { tone(180, 0.18, 0.10, "sine"); setTimeout(() => tone(140, 0.15, 0.08), 90); };
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 主循环 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  const steps = 3;
+  for (let i = 0; i < steps; i++) stepAll(dt / steps);
+  draw();
+  requestAnimationFrame(loop);
+}
+resize();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>振动与单摆</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#141d2b; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,26,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,26,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10;
+    transition:opacity 0.6s; white-space:nowrap; cursor:pointer; max-width:46%;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  .panel {
+    position:absolute; bottom:12px; z-index:9; width:300px;
+    background:rgba(10,16,26,0.78); border-radius:14px; padding:10px 14px;
+    color:#dfe9f5; font-size:13px;
+  }
+  #panelL { left:12px; border-top:3px solid #4fc3f7; }
+  #panelR { right:12px; border-top:3px solid #ffb74d; }
+  .panel h3 { font-size:14px; margin-bottom:6px; }
+  #panelL h3 { color:#4fc3f7; }
+  #panelR h3 { color:#ffb74d; }
+  .row { display:flex; align-items:center; gap:8px; margin:5px 0; }
+  .row label { width:64px; flex:none; }
+  .row input[type=range] { flex:1; accent-color:#ffd54a; height:18px; }
+  .row .val { width:86px; flex:none; text-align:right; font-variant-numeric:tabular-nums; color:#ffd54a; }
+  .panel .formula { color:#8fa3bd; font-size:12px; margin-top:4px; }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:18px;
+    background:rgba(0,0,0,0.55);
+  }
+  #winPanel .msg {
+    font-size:38px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel .sub { font-size:19px; color:#dfe9f5; text-align:center; line-height:1.7; }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#4a3300;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🎯 任务：调节摆长，让单摆周期 T = 2.00 s</div>
+<div id="hint">拖动滑块或摆球，把它拉离平衡位置，松手释放！</div>
+
+<div class="panel" id="panelL">
+  <h3>弹簧振子（光滑杆）</h3>
+  <div class="row"><label>质量 m</label><input id="slM" type="range" min="0.5" max="4" step="0.1" value="1"><span class="val" id="valM"></span></div>
+  <div class="row"><label>劲度 k</label><input id="slK" type="range" min="20" max="160" step="5" value="60"><span class="val" id="valK"></span></div>
+  <div class="formula">T = 2π√(m/k) · 理论 T = <span id="thT1"></span> s（与振幅无关）</div>
+</div>
+<div class="panel" id="panelR">
+  <h3>单摆（小角度，g = 9.8 m/s²）</h3>
+  <div class="row"><label>摆球质量</label><input id="slPM" type="range" min="0.1" max="2" step="0.1" value="0.5"><span class="val" id="valPM"></span></div>
+  <div class="row"><label>摆长 L</label><input id="slL" type="range" min="0.20" max="2.00" step="0.01" value="1.00"><span class="val" id="valL"></span></div>
+  <div class="formula">T = 2π√(L/g) · 理论 T = <span id="thT2"></span> s（与质量、振幅无关）</div>
+</div>
+
+<div id="winPanel">
+  <div class="msg">🎉 挑战成功！单摆周期 ≈ 2.00 秒</div>
+  <div class="sub">由 T = 2π√(L/g) 得 L = gT²/(4π²) = 9.8×2²/(4π²) ≈ 0.99 m<br>你算对了吗？摆长约 1 米的钟摆，正好 2 秒摆一个来回（秒摆）！</div>
+  <button id="goBtn">继续探索</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+const G = 9.8;                 // 重力加速度 m/s²
+const MAX_TH = 0.35;           // 单摆最大摆角（约 20°，小角近似成立）
+const DAMP = 0.03;             // 微小阻尼，振幅缓慢衰减，周期不受影响
+const GRAPH_T = 6;             // 图像滚动窗口 6 秒
+
+/* ================= 布局 ================= */
+// 上半：两个振动场景；下半：各自的 x-t 图像；底部：DOM 控制条
+const lay = {};
+function fitView() {
+  const ctrlH = 118, graphH = Math.max(110, Math.min(160, H * 0.19));
+  const topBar = 58;
+  lay.lx0 = 12; lay.lx1 = W / 2 - 8;
+  lay.rx0 = W / 2 + 8; lay.rx1 = W - 12;
+  lay.simTop = topBar + 8;
+  lay.simBot = H - ctrlH - graphH - 22;
+  if (lay.simBot < lay.simTop + 120) lay.simBot = lay.simTop + 120;
+  lay.gy0 = lay.simBot + 10;
+  lay.gy1 = lay.gy0 + graphH;
+  // 弹簧：墙在左，杆水平，平衡点略偏右
+  lay.rodY = (lay.simTop + lay.simBot) / 2;
+  lay.wallX = lay.lx0 + 30;
+  lay.eqX = lay.lx0 + (lay.lx1 - lay.lx0) * 0.55;
+  const ampPx = Math.min(lay.eqX - lay.wallX - 60, lay.lx1 - lay.eqX - 50);
+  lay.scaleS = ampPx / 1.0;                     // 弹簧：1 米 = ampPx 像素
+  // 单摆：悬挂点在上方中央
+  lay.pivX = (lay.rx0 + lay.rx1) / 2;
+  lay.pivY = lay.simTop + 30;
+  lay.scaleP = Math.min(190, (lay.simBot - lay.pivY - 34) / 2.05);  // L=2m 也放得下
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 场景数据 ================= */
+// 每个振子：物理量 + 拖动状态 + 周期测量 + 图像历史
+function makeOsc() {
+  return {
+    m:1, x:0, v:0, dragging:false, running:false,
+    t:0, hist:[],                    // hist: {t, y}，y 为归一化位移
+    lastCross:null, periods:[], avg:null, prevX:0
+  };
+}
+const spring = Object.assign(makeOsc(), { m:1, k:60 });   // x 单位：米
+const pend   = Object.assign(makeOsc(), { m:0.5, L:1.0 }); // x 为摆角 θ（弧度）
+pend.x = 0.25;                                             // 初始给个小角度，吸引注意
+let won = false;
+
+function release(o) {          // 松手释放：重新计时、重新测周期
+  o.running = true; o.t = 0; o.hist = [];
+  o.lastCross = null; o.periods = []; o.avg = null; o.prevX = o.x;
+}
+function resetMeasure(o) {     // 改了参数：周期重测，运动保持
+  o.lastCross = null; o.periods = []; o.avg = null;
+}
+function springT() { return 2 * Math.PI * Math.sqrt(spring.m / spring.k); }
+function pendT()   { return 2 * Math.PI * Math.sqrt(pend.L / G); }
+
+/* ================= 物理 ================= */
+function physics(dt) {
+  // 弹簧振子：a = -(k/m) x
+  if (spring.running && !spring.dragging) {
+    const a = -(spring.k / spring.m) * spring.x;
+    spring.v += a * dt;
+    spring.v *= Math.exp(-DAMP * dt);
+    spring.x += spring.v * dt;
+  }
+  // 单摆（小角度）：θ'' = -(g/L) θ
+  if (pend.running && !pend.dragging) {
+    const a = -(G / pend.L) * pend.x;
+    pend.v += a * dt;
+    pend.v *= Math.exp(-DAMP * dt);
+    pend.x += pend.v * dt;
+  }
+  for (const o of [spring, pend]) {
+    if (!o.running) continue;
+    o.t += dt;
+    // 过零点检测（向上穿过平衡位置），线性插值求精确时刻
+    if (o.prevX < 0 && o.x >= 0 && o.v > 0) {
+      const f = o.prevX / (o.prevX - o.x);
+      const ct = o.t - dt + f * dt;
+      if (o.lastCross !== null) {
+        const p = ct - o.lastCross;
+        if (p > 0.1) {
+          o.periods.push(p);
+          if (o.periods.length > 3) o.periods.shift();
+          if (o.periods.length === 3) {
+            o.avg = (o.periods[0] + o.periods[1] + o.periods[2]) / 3;
+            pop(1320);
+            if (o === pend) checkWin();
+          } else tick();
+        }
+      }
+      o.lastCross = ct;
+    }
+    o.prevX = o.x;
+    // 记录图像（每帧一个点足够平滑）
+    const yMax = o === spring ? 1.0 : MAX_TH;
+    o.hist.push({ t:o.t, y:o.x / yMax });
+    while (o.hist.length && o.hist[0].t < o.t - GRAPH_T) o.hist.shift();
+  }
+}
+
+function checkWin() {
+  if (won || pend.avg === null) return;
+  if (Math.abs(pend.avg - 2.0) <= 0.03) {
+    won = true;
+    updateScore();
+    winPanel.style.display = "flex";
+    fanfare();
+  }
+}
+
+/* ================= 交互（拖拽是核心） ================= */
+let dragTarget = null;   // spring | pend
+
+function springBlockRect() {
+  const bw = 44 + 16 * Math.sqrt(spring.m), bh = 34 + 10 * Math.sqrt(spring.m);
+  const cx = lay.eqX + spring.x * lay.scaleS;
+  return { cx, cy: lay.rodY, bw, bh };
+}
+function pendBob() {
+  const len = pend.L * lay.scaleP;
+  return {
+    x: lay.pivX + Math.sin(pend.x) * len,
+    y: lay.pivY + Math.cos(pend.x) * len,
+    r: 15 + 9 * Math.sqrt(pend.m / 0.5), len
+  };
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const sx = e.clientX, sy = e.clientY;
+  const b = springBlockRect();
+  const pb = pendBob();
+  if (Math.abs(sx - b.cx) < b.bw / 2 + 12 && Math.abs(sy - b.cy) < b.bh / 2 + 12) {
+    dragTarget = spring; spring.dragging = true;
+    pop(520);
+  } else if (Math.hypot(sx - pb.x, sy - pb.y) < pb.r + 14) {
+    dragTarget = pend; pend.dragging = true;
+    pop(620);
+  } else return;
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragTarget) return;
+  if (dragTarget === spring) {
+    // 沿杆拖动，限幅 ±1 米
+    let x = (e.clientX - lay.eqX) / lay.scaleS;
+    spring.x = Math.max(-1, Math.min(1, x));
+    spring.v = 0;
+  } else {
+    // 角度由指针相对悬点的方向决定，限制 ±MAX_TH
+    let th = Math.atan2(e.clientX - lay.pivX, e.clientY - lay.pivY);
+    pend.x = Math.max(-MAX_TH, Math.min(MAX_TH, th));
+    pend.v = 0;
+  }
+});
+function endDrag() {
+  if (!dragTarget) return;
+  if (Math.abs(dragTarget.x) > 0.005) {
+    release(dragTarget);
+    whoosh();
+  } else {
+    dragTarget.x = 0; dragTarget.v = 0;
+  }
+  dragTarget.dragging = false;
+  dragTarget = null;
+}
+window.addEventListener("pointerup", endDrag);
+window.addEventListener("pointercancel", endDrag);
+
+/* ================= 控制条（变量实验） ================= */
+const $ = id => document.getElementById(id);
+function fmt(n, d) { return n.toFixed(d === undefined ? 2 : d); }
+function refreshLabels() {
+  $("valM").textContent = fmt(spring.m, 1) + " kg";
+  $("valK").textContent = spring.k + " N/m";
+  $("valPM").textContent = fmt(pend.m, 1) + " kg";
+  $("valL").textContent = fmt(pend.L, 2) + " m";
+  $("thT1").textContent = fmt(springT());
+  $("thT2").textContent = fmt(pendT());
+}
+$("slM").addEventListener("input", e => {
+  spring.m = +e.target.value; resetMeasure(spring); refreshLabels(); pop(700);
+  showHint("弹簧振子：质量变了，看周期变不变？");
+});
+$("slK").addEventListener("input", e => {
+  spring.k = +e.target.value; resetMeasure(spring); refreshLabels(); pop(760);
+  showHint("劲度 k 变了，周期跟着变！");
+});
+$("slPM").addEventListener("input", e => {
+  pend.m = +e.target.value; resetMeasure(pend); refreshLabels(); pop(700);
+  showHint("单摆换了质量——周期变了吗？（不变！）");
+});
+$("slL").addEventListener("input", e => {
+  pend.L = +e.target.value; resetMeasure(pend); refreshLabels(); pop(760);
+  showHint("摆长 L 变了，周期跟着变：T = 2π√(L/g)");
+});
+refreshLabels();
+release(pend);   // 单摆开局就轻轻摆起来
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+function arrow(x0, y0, x1, y1, color) {
+  const a = Math.atan2(y1 - y0, x1 - x0);
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 - 10 * Math.cos(a - 0.4), y1 - 10 * Math.sin(a - 0.4));
+  ctx.lineTo(x1 - 10 * Math.cos(a + 0.4), y1 - 10 * Math.sin(a + 0.4));
+  ctx.closePath(); ctx.fill();
+}
+
+function drawSpringScene() {
+  const { lx0, lx1, simTop, simBot, rodY, wallX, eqX, scaleS } = lay;
+  ctx.save();
+  // 面板底
+  ctx.fillStyle = "rgba(255,255,255,0.045)";
+  roundRect(lx0, simTop, lx1 - lx0, simBot - simTop, 12, true);
+  ctx.fillStyle = "#4fc3f7"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("弹簧振子", lx0 + 14, simTop + 22);
+  // 墙
+  ctx.fillStyle = "#5a6b80";
+  ctx.fillRect(wallX - 18, rodY - 70, 18, 140);
+  ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 2;
+  for (let y = rodY - 66; y < rodY + 66; y += 12) {
+    ctx.beginPath(); ctx.moveTo(wallX - 18, y + 10); ctx.lineTo(wallX - 6, y); ctx.stroke();
+  }
+  // 光滑杆
+  ctx.strokeStyle = "#93a7c0"; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(wallX, rodY); ctx.lineTo(lx1 - 16, rodY); ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.35)"; ctx.font = "12px sans-serif";
+  ctx.fillText("光滑（无摩擦）", lx1 - 108, rodY + 22);
+  // 平衡位置虚线
+  ctx.setLineDash([6, 6]);
+  ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(eqX, rodY - 64); ctx.lineTo(eqX, rodY + 64); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "rgba(255,255,255,0.55)"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("平衡位置", eqX, rodY + 82);
+  // 弹簧（螺旋折线）
+  const b = springBlockRect();
+  const x0 = wallX, x1 = b.cx - b.bw / 2, coils = 9, amp = 13;
+  ctx.strokeStyle = "#4fc3f7"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(x0, rodY);
+  const seg = (x1 - x0) / (coils * 2);
+  for (let i = 1; i <= coils * 2; i++) {
+    ctx.lineTo(x0 + seg * i, rodY + (i % 2 === 1 ? -amp : amp));
+  }
+  ctx.lineTo(x1, rodY); ctx.stroke();
+  // 滑块
+  const g = ctx.createLinearGradient(b.cx, b.cy - b.bh / 2, b.cx, b.cy + b.bh / 2);
+  g.addColorStop(0, "#8fd8ff"); g.addColorStop(1, "#2f8fd0");
+  ctx.fillStyle = g;
+  roundRect(b.cx - b.bw / 2, b.cy - b.bh / 2, b.bw, b.bh, 8, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 2;
+  roundRect(b.cx - b.bw / 2, b.cy - b.bh / 2, b.bw, b.bh, 8, false); ctx.stroke();
+  ctx.fillStyle = "#06283f"; ctx.font = "bold 13px sans-serif";
+  ctx.fillText(fmt(spring.m, 1) + "kg", b.cx, b.cy + 4);
+  if (!spring.dragging && Math.abs(spring.v) < 0.01 && Math.abs(spring.x) < 0.005 && !spring.running) {
+    ctx.fillStyle = "rgba(255,255,255,0.7)"; ctx.font = "13px sans-serif";
+    ctx.fillText("👆 拖我", b.cx, b.cy - b.bh / 2 - 12);
+  }
+  // 矢量箭头：速度（绿）、回复力 F=-kx（红）
+  if (spring.running && !spring.dragging) {
+    if (Math.abs(spring.v) > 0.05)
+      arrow(b.cx, b.cy - b.bh / 2 - 16, b.cx + spring.v * 55, b.cy - b.bh / 2 - 16, "#7ee787");
+    if (Math.abs(spring.x) > 0.03) {
+      // 回复力箭头，长度限幅防出界
+      const fl = Math.max(-90, Math.min(90, -spring.k * spring.x * 0.55));
+      arrow(b.cx, b.cy + b.bh / 2 + 16, b.cx + fl, b.cy + b.bh / 2 + 16, "#ff6b6b");
+      ctx.fillStyle = "#ff6b6b"; ctx.font = "12px sans-serif";
+      ctx.fillText("F", b.cx + fl + (fl > 0 ? 12 : -12), b.cy + b.bh / 2 + 20);
+    }
+  }
+  // 拖动时显示位移
+  if (spring.dragging) {
+    ctx.fillStyle = "#ffd54a"; ctx.font = "bold 14px sans-serif";
+    ctx.fillText("x = " + fmt(spring.x) + " m", b.cx, b.cy - b.bh / 2 - 14);
+    arrow(eqX, rodY - 78, b.cx, rodY - 78, "#ffd54a");
+  }
+  ctx.restore();
+}
+
+function drawPendScene() {
+  const { rx0, rx1, simTop, simBot, pivX, pivY, scaleP } = lay;
+  ctx.save();
+  ctx.fillStyle = "rgba(255,255,255,0.045)";
+  roundRect(rx0, simTop, rx1 - rx0, simBot - simTop, 12, true);
+  ctx.fillStyle = "#ffb74d"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("单摆", rx0 + 14, simTop + 22);
+  const pb = pendBob();
+  // 摆角扇形（从竖直方向到摆线）
+  if (Math.abs(pend.x) > 0.01) {
+    ctx.fillStyle = "rgba(255,183,77,0.18)";
+    ctx.beginPath();
+    ctx.moveTo(pivX, pivY);
+    ctx.arc(pivX, pivY, pb.len, Math.PI / 2, Math.PI / 2 + pend.x, pend.x < 0);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#ffb74d"; ctx.font = "13px sans-serif"; ctx.textAlign = "center";
+    const mid = pend.x / 2, lr = pb.len * 0.78;
+    ctx.fillText(fmt(Math.abs(pend.x) * 180 / Math.PI, 1) + "°",
+      pivX + Math.sin(mid) * lr, pivY + Math.cos(mid) * lr + 4);
+  }
+  // 摆动轨迹弧线 + 最大摆角刻度
+  ctx.setLineDash([4, 6]);
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(pivX, pivY, pb.len, Math.PI / 2 - MAX_TH, Math.PI / 2 + MAX_TH);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  // 竖直虚线（平衡位置）
+  ctx.setLineDash([6, 6]);
+  ctx.strokeStyle = "rgba(255,255,255,0.4)";
+  ctx.beginPath(); ctx.moveTo(pivX, pivY); ctx.lineTo(pivX, pivY + pb.len + 12); ctx.stroke();
+  ctx.setLineDash([]);
+  // 悬点支架
+  ctx.fillStyle = "#5a6b80";
+  ctx.fillRect(pivX - 60, pivY - 12, 120, 12);
+  ctx.beginPath(); ctx.arc(pivX, pivY, 5, 0, 7);
+  ctx.fillStyle = "#93a7c0"; ctx.fill();
+  // 摆线 + 摆长标注
+  ctx.strokeStyle = "#d7c9a8"; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(pivX, pivY); ctx.lineTo(pb.x, pb.y); ctx.stroke();
+  ctx.save();
+  ctx.translate((pivX + pb.x) / 2, (pivY + pb.y) / 2);
+  let rot = Math.atan2(pb.y - pivY, pb.x - pivX) - Math.PI / 2;
+  if (rot > Math.PI / 2) rot -= Math.PI;    // 保持文字正立
+  if (rot < -Math.PI / 2) rot += Math.PI;
+  ctx.rotate(rot);
+  ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("L = " + fmt(pend.L, 2) + " m", 0, -6);
+  ctx.restore();
+  // 摆球
+  const g = ctx.createRadialGradient(pb.x - pb.r * 0.35, pb.y - pb.r * 0.4, 2, pb.x, pb.y, pb.r);
+  g.addColorStop(0, "#ffe0b2"); g.addColorStop(1, "#e07f1a");
+  ctx.beginPath(); ctx.arc(pb.x, pb.y, pb.r, 0, 7);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#4a2a00"; ctx.font = "bold 12px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(fmt(pend.m, 1), pb.x, pb.y + 4);
+  if (!pend.running && !pend.dragging && Math.abs(pend.x) < 0.005) {
+    ctx.fillStyle = "rgba(255,255,255,0.7)"; ctx.font = "13px sans-serif";
+    ctx.fillText("👆 拖我", pb.x, pb.y - pb.r - 12);
+  }
+  // 矢量箭头：切向速度（绿）、回复力（红，指向平衡位置）
+  if (pend.running && !pend.dragging) {
+    const tx = Math.cos(pend.x), ty = -Math.sin(pend.x);   // θ 增大的切向
+    const vt = pend.v * pend.L;                            // 切向速度 m/s
+    if (Math.abs(vt) > 0.05)
+      arrow(pb.x, pb.y, pb.x + tx * vt * 55, pb.y + ty * vt * 55, "#7ee787");
+    if (Math.abs(pend.x) > 0.02)
+      arrow(pb.x, pb.y + pb.r + 8,
+        pb.x - tx * Math.sin(pend.x) * 90, pb.y + pb.r + 8 - ty * Math.sin(pend.x) * 90, "#ff6b6b");
+  }
+  ctx.restore();
+}
+
+// 位移-时间图像（滚动记录最近 6 秒）+ 周期测量秒表
+function drawGraph(o, x0, x1, color, label) {
+  const { gy0, gy1 } = lay;
+  const gw = x1 - x0, gh = gy1 - gy0;
+  ctx.save();
+  ctx.fillStyle = "rgba(255,255,255,0.045)";
+  roundRect(x0, gy0, gw, gh, 12, true);
+  const pad = 12, px0 = x0 + pad, px1 = x1 - pad;
+  const py0 = gy0 + 30, py1 = gy1 - 14, pyM = (py0 + py1) / 2;
+  // 时间刻度（每 1 秒一格）
+  ctx.strokeStyle = "rgba(255,255,255,0.12)"; ctx.lineWidth = 1;
+  ctx.fillStyle = "rgba(255,255,255,0.4)"; ctx.font = "10px sans-serif"; ctx.textAlign = "center";
+  const tEnd = Math.max(GRAPH_T, o.t);
+  const t0 = tEnd - GRAPH_T;
+  for (let s = Math.ceil(t0); s <= tEnd; s++) {
+    const gx = px0 + (s - t0) / GRAPH_T * (px1 - px0);
+    ctx.beginPath(); ctx.moveTo(gx, py0); ctx.lineTo(gx, py1); ctx.stroke();
+    ctx.fillText(s + "s", gx, py1 + 11);
+  }
+  // 零线
+  ctx.strokeStyle = "rgba(255,255,255,0.3)";
+  ctx.beginPath(); ctx.moveTo(px0, pyM); ctx.lineTo(px1, pyM); ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.6)"; ctx.font = "11px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText(label, px0 + 2, py0 - 6);
+  // 曲线
+  ctx.strokeStyle = color; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  let started = false;
+  for (const p of o.hist) {
+    const gx = px0 + (p.t - t0) / GRAPH_T * (px1 - px0);
+    const gy = pyM - p.y * (py1 - py0) / 2 * 0.9;
+    if (!started) { ctx.moveTo(gx, gy); started = true; }
+    else ctx.lineTo(gx, gy);
+  }
+  ctx.stroke();
+  // 周期测量秒表
+  ctx.font = "bold 13px sans-serif"; ctx.textAlign = "right";
+  let txt = "⏱ " + fmt(o.t, 1) + "s · 周期: ";
+  txt += o.periods.length ? o.periods.map(p => fmt(p)).join(" / ") : "—";
+  if (o.avg !== null) txt += " → 平均 " + fmt(o.avg) + " s";
+  ctx.fillStyle = o.avg !== null ? "#ffd54a" : "rgba(255,255,255,0.75)";
+  ctx.fillText(txt, px1, gy0 + 18);
+  ctx.restore();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#141d2b";
+  ctx.fillRect(0, 0, W, H);
+  drawSpringScene();
+  drawPendScene();
+  drawGraph(spring, lay.lx0, lay.lx1, "#4fc3f7", "位移 x（右为正）");
+  drawGraph(pend, lay.rx0, lay.rx1, "#ffb74d", "摆角 θ / 最大摆角");
+}
+
+/* ================= 计分与提示 ================= */
+function updateScore() {
+  scorebar.textContent = won
+    ? "✅ 任务完成！单摆平均周期 = " + fmt(pend.avg) + " s"
+    : "🎯 任务：调节摆长，让单摆周期 T = 2.00 s" +
+      (pend.avg !== null ? "（当前平均 " + fmt(pend.avg) + " s）" : "");
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  const steps = 4;   // 子步进，振动更平滑
+  for (let i = 0; i < steps; i++) physics(dt / steps);
+  if (!won && pend.avg !== null) updateScore();
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+const tick = () => tone(1050, 0.05, 0.06, "square");
+const whoosh = () => tone(340, 0.12, 0.08, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+setTimeout(() => { hintEl.style.opacity = "0"; }, 5000);   // 首次提示 5 秒后自动淡出
+document.getElementById("goBtn").addEventListener("click", () => {
+  winPanel.style.display = "none";
+  pop(880);
+});
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

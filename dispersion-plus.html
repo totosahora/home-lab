@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>色散进阶：测量折射率</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#1c2637; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(16,22,38,0.88); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:16px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(16,22,38,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92%;
+  }
+  #matbar {
+    position:absolute; top:12px; left:12px; z-index:10;
+    display:flex; flex-direction:column; gap:8px;
+  }
+  #matbar .mtitle { color:#9fb2c8; font-size:13px; font-weight:bold; padding-left:6px; }
+  #matbar button {
+    font-size:16px; font-weight:bold; padding:10px 16px;
+    border-radius:22px; border:2px solid #4a5a78; background:rgba(16,22,38,0.88);
+    color:#cfd8ea; cursor:pointer; touch-action:manipulation; text-align:left;
+  }
+  #matbar button.on { border-color:#ffd54a; color:#ffd54a; background:rgba(50,40,10,0.9); }
+  #matbar button:active { transform:scale(1.05); }
+  #panel {
+    position:absolute; top:12px; right:12px; width:268px; z-index:10;
+    background:rgba(16,22,38,0.88); border:2px solid #4a5a78; border-radius:16px;
+    color:#e8eef8; font-size:14px; padding:12px 14px; line-height:1.65;
+    pointer-events:none;
+  }
+  #panel .cap { color:#9fb2c8; }
+  #panel .val { color:#ffd54a; font-weight:bold; }
+  #panel .sep { border-top:1px dashed #4a5a78; margin:6px 0; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🎯 任务：①测量水的折射率 ☐　②让紫光偏折角最大 ☐</div>
+<div id="matbar">
+  <div class="mtitle">棱镜材料</div>
+  <button data-m="glass">🔺 玻璃 n≈1.52</button>
+  <button data-m="crystal">💎 水晶 n≈1.57</button>
+  <button data-m="water">💧 水 n≈1.33</button>
+</div>
+<div id="panel">
+  <div><span class="cap">材料：</span><span class="val" id="pMat"></span></div>
+  <div><span class="cap">入射角 i：</span><span class="val" id="pI"></span></div>
+  <div><span class="cap">折射角 r：</span><span class="val" id="pR"></span></div>
+  <div class="cap" id="pN"></div>
+  <div class="sep"></div>
+  <div><span class="cap">紫光偏折角 δ：</span><span class="val" id="pDev"></span></div>
+  <div class="cap" id="pBest"></div>
+</div>
+<div id="hint">拖动 🔦 手电筒改变入射角；把 📐 量角器拖到入射点（光进入棱镜处）就能测角度！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+const scorebar = document.getElementById("scorebar");
+let W = 0, H = 0, DPR = 1;
+
+// 世界坐标固定范围，等比缩放适配窗口
+const WORLD = { x0:-720, y0:-470, w:1440, h:940 };
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / WORLD.w, H / WORLD.h);
+  view.ox = (W - WORLD.w * view.s) / 2 - WORLD.x0 * view.s;
+  view.oy = (H - WORLD.h * view.s) / 2 - WORLD.y0 * view.s;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 场景数据 ================= */
+// 等边三棱镜（顶角 60°，尖朝上），质心在原点
+const V_A = [0, -150], V_B = [-129.9, 75], V_C = [129.9, 75];
+const E = [(V_A[0] + V_B[0]) / 2, (V_A[1] + V_B[1]) / 2];   // 左面中点 = 入射点
+const SCREEN_X = 460, SCREEN_Y0 = -160, SCREEN_Y1 = 430;    // 右侧光屏
+
+// 柯西公式 n(λ) = A + B/λ²（λ 单位：微米）
+const MATS = {
+  glass:   { name:"玻璃", A:1.5046, B:0.00420, fill:"rgba(170,215,255,0.28)", edge:"rgba(120,190,240,0.95)" },
+  crystal: { name:"水晶", A:1.5500, B:0.00650, fill:"rgba(200,180,255,0.28)", edge:"rgba(170,130,240,0.95)" },
+  water:   { name:"水",   A:1.3240, B:0.00310, fill:"rgba(120,200,255,0.30)", edge:"rgba(80,170,255,0.95)" }
+};
+let matKey = "glass";
+function refIndex(mat, lambdaNm) {
+  const um = lambdaNm / 1000;
+  return mat.A + mat.B / (um * um);
+}
+// 7 个代表波长（纳米）和对应颜色
+const WAVES = [
+  { l:640, c:"#ff2418" }, { l:605, c:"#ff8c00" }, { l:580, c:"#ffd500" },
+  { l:530, c:"#25c93a" }, { l:490, c:"#00b7ff" }, { l:465, c:"#3a55ff" },
+  { l:415, c:"#9437e8" }
+];
+const LAMBDA_D = 589;   // 钠黄光，折射率测量标准
+const WHITE = "rgba(255,255,235,0.95)";
+
+// 手电筒在圆弧轨道上拖动，光束始终射向入射点 E
+const ORBIT = 340, PHI_MIN = 145, PHI_MAX = 182;
+let phiDeg = 166;
+function torchPos() {
+  const a = phiDeg * Math.PI / 180;
+  return [Math.cos(a) * ORBIT, Math.sin(a) * ORBIT];
+}
+
+// 量角器（可拖动，靠近入射点自动吸附）
+const prot = { x:-540, y:330, snapped:false };
+
+// 任务状态
+let task1 = false, task2 = false, celebrated = false;
+let bestDev = 0, devTarget = 0;   // 紫光偏折角纪录 / 目标
+
+/* ================= 物理 ================= */
+function makeSeg(a, b, inside) {
+  const dx = b[0]-a[0], dy = b[1]-a[1];
+  let nx = dy, ny = -dx;
+  const L = Math.hypot(nx, ny); nx /= L; ny /= L;
+  const mx = (a[0]+b[0])/2, my = (a[1]+b[1])/2;
+  if ((inside[0]-mx)*nx + (inside[1]-my)*ny > 0) { nx = -nx; ny = -ny; }
+  return { ax:a[0], ay:a[1], bx:b[0], by:b[1], nx, ny };   // nx,ny 为外法线
+}
+const segAB = makeSeg(V_A, V_B, [0,0]);   // 左面（入射面）
+const segAC = makeSeg(V_A, V_C, [0,0]);   // 右面（出射面）
+const segBC = makeSeg(V_B, V_C, [0,0]);   // 底面
+
+function raySegT(px, py, dx, dy, s) {
+  const sx = s.bx - s.ax, sy = s.by - s.ay;
+  const denom = dx*sy - dy*sx;
+  if (Math.abs(denom) < 1e-12) return null;
+  const qx = s.ax - px, qy = s.ay - py;
+  const t = (qx*sy - qy*sx) / denom;
+  const u = (qx*dy - qy*dx) / denom;
+  if (t > 0.5 && u >= -1e-9 && u <= 1+1e-9) return t;
+  return null;
+}
+function refract(dx, dy, nx, ny, n1, n2) {
+  let cosi = -(dx*nx + dy*ny);
+  if (cosi < 0) { nx = -nx; ny = -ny; cosi = -cosi; }
+  const eta = n1 / n2;
+  const k = 1 - eta*eta*(1 - cosi*cosi);
+  if (k < 0) return null;   // 全反射
+  const cost = Math.sqrt(k);
+  return [eta*dx + (eta*cosi - cost)*nx, eta*dy + (eta*cosi - cost)*ny];
+}
+function reflect(dx, dy, nx, ny) {
+  let cosi = -(dx*nx + dy*ny);
+  if (cosi < 0) { nx = -nx; ny = -ny; cosi = -cosi; }
+  const d = 2*(dx*nx + dy*ny);
+  return [dx - d*nx, dy - d*ny];
+}
+
+// 追踪某一波长：空气→左面→右面（或全反射到底面）→光屏
+function traceLambda(mat, phi, l) {
+  const n = refIndex(mat, l);
+  const a = phi * Math.PI / 180;
+  const T = [Math.cos(a) * ORBIT, Math.sin(a) * ORBIT];
+  let d0 = [E[0] - T[0], E[1] - T[1]];
+  const L0 = Math.hypot(d0[0], d0[1]); d0 = [d0[0]/L0, d0[1]/L0];
+  const d1 = refract(d0[0], d0[1], segAB.nx, segAB.ny, 1, n);
+  if (!d1) return { ok:false, d0 };
+  const t = raySegT(E[0], E[1], d1[0], d1[1], segAC);
+  if (t === null) return { ok:false, d0 };
+  const P2 = [E[0] + d1[0]*t, E[1] + d1[1]*t];
+  const d2 = refract(d1[0], d1[1], segAC.nx, segAC.ny, n, 1);
+  if (!d2) {   // 右面全反射：射向底面穿出
+    const dr = reflect(d1[0], d1[1], segAC.nx, segAC.ny);
+    const tb = raySegT(P2[0], P2[1], dr[0], dr[1], segBC);
+    const P3 = tb === null ? [P2[0] + dr[0]*600, P2[1] + dr[1]*600]
+                           : [P2[0] + dr[0]*tb, P2[1] + dr[1]*tb];
+    const d3 = tb === null ? null : refract(dr[0], dr[1], segBC.nx, segBC.ny, n, 1);
+    return { ok:true, tir:true, d0, d1, P2, P3, d3, exit:null, hit:null };
+  }
+  let hit = null;
+  if (d2[0] > 1e-6) {
+    const ts = (SCREEN_X - P2[0]) / d2[0];
+    if (ts > 0) hit = P2[1] + d2[1] * ts;
+  }
+  return { ok:true, tir:false, d0, d1, P2, exit:{ p:P2, d:d2 }, hit };
+}
+
+// 当前状态的派生量（每帧重算，量很小）
+let cur = null;
+function computeScene() {
+  const mat = MATS[matKey];
+  const traces = WAVES.map(w => ({ w, tr: traceLambda(mat, phiDeg, w.l) }));
+  const trD = traceLambda(mat, phiDeg, LAMBDA_D);          // 黄光用于测量
+  const trV = traces[traces.length - 1].tr;                // 紫光
+  // 入射角 i：入射光与外法线夹角
+  const cosi = -(trD.d0[0]*segAB.nx + trD.d0[1]*segAB.ny);
+  const iAng = Math.acos(Math.min(1, Math.max(-1, cosi)));
+  const nD = refIndex(mat, LAMBDA_D);
+  const rAng = Math.asin(Math.min(1, Math.sin(iAng) / nD));
+  // 紫光偏折角 δ：出射方向相对入射方向的转角
+  let devV = null;
+  if (trV.ok && trV.exit) {
+    const dot = trD.d0[0]*trV.exit.d[0] + trD.d0[1]*trV.exit.d[1];
+    devV = Math.acos(Math.min(1, Math.max(-1, dot))) * 180 / Math.PI;
+  }
+  cur = { traces, trD, trV, iAng, rAng, nD, devV, iDeg: iAng * 180 / Math.PI };
+}
+
+function devVioletAt(mat, phi) {   // 计算某材料在某轨道角的紫光偏折角（用于设目标）
+  const tr = traceLambda(mat, phi, 415);
+  if (!tr.ok || !tr.exit) return null;
+  const dot = tr.d0[0]*tr.exit.d[0] + tr.d0[1]*tr.exit.d[1];
+  return Math.acos(Math.min(1, Math.max(-1, dot))) * 180 / Math.PI;
+}
+function refreshTarget() {
+  devTarget = devVioletAt(MATS[matKey], PHI_MIN) || 0;   // 轨道端点处偏折最大
+  bestDev = 0;
+}
+
+/* ================= 任务 ================= */
+function updateScorebar() {
+  scorebar.textContent = `🎯 任务：①测量水的折射率 ${task1 ? "✅" : "☐"}　②让紫光偏折角最大 ${task2 ? "✅" : "☐"}`;
+}
+function checkTasks() {
+  if (!cur) return;
+  if (!task1 && matKey === "water" && prot.snapped) {
+    task1 = true;
+    const nMeas = Math.sin(cur.iAng) / Math.sin(cur.rAng);
+    showHint(`✅ 任务①完成！测得水的折射率 n = sin i / sin r ≈ ${nMeas.toFixed(3)}`);
+    fanfare();
+    updateScorebar();
+  }
+  if (!task2 && cur.devV !== null && cur.devV >= devTarget - 0.4) {
+    task2 = true;
+    showHint(`✅ 任务②完成！紫光偏折角达到 ${cur.devV.toFixed(1)}°，已是最大！`);
+    fanfare();
+    updateScorebar();
+  }
+  if (task1 && task2 && !celebrated) {
+    celebrated = true;
+    showHint("🎉 两个任务全部完成！你是光学小达人！");
+    setTimeout(fanfare, 600);
+  }
+  if (cur.devV !== null && cur.devV > bestDev) bestDev = cur.devV;
+}
+
+/* ================= 绘制 ================= */
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, -470, 0, 470);
+  g.addColorStop(0, "#2b3a55"); g.addColorStop(1, "#1c2637");
+  ctx.fillStyle = g;
+  ctx.fillRect(-720, -470, 1440, 940);
+  ctx.fillStyle = "rgba(255,255,255,0.06)";
+  for (let x = -720; x <= 720; x += 60)
+    for (let y = -450; y <= 450; y += 60)
+      { ctx.beginPath(); ctx.arc(x, y, 1.5, 0, 7); ctx.fill(); }
+}
+
+function drawScreen() {
+  ctx.save();
+  ctx.fillStyle = "rgba(240,244,250,0.95)";
+  ctx.strokeStyle = "rgba(120,140,170,0.9)"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(SCREEN_X + 16, SCREEN_Y0);
+  ctx.lineTo(SCREEN_X + 16, SCREEN_Y1);
+  ctx.lineTo(SCREEN_X, SCREEN_Y1);
+  ctx.lineTo(SCREEN_X, SCREEN_Y0);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "#5a6a88"; ctx.font = "bold 20px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.save(); ctx.translate(SCREEN_X + 44, (SCREEN_Y0 + SCREEN_Y1) / 2);
+  ctx.rotate(Math.PI / 2); ctx.fillText("光 屏", 0, 0); ctx.restore();
+
+  // 光谱带：红到紫的实际落点之间画彩虹渐变
+  const hits = cur.traces.filter(t => t.tr.hit !== null);
+  if (hits.length >= 2) {
+    const ys = hits.map(t => t.tr.hit);
+    const yTop = Math.min.apply(null, ys), yBot = Math.max.apply(null, ys);
+    const g2 = ctx.createLinearGradient(0, yTop, 0, yBot);
+    const cols = WAVES.map(w => w.c);
+    cols.forEach((c, i) => g2.addColorStop(i / (cols.length - 1), c));
+    ctx.fillStyle = g2;
+    ctx.fillRect(SCREEN_X, yTop, 16, Math.max(3, yBot - yTop));
+  }
+  // 各色落点光斑
+  for (const t of cur.traces) {
+    if (t.tr.hit === null) continue;
+    ctx.beginPath(); ctx.arc(SCREEN_X + 8, t.tr.hit, 7, 0, 7);
+    ctx.fillStyle = t.w.c; ctx.shadowColor = t.w.c; ctx.shadowBlur = 12;
+    ctx.fill(); ctx.shadowBlur = 0;
+  }
+  const red = cur.traces[0], vio = cur.traces[cur.traces.length - 1];
+  ctx.font = "bold 16px sans-serif"; ctx.textAlign = "left";
+  if (red.tr.hit !== null)  { ctx.fillStyle = "#ff6a60"; ctx.fillText("红", SCREEN_X + 26, red.tr.hit - 12); }
+  if (vio.tr.hit !== null)  { ctx.fillStyle = "#c090ff"; ctx.fillText("紫", SCREEN_X + 26, vio.tr.hit + 12); }
+  ctx.restore();
+}
+
+// 光谱放大视图：把光屏上红到紫的落点间距按固定倍率放大，便于观察
+const ZOOM_BOX = { x:-80, y:180, w:500, h:250 };
+const ZOOM_K = 12;
+function drawSpectrumZoom() {
+  const hits = cur.traces.filter(t => t.tr.hit !== null);
+  ctx.save();
+  roundRectPath(ZOOM_BOX.x, ZOOM_BOX.y, ZOOM_BOX.w, ZOOM_BOX.h, 14);
+  ctx.fillStyle = "rgba(10,16,30,0.75)"; ctx.fill();
+  ctx.strokeStyle = "rgba(120,140,170,0.7)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#9fb2c8"; ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("🔍 光谱放大视图（光屏局部 ×12）", ZOOM_BOX.x + 16, ZOOM_BOX.y + 24);
+  if (hits.length < 2) {
+    ctx.fillStyle = "rgba(255,255,255,0.6)"; ctx.font = "15px sans-serif";
+    ctx.fillText("光没有从右面射出（发生全反射），光屏上没有光谱", ZOOM_BOX.x + 16, ZOOM_BOX.y + 130);
+    ctx.restore();
+    return;
+  }
+  const ys = hits.map(t => t.tr.hit);
+  const yTop = Math.min.apply(null, ys), yBot = Math.max.apply(null, ys);
+  const span = (yBot - yTop) * ZOOM_K;
+  const stripH = Math.min(180, Math.max(24, span));
+  const stripX = ZOOM_BOX.x + 150, stripW = 200;
+  const stripY = ZOOM_BOX.y + 45 + (190 - stripH) / 2;
+  const mapY = y => stripY + (yBot === yTop ? 0.5 : (y - yTop) / (yBot - yTop)) * stripH;
+  // 彩虹条
+  const g = ctx.createLinearGradient(0, stripY, 0, stripY + stripH);
+  const cols = WAVES.map(w => w.c);
+  cols.forEach((c, i) => g.addColorStop(i / (cols.length - 1), c));
+  ctx.fillStyle = g;
+  roundRectPath(stripX, stripY, stripW, stripH, 6);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 1.5; ctx.stroke();
+  // 七色落点刻度线（位置按真实比例）
+  for (const t of cur.traces) {
+    const y = mapY(t.tr.hit);
+    ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(stripX - 12, y); ctx.lineTo(stripX - 2, y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(stripX + stripW + 2, y); ctx.lineTo(stripX + stripW + 12, y); ctx.stroke();
+  }
+  ctx.font = "bold 17px sans-serif";
+  ctx.fillStyle = "#ff6a60"; ctx.textAlign = "right";
+  ctx.fillText("红", stripX - 18, mapY(yTop));
+  ctx.fillStyle = "#c090ff";
+  ctx.fillText("紫", stripX - 18, mapY(yBot));
+  ctx.fillStyle = "#9fb2c8"; ctx.font = "13px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("紫光偏折最多 →", stripX + stripW + 20, mapY(yBot));
+  ctx.fillText("红光偏折最少 →", stripX + stripW + 20, mapY(yTop));
+  ctx.restore();
+}
+
+function drawPrism() {
+  const m = MATS[matKey];
+  ctx.beginPath();
+  ctx.moveTo(V_A[0], V_A[1]); ctx.lineTo(V_B[0], V_B[1]); ctx.lineTo(V_C[0], V_C[1]);
+  ctx.closePath();
+  ctx.fillStyle = m.fill; ctx.fill();
+  ctx.strokeStyle = m.edge; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.font = "bold 18px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(m.name + " n≈" + cur.nD.toFixed(2), 0, 10);
+}
+
+function drawRays() {
+  const T = torchPos();
+  const d0 = cur.trD.d0;
+  const start = [T[0] + d0[0] * 50, T[1] + d0[1] * 50];
+  ctx.save();
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  // 入射白光
+  ctx.strokeStyle = WHITE; ctx.lineWidth = 7;
+  ctx.shadowColor = WHITE; ctx.shadowBlur = 16;
+  ctx.beginPath(); ctx.moveTo(start[0], start[1]); ctx.lineTo(E[0], E[1]); ctx.stroke();
+  ctx.shadowBlur = 0;
+  // 棱镜内外的色散光线
+  for (const t of cur.traces) {
+    const tr = t.tr;
+    if (!tr.ok) continue;
+    ctx.strokeStyle = t.w.c; ctx.lineWidth = 2.5;
+    ctx.shadowColor = t.w.c; ctx.shadowBlur = 7;
+    ctx.beginPath();
+    ctx.moveTo(E[0], E[1]); ctx.lineTo(tr.P2[0], tr.P2[1]);
+    if (tr.tir && tr.P3) ctx.lineTo(tr.P3[0], tr.P3[1]);
+    ctx.stroke();
+    if (tr.exit) {
+      const end = tr.hit !== null ? [SCREEN_X, tr.hit]
+                 : [tr.exit.p[0] + tr.exit.d[0] * 900, tr.exit.p[1] + tr.exit.d[1] * 900];
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(tr.exit.p[0], tr.exit.p[1]); ctx.lineTo(end[0], end[1]); ctx.stroke();
+    } else if (tr.tir && tr.d3 && tr.P3) {
+      ctx.beginPath(); ctx.moveTo(tr.P3[0], tr.P3[1]);
+      ctx.lineTo(tr.P3[0] + tr.d3[0] * 500, tr.P3[1] + tr.d3[1] * 500); ctx.stroke();
+    }
+  }
+  ctx.restore();
+  // 入射点处法线（虚线）
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 1.5;
+  ctx.setLineDash([8, 7]);
+  ctx.beginPath();
+  ctx.moveTo(E[0] - segAB.nx * 170, E[1] - segAB.ny * 170);
+  ctx.lineTo(E[0] + segAB.nx * 200, E[1] + segAB.ny * 200);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "rgba(255,255,255,0.6)"; ctx.font = "14px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("法线", E[0] + segAB.nx * 185, E[1] + segAB.ny * 185 - 8);
+  // 入射点小标记
+  ctx.beginPath(); ctx.arc(E[0], E[1], 5, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  ctx.restore();
+}
+
+function drawDeviation() {
+  const tr = cur.trV;
+  if (!tr.ok || !tr.exit || cur.devV === null) return;
+  const P = tr.exit.p, d0 = cur.trD.d0;
+  const a0 = Math.atan2(d0[1], d0[0]);
+  const a1 = Math.atan2(tr.exit.d[1], tr.exit.d[0]);
+  ctx.save();
+  // 入射方向的延长虚线
+  ctx.strokeStyle = "rgba(255,255,255,0.45)"; ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 6]);
+  ctx.beginPath(); ctx.moveTo(P[0], P[1]);
+  ctx.lineTo(P[0] + d0[0] * 160, P[1] + d0[1] * 160); ctx.stroke();
+  ctx.setLineDash([]);
+  // 偏折角弧线
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.arc(P[0], P[1], 75, a0, a1); ctx.stroke();
+  const mid = (a0 + a1) / 2;
+  ctx.fillStyle = "#ffd54a"; ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("δ紫=" + cur.devV.toFixed(1) + "°", P[0] + Math.cos(mid) * 88, P[1] + Math.sin(mid) * 88);
+  ctx.restore();
+}
+
+function drawTorch() {
+  const T = torchPos();
+  const ang = Math.atan2(E[1] - T[1], E[0] - T[0]);
+  // 轨道
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,213,74,0.35)"; ctx.lineWidth = 2;
+  ctx.setLineDash([5, 8]);
+  ctx.beginPath();
+  ctx.arc(0, 0, ORBIT, PHI_MIN * Math.PI / 180, PHI_MAX * Math.PI / 180);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+  // 手电筒
+  ctx.save();
+  ctx.translate(T[0], T[1]); ctx.rotate(ang);
+  ctx.fillStyle = "#ff7043"; ctx.strokeStyle = "rgba(0,0,0,0.45)"; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(-46, -15); ctx.lineTo(8, -15); ctx.lineTo(8, 15); ctx.lineTo(-46, 15);
+  ctx.closePath();
+  // 圆角矩形筒身
+  ctx.moveTo(-38, -15);
+  ctx.arcTo(8, -15, 8, 15, 8); ctx.arcTo(8, 15, -46, 15, 8);
+  ctx.arcTo(-46, 15, -46, -15, 8); ctx.arcTo(-46, -15, 8, -15, 8);
+  ctx.fill(); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(6, -15); ctx.lineTo(46, -26); ctx.lineTo(46, 26); ctx.lineTo(6, 15);
+  ctx.closePath();
+  ctx.fillStyle = "#ffa06a"; ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(46, 0, 6, 25, 0, 0, 7);
+  ctx.fillStyle = "#fff7c0"; ctx.fill();
+  ctx.restore();
+  // 提示光圈
+  ctx.save();
+  ctx.beginPath(); ctx.arc(T[0], T[1], 62, 0, 7);
+  ctx.strokeStyle = "rgba(255,213,74,0.25)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.restore();
+}
+
+function drawProtractor() {
+  const D2R = Math.PI / 180;
+  const faceAng = Math.atan2(V_B[1] - V_A[1], V_B[0] - V_A[0]);   // 左面方向 120°
+  ctx.save();
+  if (prot.snapped) {
+    // 吸附在入射点：半圆盘贴在棱镜外侧，0° 对准法线
+    ctx.translate(E[0], E[1]);
+    let normOut = Math.atan2(segAB.ny, segAB.nx);   // 外法线方向 210°
+    if (normOut < 0) normOut += 2 * Math.PI;        // 统一到 [0, 2π)，保证弧线扫描方向正确
+    ctx.beginPath();
+    ctx.arc(0, 0, 115, normOut - Math.PI / 2, normOut + Math.PI / 2);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(255,255,255,0.22)"; ctx.fill();
+    ctx.strokeStyle = "rgba(255,213,74,0.9)"; ctx.lineWidth = 2.5; ctx.stroke();
+    // 刻度
+    ctx.font = "12px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (let v = 0; v <= 90; v += 10) {
+      for (const sgn of [-1, 1]) {
+        if (v === 90 && sgn === 1) continue;
+        const a = normOut + sgn * v * D2R;
+        const long = v % 30 === 0;
+        ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = long ? 2 : 1;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(a) * (long ? 100 : 106), Math.sin(a) * (long ? 100 : 106));
+        ctx.lineTo(Math.cos(a) * 115, Math.sin(a) * 115);
+        ctx.stroke();
+        if (long) {
+          ctx.fillStyle = "rgba(255,255,255,0.9)";
+          ctx.fillText(String(v), Math.cos(a) * 130, Math.sin(a) * 130);
+        }
+      }
+    }
+    // 入射角 i 弧线（入射光反方向 ↔ 外法线）
+    const d0 = cur.trD.d0;
+    const back = Math.atan2(-d0[1], -d0[0]);
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(0, 0, 72, back, normOut); ctx.stroke();
+    const midI = (back + normOut) / 2;
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 16px sans-serif";
+    ctx.fillText("i=" + cur.iDeg.toFixed(1) + "°", Math.cos(midI) * 95, Math.sin(midI) * 95);
+    // 折射角 r 弧线（画在棱镜内，黄光 ↔ 内法线）
+    const normIn = normOut - Math.PI;
+    let rAng = Math.atan2(cur.trD.d1 ? cur.trD.d1[1] : 0, cur.trD.d1 ? cur.trD.d1[0] : 1);
+    if (rAng < 0) rAng += 2 * Math.PI;
+    ctx.strokeStyle = "#ffd500"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(0, 0, 58, rAng, normIn + 2 * Math.PI); ctx.stroke();
+    const midR = (rAng + normIn + 2 * Math.PI) / 2;
+    ctx.fillStyle = "#ffd500";
+    ctx.fillText("r=" + (cur.rAng * 180 / Math.PI).toFixed(1) + "°",
+                 Math.cos(midR) * 84, Math.sin(midR) * 84);
+  } else {
+    // 未吸附：画一个半圆量角器图标
+    ctx.translate(prot.x, prot.y);
+    ctx.beginPath(); ctx.arc(0, 0, 55, Math.PI, 0); ctx.closePath();
+    ctx.fillStyle = "rgba(255,213,74,0.25)"; ctx.fill();
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 1;
+    for (let v = 0; v <= 180; v += 30) {
+      const a = Math.PI + v * D2R;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * 45, Math.sin(a) * 45);
+      ctx.lineTo(Math.cos(a) * 55, Math.sin(a) * 55);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "#ffd54a"; ctx.font = "bold 15px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("量角器", 0, 30);
+    ctx.font = "12px sans-serif"; ctx.fillStyle = "rgba(255,255,255,0.8)";
+    ctx.fillText("拖到入射点", 0, 48);
+  }
+  ctx.restore();
+}
+
+function roundRectPath(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function draw() {
+  computeScene();
+  ctx.setTransform(DPR * view.s, 0, 0, DPR * view.s, DPR * view.ox, DPR * view.oy);
+  drawBackground();
+  drawScreen();
+  drawSpectrumZoom();
+  drawPrism();
+  drawRays();
+  drawDeviation();
+  drawTorch();
+  drawProtractor();
+  updatePanel();
+}
+
+/* ================= 面板 ================= */
+const pMat = document.getElementById("pMat"), pI = document.getElementById("pI"),
+      pR = document.getElementById("pR"), pN = document.getElementById("pN"),
+      pDev = document.getElementById("pDev"), pBest = document.getElementById("pBest");
+function updatePanel() {
+  pMat.textContent = `${MATS[matKey].name}　n(D线) = ${cur.nD.toFixed(3)}`;
+  if (prot.snapped) {
+    const sinI = Math.sin(cur.iAng), sinR = Math.sin(cur.rAng);
+    pI.textContent = cur.iDeg.toFixed(1) + "°";
+    pR.textContent = (cur.rAng * 180 / Math.PI).toFixed(1) + "°";
+    pN.innerHTML = `验证：<span class="val">sin i / sin r = ${sinI.toFixed(3)} / ${sinR.toFixed(3)} = ${(sinI / sinR).toFixed(3)}</span>`;
+  } else {
+    pI.textContent = "—"; pR.textContent = "—";
+    pN.textContent = "把量角器拖到入射点开始测量";
+  }
+  pDev.textContent = cur.devV !== null ? cur.devV.toFixed(1) + "°" : "全反射，无光射出";
+  pBest.textContent = `本次最佳 ${bestDev.toFixed(1)}° ・ 目标 ≥ ${devTarget.toFixed(1)}°（拖手电筒到轨道下端）`;
+}
+
+/* ================= 交互 ================= */
+let drag = null;   // {mode:'torch'} | {mode:'prot', offX, offY}
+function canvasPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+}
+canvas.addEventListener("pointerdown", e => {
+  const [sx, sy] = canvasPos(e);
+  const [wx, wy] = toWorld(sx, sy);
+  hintEl.style.opacity = "0";
+  // 量角器优先
+  const pr = prot.snapped ? E : [prot.x, prot.y];
+  const prR = prot.snapped ? 118 : 70;
+  if (Math.hypot(wx - pr[0], wy - pr[1]) < prR) {
+    drag = { mode:"prot", offX: wx - pr[0], offY: wy - pr[1] };
+    canvas.setPointerCapture(e.pointerId);
+    pop(660);
+    return;
+  }
+  const T = torchPos();
+  if (Math.hypot(wx - T[0], wy - T[1]) < 62) {
+    drag = { mode:"torch" };
+    canvas.setPointerCapture(e.pointerId);
+    pop(760);
+    return;
+  }
+});
+window.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const [sx, sy] = canvasPos(e);
+  const [wx, wy] = toWorld(sx, sy);
+  if (drag.mode === "torch") {
+    let deg = Math.atan2(wy, wx) * 180 / Math.PI;
+    if (deg < 0) deg += 360;
+    phiDeg = Math.min(PHI_MAX, Math.max(PHI_MIN, deg));
+  } else if (drag.mode === "prot") {
+    const nx = wx - drag.offX, ny = wy - drag.offY;
+    if (Math.hypot(nx - E[0], ny - E[1]) < 100) {
+      if (!prot.snapped) { prot.snapped = true; snap(); showHint("📐 量角器已对准入射点，看右上角读数！"); }
+    } else {
+      prot.snapped = false;
+    }
+    if (prot.snapped) { prot.x = E[0]; prot.y = E[1]; }
+    else { prot.x = nx; prot.y = ny; }
+  }
+});
+window.addEventListener("pointerup", () => {
+  if (drag) pop(drag.mode === "prot" && prot.snapped ? 980 : 520);
+  drag = null;
+});
+window.addEventListener("pointercancel", () => { drag = null; });
+
+// 材料切换按钮
+document.querySelectorAll("#matbar button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    matKey = btn.dataset.m;
+    document.querySelectorAll("#matbar button").forEach(b => b.classList.toggle("on", b === btn));
+    refreshTarget();
+    pop(880);
+    if (matKey === "water" && !task1) showHint("💧 已换成水！把量角器拖到入射点，读出 sin i / sin r");
+  });
+});
+document.querySelector('[data-m="glass"]').classList.add("on");
+
+/* ================= 主循环 ================= */
+function loop() {
+  draw();
+  checkTasks();
+  requestAnimationFrame(loop);
+}
+refreshTarget();
+updateScorebar();
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+const snap = () => { tone(980, 0.08, 0.1, "triangle"); tone(1470, 0.1, 0.07, "triangle"); };
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+
+/* ================= 测试钩子 ================= */
+window.__dp = {
+  setPhi(d) { phiDeg = Math.min(PHI_MAX, Math.max(PHI_MIN, d)); },
+  setMat(k) {
+    if (MATS[k]) {
+      matKey = k;
+      document.querySelectorAll("#matbar button").forEach(b => b.classList.toggle("on", b.dataset.m === k));
+      refreshTarget();
+    }
+  },
+  snapProt(on) { prot.snapped = !!on; if (on) { prot.x = E[0]; prot.y = E[1]; } },
+  state() {
+    computeScene();
+    checkTasks();
+    const sinI = Math.sin(cur.iAng), sinR = Math.sin(cur.rAng);
+    return {
+      mat: matKey, phi: phiDeg, i: cur.iDeg, r: cur.rAng * 180 / Math.PI,
+      nD: cur.nD, nMeas: sinI / sinR, devViolet: cur.devV, devTarget,
+      hitRed: cur.traces[0].tr.hit, hitViolet: cur.traces[6].tr.hit,
+      tir: cur.trV.tir || false, task1, task2
+    };
+  }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

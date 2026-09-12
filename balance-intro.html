@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>方程天平入门</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#7ec3ee; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,60,0.8); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:19px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,60,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  .bigbtn {
+    position:absolute; z-index:15; display:none;
+    font-size:22px; font-weight:bold; padding:14px 30px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.35);
+  }
+  .bigbtn:active { transform:scale(1.06); }
+  #splitBtn { right:26px; bottom:70px; }
+  #nextBtn { right:26px; bottom:70px; background:#7dde6b; color:#144a08; }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.45);
+  }
+  #winPanel .msg {
+    font-size:42px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar"></div>
+<div id="hint">点我可以关掉提示</div>
+<button id="splitBtn" class="bigbtn">⚖️ 平分给木箱</button>
+<button id="nextBtn" class="bigbtn">下一关 ▶</button>
+<div id="winPanel">
+  <div class="msg">🎉 全部通关！<br>你是方程小达人！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const splitBtn = document.getElementById("splitBtn");
+const nextBtn = document.getElementById("nextBtn");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 场景与视图 ================= */
+// 世界坐标：1000 x 700，天平支点在 (500, 285)
+const WORLD_W = 1000, WORLD_H = 700;
+const PIVOT = { x: 500, y: 285 };
+const BEAM_LEN = 335;       // 梁半长
+const ROPE = 122;           // 吊绳长度
+const BOX_W = 84, BOX_H = 66;
+const WEIGHT_R = 24;
+const GROUND_Y = 632;
+const BASKETS = { L: { x: 112, y: 660 }, R: { x: 888, y: 660 } };
+
+const view = { s: 1, ox: 0, oy: 0 };
+function fitView() {
+  view.s = Math.min(W / (WORLD_W + 30), H / (WORLD_H + 30));
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 关卡与状态 ================= */
+// boxes: 左边木箱数; leftW: 左边 1kg 砝码数; right: 右边砝码堆; xVal: 答案
+const LEVELS = [
+  { boxes: 1, leftW: 3, right: [7],    xVal: 4, intro: "拖出一个 1kg 砝码：两边会同时拿走一样多，让 x 单独留下！" },
+  { boxes: 1, leftW: 2, right: [9],    xVal: 7, intro: "这次右边更重，方法还是一样：两边同时拿走一样多！" },
+  { boxes: 1, leftW: 5, right: [11],   xVal: 6, intro: "砝码有点多，一对一对拿，别着急！" },
+  { boxes: 2, leftW: 0, right: [8],    xVal: 4, intro: "两个木箱一样重！点右下角「⚖️ 平分」按钮，把右边平分给它们！" },
+  { boxes: 1, leftW: 4, right: [6, 2], xVal: 4, intro: "右边是两堆：先心算 6 + 2 = ? 再一对一对拿走！" },
+  { boxes: 2, leftW: 2, right: [10],   xVal: 4, intro: "最后一关：先拿走多余的砝码，再平分！" }
+];
+
+let levelIdx = 0, level = null;
+let weights = [];      // {id, side, pile, pos, home, out, gone, drag, fly}
+let boxCount = 0;
+let boxPos = [];       // 木箱中心位置（随天平摆动）
+let state = "play";    // play | splitting | won
+let dragW = null;      // 正在拖的砝码
+let confetti = [];
+let floats = [];       // 飘字 {x, y, text, t}
+let wonT = 0;          // 过关时刻（做弹跳动画）
+
+function loadLevel(i) {
+  levelIdx = i;
+  level = LEVELS[i];
+  weights = [];
+  let id = 0;
+  for (let k = 0; k < level.leftW; k++)
+    weights.push({ id: id++, side: "L", pile: 0, pos: {x:0,y:0}, home: {x:0,y:0}, out: false, gone: false, drag: false, fly: null });
+  level.right.forEach((n, pi) => {
+    for (let k = 0; k < n; k++)
+      weights.push({ id: id++, side: "R", pile: pi, pos: {x:0,y:0}, home: {x:0,y:0}, out: false, gone: false, drag: false, fly: null });
+  });
+  boxCount = level.boxes;
+  beam.ang = 0; beam.vel = 0;
+  state = "play";
+  dragW = null;
+  confetti = []; floats = [];
+  splitBtn.style.display = "none";
+  nextBtn.style.display = "none";
+  winPanel.style.display = "none";
+  layout();
+  weights.forEach(w => { w.pos.x = w.home.x; w.pos.y = w.home.y; });
+  updateScore();
+  showHint(level.intro, true);
+  // 一上来左边就没有砝码且有两箱：直接亮出平分按钮
+  if (leftWeights() === 0 && boxCount > 1) splitBtn.style.display = "block";
+}
+
+function leftWeights() { return weights.filter(w => w.side === "L" && !w.out).length; }
+function pileCounts() {
+  return level.right.map((_, pi) => weights.filter(w => w.side === "R" && w.pile === pi && !w.out).length);
+}
+function eqText() {
+  const lp = [];
+  if (boxCount > 0) lp.push(boxCount > 1 ? boxCount + "x" : "x");
+  const lw = leftWeights();
+  if (lw > 0) lp.push(lw);
+  const pc = pileCounts().filter(c => c > 0);
+  // 左边清空后合并显示总数，结局一眼看到 "x = 4"
+  const right = pc.length ? (lw > 0 ? pc.join(" + ") : pc.reduce((a, b) => a + b, 0)) : "0";
+  return (lp.join(" + ") || "0") + " = " + right;
+}
+function updateScore() {
+  const tag = state === "won" ? " ✅" : "";
+  scorebar.textContent = `第 ${levelIdx + 1} / ${LEVELS.length} 关 · ${eqText()}${tag}`;
+}
+
+/* ================= 天平物理 ================= */
+// 梁角度用弹簧模拟：两边质量差决定目标倾角，拖拽时手里砝码不计重
+const beam = { ang: 0, vel: 0 };
+
+function massL() {
+  return boxCount * level.xVal +
+    weights.filter(w => w.side === "L" && !w.out && !w.drag).length;
+}
+function massR() {
+  return weights.filter(w => w.side === "R" && !w.out && !w.drag).length;
+}
+
+function panGeom(side) {
+  const a = beam.ang;
+  const sx = side === "L" ? -1 : 1;
+  const ex = PIVOT.x + sx * BEAM_LEN * Math.cos(a);
+  const ey = PIVOT.y - sx * BEAM_LEN * Math.sin(a);   // ang>0 左边下沉
+  return { ex, ey, px: ex, py: ey + ROPE };
+}
+
+function physics(dt) {
+  // 梁弹簧
+  const target = Math.max(-0.3, Math.min(0.3, (massL() - massR()) * 0.085));
+  beam.vel += ((target - beam.ang) * 40 - beam.vel * 8) * dt;
+  beam.ang += beam.vel * dt;
+  // 飞行动画（抛物线弧线）
+  for (const w of weights) {
+    const f = w.fly;
+    if (!f) continue;
+    if (f.delay > 0) { f.delay -= dt; continue; }
+    f.t = Math.min(1, f.t + dt / f.dur);
+    const e = 1 - Math.pow(1 - f.t, 2);
+    const mx = (f.x0 + f.x1) / 2, my = Math.min(f.y0, f.y1) - 95;
+    w.pos.x = (1 - e) * (1 - e) * f.x0 + 2 * (1 - e) * e * mx + e * e * f.x1;
+    w.pos.y = (1 - e) * (1 - e) * f.y0 + 2 * (1 - e) * e * my + e * e * f.y1;
+    if (f.t >= 1) {
+      if (!f.back) w.gone = true;
+      w.fly = null;
+    }
+  }
+  // 飘字
+  for (const f of floats) f.t += dt;
+  floats = floats.filter(f => f.t < 1.1);
+  // 彩带
+  for (const c of confetti) {
+    c.vy += 620 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    c.r += c.vr * dt; c.t += dt;
+  }
+  confetti = confetti.filter(c => c.t < 3.5 && c.y < WORLD_H + 40);
+  // 平分动画完成判定
+  if (state === "splitting" && weights.every(w => !w.fly)) winLevel();
+}
+
+/* ================= 布局 ================= */
+function layout() {
+  const pl = panGeom("L");
+  const bOff = boxCount === 1 ? [0] : [-56, 56];
+  boxPos = bOff.map(o => ({ x: pl.px + o, y: pl.py - 14 - BOX_H / 2 }));
+  for (const side of ["L", "R"]) {
+    const g = panGeom(side);
+    const list = weights.filter(w => w.side === side && !w.out);
+    const assign = (ws, cols) => {
+      ws.forEach((w, i) => {
+        const ci = Math.min(Math.floor(i / 3), cols.length - 1);
+        w.home = { x: g.px + cols[ci], y: g.py - 38 - (i % 3) * 48 };
+        if (!w.drag && !w.fly) { w.pos.x = w.home.x; w.pos.y = w.home.y; }
+      });
+    };
+    if (side === "R" && level.right.length > 1) {
+      const pileCols = [[-128, -62], [62, 128]];
+      level.right.forEach((_, pi) => assign(list.filter(w => w.pile === pi), pileCols[pi]));
+    } else {
+      const cols = (side === "L" && boxCount > 0) ? [-128, 128] : [-128, -43, 43, 128];
+      assign(list, cols);
+    }
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+  g.addColorStop(0, "#8ecdf2"); g.addColorStop(1, "#e8f7ff");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+  // 地面
+  ctx.fillStyle = "#8fce6e";
+  ctx.fillRect(0, GROUND_Y, WORLD_W, WORLD_H - GROUND_Y);
+  ctx.fillStyle = "rgba(0,0,0,0.08)";
+  ctx.fillRect(0, GROUND_Y, WORLD_W, 5);
+  // 回收筐
+  for (const s of ["L", "R"]) {
+    const b = BASKETS[s];
+    ctx.fillStyle = "#a5672f";
+    ctx.beginPath();
+    ctx.moveTo(b.x - 58, b.y - 30); ctx.lineTo(b.x + 58, b.y - 30);
+    ctx.lineTo(b.x + 44, b.y + 18); ctx.lineTo(b.x - 44, b.y + 18);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#7d4a1d";
+    ctx.fillRect(b.x - 62, b.y - 38, 124, 10);
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("回收筐", b.x, b.y + 2);
+  }
+}
+
+function drawStand() {
+  // 底座
+  ctx.fillStyle = "#6b4a2a";
+  roundRect(PIVOT.x - 90, GROUND_Y - 22, 180, 22, 8, true);
+  // 立柱
+  ctx.beginPath();
+  ctx.moveTo(PIVOT.x - 16, GROUND_Y - 22);
+  ctx.lineTo(PIVOT.x + 16, GROUND_Y - 22);
+  ctx.lineTo(PIVOT.x + 7, PIVOT.y);
+  ctx.lineTo(PIVOT.x - 7, PIVOT.y);
+  ctx.closePath();
+  ctx.fillStyle = "#8a6136"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2; ctx.stroke();
+  // 支点三角
+  ctx.beginPath();
+  ctx.moveTo(PIVOT.x, PIVOT.y - 14);
+  ctx.lineTo(PIVOT.x - 12, PIVOT.y + 12);
+  ctx.lineTo(PIVOT.x + 12, PIVOT.y + 12);
+  ctx.closePath();
+  ctx.fillStyle = "#c93b3b"; ctx.fill();
+}
+
+function drawBeamAndPans() {
+  const a = beam.ang;
+  // 梁
+  ctx.save();
+  ctx.translate(PIVOT.x, PIVOT.y);
+  ctx.rotate(-a);
+  ctx.fillStyle = "#c9853f";
+  roundRect(-BEAM_LEN - 14, -11, (BEAM_LEN + 14) * 2, 22, 10, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2;
+  roundRect(-BEAM_LEN - 14, -11, (BEAM_LEN + 14) * 2, 22, 10, false); ctx.stroke();
+  ctx.fillStyle = "#5a3d1a";
+  ctx.beginPath(); ctx.arc(0, 0, 8, 0, 7); ctx.fill();
+  ctx.restore();
+  // 平衡标志
+  if (Math.abs(a) < 0.02 && state === "play") {
+    ctx.fillStyle = "rgba(30,120,40,0.9)";
+    ctx.font = "bold 22px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("⚖ 平衡", PIVOT.x, PIVOT.y - 46);
+  }
+  // 吊绳与托盘
+  for (const side of ["L", "R"]) {
+    const g = panGeom(side);
+    ctx.strokeStyle = "#6b4a2a"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(g.ex, g.ey); ctx.lineTo(g.px - 120, g.py - 6); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(g.ex, g.ey); ctx.lineTo(g.px + 120, g.py - 6); ctx.stroke();
+    // 托盘
+    ctx.beginPath(); ctx.ellipse(g.px, g.py, 178, 22, 0, 0, 7);
+    ctx.fillStyle = "#e0aa5e"; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.28)"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(g.px, g.py - 5, 168, 17, 0, 0, 7);
+    ctx.fillStyle = "#f0c684"; ctx.fill();
+    // 两堆的分隔线
+    if (side === "R" && level.right.length > 1) {
+      ctx.setLineDash([6, 6]);
+      ctx.strokeStyle = "rgba(120,60,0,0.5)"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(g.px, g.py - 130); ctx.lineTo(g.px, g.py - 8); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+}
+
+function drawBox(b, glow) {
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  if (glow) {
+    ctx.shadowColor = "#ffd54a"; ctx.shadowBlur = 26;
+  }
+  ctx.fillStyle = "#b07a3e";
+  roundRect(-BOX_W / 2, -BOX_H / 2, BOX_W, BOX_H, 9, true);
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 3;
+  roundRect(-BOX_W / 2, -BOX_H / 2, BOX_W, BOX_H, 9, false); ctx.stroke();
+  // 木板与胶带
+  ctx.strokeStyle = "rgba(90,50,10,0.4)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(-BOX_W / 2 + 6, -BOX_H / 6); ctx.lineTo(BOX_W / 2 - 6, -BOX_H / 6); ctx.stroke();
+  ctx.fillStyle = "rgba(255,240,200,0.55)";
+  ctx.fillRect(-7, -BOX_H / 2, 14, BOX_H);
+  // x 字样
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 34px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("x", 0, 4);
+  ctx.restore();
+}
+
+function drawWeight(w) {
+  const { x, y } = w.pos, r = WEIGHT_R;
+  ctx.save();
+  if (w.drag) { ctx.shadowColor = "rgba(0,0,0,0.4)"; ctx.shadowBlur = 14; ctx.shadowOffsetY = 6; }
+  // 小提手
+  ctx.fillStyle = "#8a5a00";
+  ctx.fillRect(x - 5, y - r - 9, 10, 10);
+  const g = ctx.createRadialGradient(x - 7, y - 9, 2, x, y, r);
+  g.addColorStop(0, "#ffe082"); g.addColorStop(1, "#e0a020");
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+  ctx.strokeStyle = "#8a5a00"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#5a3d00";
+  ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("1kg", x, y + 1);
+  ctx.restore();
+}
+
+function drawFloats() {
+  for (const f of floats) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, 1 - f.t / 1.1);
+    ctx.fillStyle = "#e93b3b";
+    ctx.font = "bold 42px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(f.text, f.x, f.y - f.t * 55);
+    ctx.restore();
+  }
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.r);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.s / 2, -c.s / 4, c.s, c.s / 2);
+    ctx.restore();
+  }
+}
+
+function drawWinText() {
+  if (state !== "won") return;
+  const t = Math.min(1, (performance.now() - wonT) / 400);
+  const s = 1 + Math.sin(t * Math.PI) * 0.25;
+  ctx.save();
+  ctx.translate(PIVOT.x, 165); ctx.scale(s, s);
+  ctx.font = "bold 62px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.lineWidth = 10; ctx.strokeStyle = "rgba(90,60,0,0.85)";
+  ctx.strokeText(`🎉 x = ${level.xVal} kg`, 0, 0);
+  ctx.fillStyle = "#ffd54a";
+  ctx.fillText(`🎉 x = ${level.xVal} kg`, 0, 0);
+  ctx.restore();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#8ecdf2";
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  drawBackground();
+  drawStand();
+  drawBeamAndPans();
+  const glowing = state === "splitting" || state === "won";
+  for (const b of boxPos) drawBox(b, glowing);
+  for (const w of weights) if (!w.gone && !w.drag) drawWeight(w);
+  if (dragW) drawWeight(dragW);
+  drawFloats();
+  drawConfetti();
+  drawWinText();
+  ctx.restore();
+}
+
+/* ================= 交互 ================= */
+function hitWeight(wx, wy) {
+  for (let i = weights.length - 1; i >= 0; i--) {
+    const w = weights[i];
+    if (w.gone || w.out || w.fly || w.drag) continue;
+    if (Math.hypot(wx - w.pos.x, wy - w.pos.y) < WEIGHT_R + 12) return w;
+  }
+  return null;
+}
+function hitBox(wx, wy) {
+  return boxPos.some(b => Math.abs(wx - b.x) < BOX_W / 2 + 8 && Math.abs(wy - b.y) < BOX_H / 2 + 8);
+}
+
+canvas.addEventListener("pointerdown", e => {
+  hintEl.style.opacity = "0";
+  if (state !== "play") return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  const w = hitWeight(wx, wy);
+  if (w) {
+    w.drag = true;
+    dragW = w;
+    w.pos.x = wx; w.pos.y = wy;
+    canvas.setPointerCapture(e.pointerId);
+    pop(520);
+  } else if (hitBox(wx, wy)) {
+    showHint("📦 木箱里装着 x kg，拿不走哦！想想怎么让它单独留下");
+    pop(200);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragW) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  dragW.pos.x = wx; dragW.pos.y = wy;
+});
+window.addEventListener("pointerup", () => {
+  if (!dragW) return;
+  const w = dragW;
+  w.drag = false;
+  dragW = null;
+  removePair(w);
+});
+
+// 从一边拿走一个砝码，另一边自动同步拿走一个（等式性质）
+function removePair(w) {
+  if (state !== "play") return false;
+  const otherSide = w.side === "L" ? "R" : "L";
+  const cand = weights.filter(o => o.side === otherSide && !o.out && !o.fly && !o.drag);
+  if (!cand.length) {
+    // 另一边没有可拿的：飞回原位
+    w.fly = { x0: w.pos.x, y0: w.pos.y, x1: w.home.x, y1: w.home.y, t: 0, dur: 0.35, delay: 0, back: true };
+    showHint(boxCount > 1 && leftWeights() === 0
+      ? "左边没有 1kg 砝码啦！试试点「⚖️ 平分」按钮"
+      : "两边要拿走一样多！另一边没有 1kg 砝码啦");
+    tone(220, 0.18, 0.12, "triangle");
+    return false;
+  }
+  // 拿最上面的一个
+  const o = cand.reduce((a, b) => (a.home.y < b.home.y ? a : b));
+  w.out = true; o.out = true;
+  w.fly = { x0: w.pos.x, y0: w.pos.y, x1: BASKETS[w.side].x, y1: BASKETS[w.side].y - 30, t: 0, dur: 0.55, delay: 0, back: false };
+  o.fly = { x0: o.pos.x, y0: o.pos.y, x1: BASKETS[o.side].x, y1: BASKETS[o.side].y - 30, t: 0, dur: 0.55, delay: 0.08, back: false };
+  const gl = panGeom("L"), gr = panGeom("R");
+  floats.push({ x: gl.px, y: gl.py - 170, text: "−1", t: 0 });
+  floats.push({ x: gr.px, y: gr.py - 170, text: "−1", t: 0 });
+  pop(700); setTimeout(() => pop(940), 90);
+  updateScore();
+  if (leftWeights() === 0) onCleared();
+  return true;
+}
+
+function onCleared() {
+  if (boxCount === 1) {
+    winLevel();
+  } else {
+    splitBtn.style.display = "block";
+    showHint("左边只剩木箱啦！点「⚖️ 平分」按钮，把右边平分给每个木箱", true);
+  }
+}
+
+function doSplit() {
+  if (state !== "play" || leftWeights() !== 0 || boxCount < 2) return;
+  state = "splitting";
+  splitBtn.style.display = "none";
+  const list = weights.filter(w => w.side === "R" && !w.out);
+  list.forEach((w, i) => {
+    const b = boxPos[i % boxCount];
+    const row = Math.floor(i / boxCount);
+    w.fly = {
+      x0: w.pos.x, y0: w.pos.y,
+      x1: b.x + (row % 2 === 0 ? -30 : 30),
+      y1: b.y - 78 - Math.floor(row / 2) * 52,
+      t: 0, dur: 0.6, delay: i * 0.1, back: false
+    };
+  });
+  whooshSplit();
+  showHint("每个木箱分到的砝码一样多，所以它们一样重！", true);
+}
+
+function winLevel() {
+  if (state === "won") return;
+  state = "won";
+  wonT = performance.now();
+  updateScore();
+  fanfare();
+  spawnConfetti();
+  nextBtn.textContent = levelIdx === LEVELS.length - 1 ? "完成 🎉" : "下一关 ▶";
+  nextBtn.style.display = "block";
+  showHint(`太棒了！x = ${level.xVal} kg，天平两边一样重！`, true);
+}
+
+function spawnConfetti() {
+  const colors = ["#e93b3b", "#ffb800", "#2fbf4a", "#2f7fe9", "#9b3de0", "#ff7a1a"];
+  for (let i = 0; i < 90; i++) {
+    confetti.push({
+      x: PIVOT.x + (Math.random() - 0.5) * 320, y: 200,
+      vx: (Math.random() - 0.5) * 480, vy: -Math.random() * 420 - 60,
+      r: Math.random() * Math.PI, vr: (Math.random() - 0.5) * 12,
+      s: 8 + Math.random() * 9, t: 0, color: colors[i % colors.length]
+    });
+  }
+}
+
+splitBtn.addEventListener("click", doSplit);
+nextBtn.addEventListener("click", () => {
+  pop(880);
+  if (levelIdx === LEVELS.length - 1) {
+    winPanel.style.display = "flex";
+    fanfare();
+  } else {
+    loadLevel(levelIdx + 1);
+  }
+});
+document.getElementById("replayBtn").addEventListener("click", () => { pop(880); loadLevel(0); });
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const whooshSplit = () => tone(420, 0.3, 0.1, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 提示条 ================= */
+let hintTimer = null;
+function showHint(text, sticky) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  if (!sticky) hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  layout();
+  draw();
+  requestAnimationFrame(loop);
+}
+loadLevel(0);
+requestAnimationFrame(loop);
+
+/* ================= 测试钩子（无头验证用） ================= */
+window.__T = {
+  level: () => levelIdx,
+  state: () => state,
+  eq: eqText,
+  leftW: leftWeights,
+  autoRemove() {
+    const w = weights.find(x => x.side === "L" && !x.out) ||
+              weights.find(x => x.side === "R" && !x.out && leftWeights() > 0);
+    return w ? removePair(w) : false;
+  },
+  split: doSplit,
+  next: () => nextBtn.click(),
+  step(dt) { physics(dt); layout(); draw(); }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

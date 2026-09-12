@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>欧姆定律实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#16213a; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,34,0.85); color:#7fd8ff; padding:10px 22px;
+    border-radius:24px; font-size:19px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,34,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #challengeBtn {
+    position:absolute; top:12px; right:14px; z-index:10;
+    font-size:17px; font-weight:bold; padding:10px 18px;
+    border-radius:24px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #challengeBtn:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar"></div>
+<button id="challengeBtn">🎯 挑战：让电流表读 0.3A</button>
+<div id="hint">拖动左边滑杆改变电压，点电阻可以换阻值，看看电流怎么变！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const challengeBtn = document.getElementById("challengeBtn");
+let W = 0, H = 0, DPR = 1;
+
+// 设计坐标 1280×800，整体等比缩放居中
+const DW = 1280, DH = 800;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / DW, H / DH);
+  view.ox = (W - DW * view.s) / 2;
+  view.oy = (H - DH * view.s) / 2;
+}
+function toDesign(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 场景数据（布局） ================= */
+// 电路矩形回路（左侧实验区）
+const LOOP = { x0:230, y0:210, x1:700, y1:560 };   // 左上 / 右下角
+const BATT = { x:465, y:LOOP.y1 };                  // 电池在底边中央
+const RES  = { x0:400, x1:530, y:LOOP.y0 };         // 电阻在顶边
+const AM   = { x:LOOP.x1, y:385, r:46 };            // 电流表在右边
+const VM   = { x:465, y:102, r:40 };                // 电压表并在电阻两端
+// 电压滑杆（竖直）
+const SLIDER = { x:120, y0:250, y1:540, knobR:24 };
+const U_MIN = 1.5, U_MAX = 9.0;
+// U-I 图表面板（右侧）
+const CHART = { px0:880, py0:150, px1:1220, py1:500 }; // 绘图区
+const I_MAX = 2.0, V_MAX = 10.0;                     // 坐标轴量程
+const CLEAR_BTN = { x:880, y:530, w:150, h:44 };
+const R_LIST = [5, 10, 20];
+const R_COLOR = { 5:"#ff5a5a", 10:"#4f9dff", 20:"#3ecf6e" };
+
+/* ================= 游戏状态 ================= */
+let U = 4.5;                 // 电源电压 (V)
+let R = 10;                  // 电阻 (Ω)
+let points = [];             // 已记录的 {I, U, R}
+let needleA = 0, needleV = 0;// 表针平滑值
+let flowPhase = 0;           // 光点流动相位
+let pulseT = 0;              // 新数据点脉冲动画
+let challengeActive = false;
+let challengeDone = 0;
+let sparks = [];             // 庆祝粒子
+
+function current() { return U / R; }   // 欧姆定律 I = U / R
+
+function updateScore() {
+  let s = `U = ${U.toFixed(1)} V · R = ${R} Ω · I = ${current().toFixed(2)} A`;
+  if (challengeActive) s += " · 🎯 目标 0.30 A";
+  scorebar.textContent = s;
+}
+
+function recordPoint() {
+  const I = current();
+  const last = points[points.length - 1];
+  if (last && Math.abs(last.U - U) < 0.001 && last.R === R) return; // 避免重复
+  points.push({ I, U, R });
+  pulseT = 1;
+  pop(660);
+  if (points.length === 3) showHint("连成线啦！过原点的直线 → 欧姆定律 U = I × R");
+  else if (points.length < 3) showHint(`已记录第 ${points.length} 个点，凑满 3 个就能连线！`);
+}
+
+// 过原点直线拟合：U = k·I，斜率 k = Σ(I·U)/Σ(I²)，应≈平均电阻
+function fitSlope() {
+  let a = 0, b = 0;
+  for (const p of points) { a += p.I * p.U; b += p.I * p.I; }
+  return b > 0 ? a / b : 0;
+}
+
+/* ================= 物理（步进） ================= */
+function physics(dt) {
+  // 表针平滑跟随
+  needleA += (current() - needleA) * Math.min(1, dt * 8);
+  needleV += (U - needleV) * Math.min(1, dt * 8);
+  // 光点流动：速度正比于电流
+  flowPhase += (40 + current() * 230) * dt;
+  if (pulseT > 0) pulseT = Math.max(0, pulseT - dt * 2);
+  // 庆祝粒子
+  for (const s of sparks) {
+    s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 500 * dt; s.life -= dt;
+  }
+  sparks = sparks.filter(s => s.life > 0);
+  // 挑战判定：电流表读到 0.30A（±0.01）
+  if (challengeActive && Math.abs(current() - 0.3) <= 0.01) {
+    challengeActive = false;
+    challengeDone++;
+    fanfare();
+    burst(AM.x, AM.y);
+    showHint(`🎉 成功！U=${U.toFixed(1)}V ÷ R=${R}Ω = 0.30A，这就是 U = I × R！`);
+    challengeBtn.textContent = "🎯 再挑战一次 0.3A";
+    updateScore();
+  }
+}
+
+function burst(x, y) {
+  for (let i = 0; i < 40; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 260;
+    sparks.push({ x, y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp - 150,
+      life:0.9 + Math.random()*0.6, c:["#ffd54a","#ff5a5a","#7fd8ff","#3ecf6e"][i % 4] });
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+// 回路路径（顺时针）：底边从左到右（过电池）→ 右边上（过电流表）→ 顶边从右到左（过电阻）→ 左边下
+function loopPath() {
+  const L = LOOP;
+  const segs = [
+    [L.x0, L.y1, L.x1, L.y1],
+    [L.x1, L.y1, L.x1, L.y0],
+    [L.x1, L.y0, L.x0, L.y0],
+    [L.x0, L.y0, L.x0, L.y1],
+  ];
+  let total = 0;
+  const list = segs.map(([x0, y0, x1, y1]) => {
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    const s = { x0, y0, x1, y1, start: total, len };
+    total += len;
+    return s;
+  });
+  return { list, total };
+}
+function pathPoint(path, d) {
+  d = ((d % path.total) + path.total) % path.total;
+  for (const s of path.list) {
+    if (d <= s.start + s.len) {
+      const t = (d - s.start) / s.len;
+      return [s.x0 + (s.x1 - s.x0) * t, s.y0 + (s.y1 - s.y0) * t];
+    }
+  }
+  return [path.list[0].x0, path.list[0].y0];
+}
+
+function drawWires(path) {
+  ctx.lineCap = "round";
+  for (const w of [9, 4]) {
+    ctx.strokeStyle = w === 9 ? "#3a4d78" : "#8fa8d8";
+    ctx.lineWidth = w;
+    ctx.beginPath();
+    let first = true;
+    for (const s of path.list) {
+      if (first) { ctx.moveTo(s.x0, s.y0); first = false; }
+      ctx.lineTo(s.x1, s.y1);
+    }
+    ctx.closePath();
+    ctx.stroke();
+  }
+  // 电压表并联支路
+  ctx.strokeStyle = "#8fa8d8"; ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(RES.x0, LOOP.y0); ctx.lineTo(RES.x0, VM.y);
+  ctx.lineTo(VM.x - VM.r, VM.y);
+  ctx.moveTo(VM.x + VM.r, VM.y); ctx.lineTo(RES.x1, VM.y);
+  ctx.lineTo(RES.x1, LOOP.y0);
+  ctx.stroke();
+}
+
+function drawFlowDots(path) {
+  const N = 16;
+  const I = current();
+  const glow = Math.min(1, 0.25 + I / 0.8);
+  for (let i = 0; i < N; i++) {
+    const [x, y] = pathPoint(path, flowPhase + i * path.total / N);
+    ctx.beginPath();
+    ctx.arc(x, y, 7, 0, 7);
+    ctx.fillStyle = `rgba(255,214,80,${0.25 * glow})`;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, 7);
+    ctx.fillStyle = `rgba(255,236,150,${0.55 + 0.45 * glow})`;
+    ctx.fill();
+  }
+}
+
+function drawBattery() {
+  const { x, y } = BATT;
+  // 电池符号：左长右短（长线为正极）
+  ctx.strokeStyle = "#e8eeff"; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(x - 26, y - 24); ctx.lineTo(x - 26, y + 24); ctx.stroke();
+  ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.moveTo(x + 8, y - 11); ctx.lineTo(x + 8, y + 11); ctx.stroke();
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 20px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("+", x - 40, y - 28);
+  ctx.fillText("−", x + 22, y - 28);
+  ctx.fillStyle = "#cfe0ff";
+  ctx.font = "bold 22px sans-serif";
+  ctx.fillText(`电源  U = ${U.toFixed(1)} V`, x, y + 52);
+}
+
+function drawSlider() {
+  const { x, y0, y1, knobR } = SLIDER;
+  const frac = (U - U_MIN) / (U_MAX - U_MIN);
+  const ky = y1 - frac * (y1 - y0);
+  // 标签
+  ctx.fillStyle = "#cfe0ff"; ctx.font = "bold 20px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("电压滑杆", x, y0 - 46);
+  ctx.font = "16px sans-serif";
+  ctx.fillText(`${U_MAX}V`, x + 34, y0 + 5);
+  ctx.fillText(`${U_MIN}V`, x + 38, y1 + 5);
+  // 轨道
+  ctx.fillStyle = "#2c3c66";
+  roundRect(x - 9, y0 - 10, 18, (y1 - y0) + 20, 9, true);
+  ctx.fillStyle = "#ffb800";
+  roundRect(x - 9, ky, 18, y1 - ky + 10, 9, true);
+  // 手柄（大拖拽区）
+  const g = ctx.createRadialGradient(x - 6, ky - 7, 3, x, ky, knobR);
+  g.addColorStop(0, "#ffe9a8"); g.addColorStop(1, "#e8a200");
+  ctx.beginPath(); ctx.arc(x, ky, knobR, 0, 7);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = draggingSlider ? "#ffffff" : "rgba(0,0,0,0.35)";
+  ctx.lineWidth = draggingSlider ? 4 : 2; ctx.stroke();
+  // 数值气泡
+  ctx.fillStyle = "rgba(10,16,34,0.9)";
+  roundRect(x + 34, ky - 20, 86, 40, 10, true);
+  ctx.fillStyle = "#ffd54a"; ctx.font = "bold 22px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(`${U.toFixed(1)}V`, x + 77, ky + 8);
+}
+
+function drawResistor() {
+  const { x0, x1, y } = RES;
+  const col = R_COLOR[R];
+  // 锯齿电阻符号
+  ctx.strokeStyle = col; ctx.lineWidth = 5; ctx.lineJoin = "round";
+  ctx.beginPath();
+  const n = 6, w = (x1 - x0) / n;
+  ctx.moveTo(x0, y);
+  for (let i = 0; i < n; i++)
+    ctx.lineTo(x0 + w * (i + 0.5), y + (i % 2 === 0 ? -16 : 16));
+  ctx.lineTo(x1, y);
+  ctx.stroke();
+  // 标签 + 可点击提示
+  ctx.fillStyle = col; ctx.font = "bold 24px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(`R = ${R} Ω`, (x0 + x1) / 2, y - 34);
+  ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.font = "15px sans-serif";
+  ctx.fillText("点我换 5/10/20Ω", (x0 + x1) / 2, y + 46);
+  ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 2;
+  ctx.setLineDash([6, 6]);
+  roundRect(x0 - 18, y - 62, (x1 - x0) + 36, 122, 14, false);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+// 指针表盘：value/maxValue → 指针角度（零在左上，满偏右上）
+function drawMeter(cx, cy, r, label, value, maxV, unit, color) {
+  // 表盘
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7);
+  ctx.fillStyle = "#f5f2e8"; ctx.fill();
+  ctx.strokeStyle = "#333"; ctx.lineWidth = 3; ctx.stroke();
+  // 刻度
+  for (let i = 0; i <= 10; i++) {
+    const a = (225 + i * 9) * Math.PI / 180;
+    const c = Math.cos(a), s = Math.sin(a);
+    ctx.strokeStyle = i * maxV / 10 > maxV * 0.8 ? "#d33" : "#555";
+    ctx.lineWidth = i % 5 === 0 ? 3 : 1.5;
+    ctx.beginPath();
+    ctx.moveTo(cx + c * (r - 6), cy + s * (r - 6));
+    ctx.lineTo(cx + c * (r - (i % 5 === 0 ? 15 : 11)), cy + s * (r - (i % 5 === 0 ? 15 : 11)));
+    ctx.stroke();
+  }
+  // 单位符号
+  ctx.fillStyle = "#333"; ctx.font = `bold ${r * 0.5}px sans-serif`; ctx.textAlign = "center";
+  ctx.fillText(label, cx, cy - r * 0.12);
+  // 指针
+  const frac = Math.max(0, Math.min(1, value / maxV));
+  const a = (225 + frac * 90) * Math.PI / 180;
+  ctx.strokeStyle = "#d33"; ctx.lineWidth = 3.5;
+  ctx.beginPath(); ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + Math.cos(a) * (r - 12), cy + Math.sin(a) * (r - 12));
+  ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 7);
+  ctx.fillStyle = "#333"; ctx.fill();
+  // 数字读数（画在表盘下半部，避免与周围元件重叠）
+  ctx.fillStyle = color; ctx.font = `bold ${Math.round(r * 0.34)}px sans-serif`;
+  ctx.fillText(`${value.toFixed(2)} ${unit}`, cx, cy + r * 0.62);
+}
+
+function drawChart() {
+  // 面板
+  ctx.fillStyle = "rgba(20,30,58,0.92)";
+  roundRect(845, 90, 420, 560, 18, true);
+  ctx.strokeStyle = "rgba(127,216,255,0.4)"; ctx.lineWidth = 2;
+  roundRect(845, 90, 420, 560, 18, false); ctx.stroke();
+  ctx.fillStyle = "#7fd8ff"; ctx.font = "bold 21px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("实验记录：U - I 图象", 1055, 122);
+  const { px0, py0, px1, py1 } = CHART;
+  // 网格与坐标
+  ctx.strokeStyle = "rgba(255,255,255,0.12)"; ctx.lineWidth = 1;
+  ctx.fillStyle = "rgba(255,255,255,0.65)"; ctx.font = "13px sans-serif";
+  for (let i = 0; i <= 4; i++) {  // I 轴（横）
+    const x = px0 + (px1 - px0) * i / 4;
+    ctx.beginPath(); ctx.moveTo(x, py0); ctx.lineTo(x, py1); ctx.stroke();
+    ctx.textAlign = "center"; ctx.fillText((I_MAX * i / 4).toFixed(1), x, py1 + 18);
+  }
+  for (let i = 0; i <= 5; i++) {  // U 轴（纵）
+    const y = py1 - (py1 - py0) * i / 5;
+    ctx.beginPath(); ctx.moveTo(px0, y); ctx.lineTo(px1, y); ctx.stroke();
+    ctx.textAlign = "right"; ctx.fillText((V_MAX * i / 5).toFixed(0), px0 - 6, y + 4);
+  }
+  ctx.strokeStyle = "#cfe0ff"; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(px0, py0 - 6); ctx.lineTo(px0, py1); ctx.lineTo(px1 + 6, py1); ctx.stroke();
+  ctx.fillStyle = "#cfe0ff"; ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "right"; ctx.fillText("I / A", px1 + 4, py1 + 36);
+  ctx.textAlign = "left"; ctx.fillText("U / V", px0 - 2, py0 - 12);
+  const X = I => px0 + (px1 - px0) * I / I_MAX;
+  const Y = Uv => py1 - (py1 - py0) * Uv / V_MAX;
+  // 挑战目标线
+  if (challengeActive) {
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 2.5; ctx.setLineDash([8, 7]);
+    ctx.beginPath(); ctx.moveTo(X(0.3), py0); ctx.lineTo(X(0.3), py1); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#ffd54a"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("目标 0.3A", X(0.3), py0 - 8);
+  }
+  // 拟合直线（≥3 点，过原点，斜率≈R）
+  if (points.length >= 3) {
+    const k = fitSlope();
+    const iEnd = Math.min(I_MAX, V_MAX / k);
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3.5;
+    ctx.beginPath(); ctx.moveTo(X(0), Y(0)); ctx.lineTo(X(iEnd), Y(k * iEnd)); ctx.stroke();
+    ctx.fillStyle = "#ffd54a"; ctx.font = "bold 17px sans-serif"; ctx.textAlign = "left";
+    ctx.fillText(`过原点直线！斜率 ≈ ${k.toFixed(1)} Ω`, px0 + 8, py0 + 24);
+    ctx.fillText(`= 平均电阻 R̄ → U = I × R`, px0 + 8, py0 + 46);
+  } else {
+    ctx.fillStyle = "rgba(255,255,255,0.55)"; ctx.font = "15px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(`松开滑杆自动记录数据点（${points.length}/3 个后连线）`, (px0 + px1) / 2, py0 + 26);
+  }
+  // 数据点
+  for (const p of points) {
+    ctx.beginPath(); ctx.arc(X(p.I), Y(p.U), 7, 0, 7);
+    ctx.fillStyle = R_COLOR[p.R]; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+  }
+  // 最新点脉冲
+  if (pulseT > 0 && points.length) {
+    const p = points[points.length - 1];
+    ctx.beginPath(); ctx.arc(X(p.I), Y(p.U), 7 + (1 - pulseT) * 22, 0, 7);
+    ctx.strokeStyle = `rgba(255,213,74,${pulseT})`; ctx.lineWidth = 3; ctx.stroke();
+  }
+  // 图例
+  ctx.font = "14px sans-serif"; ctx.textAlign = "left";
+  let lx = 880;
+  for (const r of R_LIST) {
+    ctx.fillStyle = R_COLOR[r];
+    ctx.beginPath(); ctx.arc(lx + 7, 596, 6, 0, 7); ctx.fill();
+    ctx.fillStyle = "#cfe0ff"; ctx.fillText(`${r}Ω`, lx + 18, 601);
+    lx += 62;
+  }
+  // 清除按钮
+  ctx.fillStyle = "rgba(255,90,90,0.18)";
+  roundRect(CLEAR_BTN.x, CLEAR_BTN.y, CLEAR_BTN.w, CLEAR_BTN.h, 12, true);
+  ctx.strokeStyle = "rgba(255,120,120,0.6)"; ctx.lineWidth = 2;
+  roundRect(CLEAR_BTN.x, CLEAR_BTN.y, CLEAR_BTN.w, CLEAR_BTN.h, 12, false); ctx.stroke();
+  ctx.fillStyle = "#ff9a9a"; ctx.font = "bold 17px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("🗑 清除数据", CLEAR_BTN.x + CLEAR_BTN.w / 2, CLEAR_BTN.y + 29);
+}
+
+function drawSparks() {
+  for (const s of sparks) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, s.life));
+    ctx.beginPath(); ctx.arc(s.x, s.y, 5, 0, 7);
+    ctx.fillStyle = s.c; ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#1a2547"); bg.addColorStop(1, "#101a30");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  // 标题
+  ctx.fillStyle = "#e8eeff"; ctx.font = "bold 30px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("⚡ 欧姆定律实验室", 40, 56);
+  ctx.fillStyle = "rgba(255,255,255,0.55)"; ctx.font = "16px sans-serif";
+  ctx.fillText("电流 I = 电压 U ÷ 电阻 R", 42, 84);
+  const path = loopPath();
+  drawWires(path);
+  drawFlowDots(path);
+  drawBattery();
+  drawSlider();
+  drawResistor();
+  drawMeter(AM.x, AM.y, AM.r, "A", needleA, 2, "A", "#ff8a5a");
+  drawMeter(VM.x, VM.y, VM.r, "V", needleV, 10, "V", "#7fd8ff");
+  drawChart();
+  drawSparks();
+}
+
+/* ================= 交互 ================= */
+let draggingSlider = false;
+
+function hitSlider(dx, dy) {
+  return Math.abs(dx - SLIDER.x) < 46 && dy > SLIDER.y0 - 40 && dy < SLIDER.y1 + 40;
+}
+function sliderToU(dy) {
+  const f = Math.max(0, Math.min(1, (SLIDER.y1 - dy) / (SLIDER.y1 - SLIDER.y0)));
+  return Math.round((U_MIN + f * (U_MAX - U_MIN)) * 10) / 10;
+}
+function hitResistor(dx, dy) {
+  return dx > RES.x0 - 18 && dx < RES.x1 + 18 && dy > RES.y - 62 && dy < RES.y + 60;
+}
+function hitClear(dx, dy) {
+  return dx > CLEAR_BTN.x && dx < CLEAR_BTN.x + CLEAR_BTN.w &&
+         dy > CLEAR_BTN.y && dy < CLEAR_BTN.y + CLEAR_BTN.h;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const [dx, dy] = toDesign(e.clientX, e.clientY);
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+  if (hitSlider(dx, dy)) {
+    draggingSlider = true;
+    U = sliderToU(dy);
+    updateScore();
+    tick();
+  } else if (hitResistor(dx, dy)) {
+    R = R_LIST[(R_LIST.indexOf(R) + 1) % R_LIST.length];
+    pop(520);
+    updateScore();
+    recordPoint();
+    showHint(`换成 ${R}Ω！同样电压下，电阻越大电流越小`);
+  } else if (hitClear(dx, dy)) {
+    points = [];
+    pop(300);
+    showHint("数据已清除，重新做实验吧！");
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!draggingSlider) return;
+  const [dx, dy] = toDesign(e.clientX, e.clientY);
+  const nu = sliderToU(dy);
+  if (nu !== U) { U = nu; updateScore(); tick(); }
+});
+window.addEventListener("pointerup", () => {
+  if (draggingSlider) {
+    draggingSlider = false;
+    recordPoint();   // 松开滑杆自动记录数据点
+  }
+});
+
+challengeBtn.addEventListener("click", () => {
+  challengeActive = true;
+  updateScore();
+  pop(880);
+  showHint("🎯 挑战开始：调电压、换电阻，让电流表正好读 0.30A！");
+});
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const tick = () => tone(900 + U * 40, 0.04, 0.05, "square");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+updateScore();
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

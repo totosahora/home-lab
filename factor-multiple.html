@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>数字果园 · 因数与倍数</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#7ec850; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,20,0.85); color:#ffe98a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,20,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  .panel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:20px;
+    background:rgba(0,40,0,0.45);
+  }
+  .panel .msg {
+    font-size:34px; font-weight:bold; color:#ffe98a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.7;
+    padding:0 20px;
+  }
+  .panel .sub { font-size:20px; color:#fff; text-align:center; line-height:1.8; }
+  .panel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  .panel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar"></div>
+<div id="hint"></div>
+<div class="panel" id="levelPanel">
+  <div class="msg" id="panelMsg"></div>
+  <div class="sub" id="panelSub"></div>
+  <button id="panelBtn">下一关</button>
+</div>
+<div class="panel" id="winPanel">
+  <div class="msg">🏆 最大公因数是 6！</div>
+  <div class="sub">12 和 18 的公因数：1、2、3、6<br>其中最大的就是最大公因数 6，你太棒了！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const levelPanel = document.getElementById("levelPanel");
+const panelMsg = document.getElementById("panelMsg");
+const panelSub = document.getElementById("panelSub");
+const panelBtn = document.getElementById("panelBtn");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+// 世界坐标 1200×750，等比缩放居中
+const WORLD_W = 1200, WORLD_H = 750;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / WORLD_W, H / WORLD_H);
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 关卡数据 ================= */
+// 第1、2关：摘 N 的所有因数；第3关：公因数韦恩图
+const PICK_LEVELS = [
+  { n:12, factors:[1,2,3,4,6,12] },
+  { n:18, factors:[1,2,3,6,9,18] },
+];
+const L3_VALUES = [1,2,3,4,6,9,12,18];      // 12 与 18 的因数合集
+const L3_MID = [1,2,3,6];                   // 公因数
+const GCF = 6;                              // 最大公因数
+
+const FRUIT_COLORS = ["#ff5a4e","#ff9430","#ffc93c","#ff7ab8","#ff5a4e","#ff9430","#ffc93c","#ff7ab8"];
+
+// 篮子（第1、2关）
+const BASKET = { x:600, y:655, topW:380, botW:300, h:130 };
+function basketSlot(i) {  // 6 个位子，两行三列
+  const col = i % 3, row = (i / 3) | 0;
+  return { x: BASKET.x - 82 + col * 82, y: BASKET.y - 22 + row * 52 };
+}
+// 韦恩图（第3关）：左右两圆 + 中间交集
+const VENN = { l:{x:430,y:540,r:170}, r:{x:770,y:540,r:170} };
+const VENN_SLOTS = {
+  left:  [{x:335,y:515},{x:335,y:615}],
+  mid:   [{x:600,y:462},{x:600,y:535},{x:600,y:608},{x:600,y:681}],
+  right: [{x:865,y:515},{x:865,y:615}],
+};
+
+/* ================= 游戏状态 ================= */
+let level = 1;               // 1 | 2 | 3
+let fruits = [];             // {n,hx,hy,x,y,r,st,t,fx,fy,tx,ty,shakeT,onArrive,zone}
+let picked = [];             // 已摘下的因数
+let placedCount = 0;         // 第3关已放对的果子数
+let zoneCount = { left:0, mid:0, right:0 };
+let dragging = null;
+let downX = 0, downY = 0;
+let confetti = [];
+let showTrophy = false, trophyT = 0;
+
+function makeFruit(n, hx, hy, r) {
+  return { n, hx, hy, x:hx, y:hy, r, st:"tree", t:0, fx:0, fy:0, tx:0, ty:0, shakeT:0, onArrive:null, zone:null };
+}
+function setupPickLevel(idx) {
+  level = idx + 1;
+  const N = PICK_LEVELS[idx].n;
+  fruits = []; picked = [];
+  const cands = [];
+  for (let i = 1; i <= N; i++) cands.push(i);
+  const rows = N > 12 ? 2 : 1;
+  const perRow = Math.ceil(cands.length / rows);
+  cands.forEach((n, i) => {
+    const row = (i / perRow) | 0, col = i % perRow;
+    const cnt = row === 0 ? Math.min(perRow, cands.length) : cands.length - perRow;
+    const gap = rows === 1 ? 88 : 104;
+    const x = 600 - (cnt - 1) * gap / 2 + col * gap;
+    const y = rows === 1 ? 345 : 305 + row * 105;
+    fruits.push(makeFruit(n, x, y, 34));
+  });
+  showTrophy = false;
+  updateScore();
+  showHint(`点击或拖动果子：把 ${N} 的因数摘进篮子！`);
+}
+function setupLevel3() {
+  level = 3;
+  fruits = []; placedCount = 0;
+  zoneCount = { left:0, mid:0, right:0 };
+  L3_VALUES.forEach((n, i) => {
+    fruits.push(makeFruit(n, 198 + i * 115, 300, 34));
+  });
+  showTrophy = false;
+  updateScore();
+  showHint("拖动果子进正确的篮子：只属于 12 放左边，只属于 18 放右边，都是就放中间！");
+}
+function resetGame() {
+  winPanel.style.display = "none";
+  levelPanel.style.display = "none";
+  confetti = [];
+  setupPickLevel(0);
+}
+function updateScore() {
+  if (level === 3) {
+    scorebar.textContent = `第 3 关 · 找 12 和 18 的公因数：${placedCount} / ${L3_VALUES.length}`;
+  } else {
+    const L = PICK_LEVELS[level - 1];
+    scorebar.textContent = `第 ${level} 关 · 摘 ${L.n} 的因数：${picked.length} / ${L.factors.length}`;
+  }
+}
+
+/* ================= 动画 ================= */
+function flyTo(f, tx, ty, onArrive) {
+  f.st = "fly"; f.t = 0;
+  f.fx = f.x; f.fy = f.y; f.tx = tx; f.ty = ty;
+  f.onArrive = onArrive || null;
+}
+function easeOut(t) { return 1 - (1 - t) * (1 - t); }
+
+function update(dt) {
+  for (const f of fruits) {
+    if (f.st === "fly") {
+      f.t += dt / 0.55;
+      if (f.t >= 1) {
+        f.x = f.tx; f.y = f.ty;
+        const cb = f.onArrive; f.onArrive = null;
+        f.st = "done";
+        if (cb) cb(f);
+      } else {
+        const t = easeOut(f.t);
+        // 弧线飞行：中点上抬
+        const mx = (f.fx + f.tx) / 2, my = Math.min(f.fy, f.ty) - 90;
+        const u = 1 - t;
+        f.x = u * u * f.fx + 2 * u * t * mx + t * t * f.tx;
+        f.y = u * u * f.fy + 2 * u * t * my + t * t * f.ty;
+      }
+    } else if (f.st === "shake") {
+      f.shakeT -= dt;
+      f.x = f.hx + Math.sin(f.shakeT * 55) * 9 * Math.max(0, f.shakeT / 0.5);
+      if (f.shakeT <= 0) { f.st = "tree"; f.x = f.hx; f.y = f.hy; }
+    }
+  }
+  // 彩带
+  for (const c of confetti) {
+    c.vy += 500 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += c.spin * dt; c.life -= dt;
+  }
+  confetti = confetti.filter(c => c.life > 0 && c.y < WORLD_H + 40);
+  if (showTrophy) trophyT += dt;
+}
+
+/* ================= 交互 ================= */
+function fruitAt(x, y) {
+  for (let i = fruits.length - 1; i >= 0; i--) {
+    const f = fruits[i];
+    if (f.st !== "tree") continue;
+    if (Math.hypot(f.x - x, f.y - y) < f.r + 10) return f;
+  }
+  return null;
+}
+function overBasket(x, y) {
+  return x > BASKET.x - BASKET.topW / 2 - 20 && x < BASKET.x + BASKET.topW / 2 + 20 &&
+         y > BASKET.y - BASKET.h / 2 - 40 && y < BASKET.y + BASKET.h / 2 + 30;
+}
+function inCircle(c, x, y) { return Math.hypot(c.x - x, c.y - y) < c.r; }
+function zoneAt(x, y) {
+  const L = inCircle(VENN.l, x, y), R = inCircle(VENN.r, x, y);
+  if (L && R) return "mid";
+  if (L) return "left";
+  if (R) return "right";
+  return null;
+}
+function needZone(v) {
+  const a = 12 % v === 0, b = 18 % v === 0;
+  return a && b ? "mid" : a ? "left" : "right";
+}
+
+function tryPick(f) {
+  const L = PICK_LEVELS[level - 1], N = L.n;
+  if (N % f.n === 0) {
+    const slot = basketSlot(picked.length);
+    ding();
+    flyTo(f, slot.x, slot.y, () => {
+      picked.push(f.n);
+      updateScore();
+      pop(1200 + picked.length * 60);
+      if (picked.length === L.factors.length) celebratePick(L);
+    });
+  } else {
+    f.st = "shake"; f.shakeT = 0.5;
+    showHint(`${N} ÷ ${f.n} 除不尽哦（余 ${N % f.n}），它不是 ${N} 的因数`);
+    wrong();
+  }
+}
+function tryPlace(f, zone) {
+  const need = needZone(f.n);
+  if (zone === need) {
+    const slot = VENN_SLOTS[zone][zoneCount[zone]++];
+    ding();
+    flyTo(f, slot.x, slot.y, () => {
+      f.zone = zone;
+      placedCount++;
+      updateScore();
+      pop(1200 + placedCount * 60);
+      if (placedCount === L3_VALUES.length) celebrateL3();
+    });
+  } else {
+    flyTo(f, f.hx, f.hy, g => { g.st = "shake"; g.shakeT = 0.5; });
+    if (need === "mid") showHint(`${f.n} 既是 12 的因数，又是 18 的因数，要放中间的篮子哦`);
+    else if (need === "left") showHint(`${f.n} 只是 12 的因数（18 ÷ ${f.n} 除不尽），放左边篮子`);
+    else showHint(`${f.n} 只是 18 的因数（12 ÷ ${f.n} 除不尽），放右边篮子`);
+    wrong();
+  }
+}
+function celebratePick(L) {
+  fanfare();
+  spawnConfetti(90);
+  const pairs = [];
+  for (const a of L.factors) if (a <= L.n / a) pairs.push(`${a}×${L.n / a}=${L.n}`);
+  setTimeout(() => {
+    panelMsg.innerHTML = `🎉 ${L.n} 的因数全家福！`;
+    panelSub.innerHTML = `${L.factors.join(" · ")}<br>${pairs.join("　")}`;
+    panelBtn.textContent = level === 1 ? "下一关：摘 18 的因数" : "挑战：找公因数 🏆";
+    levelPanel.style.display = "flex";
+  }, 900);
+}
+function celebrateL3() {
+  fanfare();
+  spawnConfetti(120);
+  showTrophy = true; trophyT = 0;
+  showHint(`中间篮子里最大的是 ${GCF}，它就是 12 和 18 的最大公因数！`);
+  setTimeout(() => { winPanel.style.display = "flex"; }, 2200);
+}
+
+canvas.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  resumeAudio();
+  const [x, y] = toWorld(e.clientX, e.clientY);
+  const f = fruitAt(x, y);
+  if (f) {
+    dragging = f; f.st = "drag";
+    downX = x; downY = y;
+    f.x = x; f.y = y;
+    canvas.setPointerCapture(e.pointerId);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  const [x, y] = toWorld(e.clientX, e.clientY);
+  dragging.x = Math.max(30, Math.min(WORLD_W - 30, x));
+  dragging.y = Math.max(30, Math.min(WORLD_H - 30, y));
+});
+window.addEventListener("pointerup", e => {
+  if (!dragging) return;
+  const f = dragging; dragging = null;
+  const [x, y] = toWorld(e.clientX, e.clientY);
+  const moved = Math.hypot(x - downX, y - downY);
+  if (level < 3) {
+    if (moved < 16 || overBasket(x, y)) {
+      f.x = x; f.y = y;
+      tryPick(f);
+    } else {
+      flyTo(f, f.hx, f.hy, g => { g.st = "tree"; });
+    }
+  } else {
+    const zone = zoneAt(x, y);
+    if (zone) {
+      f.x = x; f.y = y;
+      tryPlace(f, zone);
+    } else {
+      flyTo(f, f.hx, f.hy, g => { g.st = "tree"; });
+    }
+  }
+});
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const sky = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+  sky.addColorStop(0, "#b8e6ff"); sky.addColorStop(0.6, "#dff5e0"); sky.addColorStop(1, "#a8dd80");
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+  // 太阳
+  ctx.fillStyle = "#ffe066";
+  ctx.beginPath(); ctx.arc(1050, 90, 46, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "rgba(255,224,102,0.35)";
+  ctx.beginPath(); ctx.arc(1050, 90, 64, 0, Math.PI * 2); ctx.fill();
+  // 云
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  for (const [cx, cy, s] of [[200,90,1],[520,60,0.8],[880,150,0.9]]) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, 30 * s, 0, Math.PI * 2);
+    ctx.arc(cx + 32 * s, cy + 6 * s, 24 * s, 0, Math.PI * 2);
+    ctx.arc(cx - 32 * s, cy + 8 * s, 22 * s, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // 草地
+  ctx.fillStyle = "#6fbf45";
+  ctx.fillRect(0, 560, WORLD_W, WORLD_H - 560);
+  ctx.fillStyle = "#5da838";
+  ctx.beginPath(); ctx.ellipse(600, 560, 700, 26, 0, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawTree() {
+  // 树干
+  ctx.fillStyle = "#8a5a2b";
+  ctx.beginPath();
+  ctx.moveTo(555, 580); ctx.lineTo(575, 300); ctx.lineTo(625, 300); ctx.lineTo(645, 580);
+  ctx.closePath(); ctx.fill();
+  // 树枝
+  ctx.strokeStyle = "#8a5a2b"; ctx.lineCap = "round";
+  ctx.lineWidth = 16;
+  ctx.beginPath(); ctx.moveTo(585, 330); ctx.lineTo(380, 250); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(615, 330); ctx.lineTo(820, 250); ctx.stroke();
+  // 树冠
+  const greens = ["#3e9c3e", "#48ad48", "#57bd57"];
+  const blobs = [[600,150,150],[430,190,110],[770,190,110],[520,110,100],[680,110,100],[600,220,130]];
+  blobs.forEach(([x, y, r], i) => {
+    ctx.fillStyle = greens[i % 3];
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  });
+}
+
+function drawFruitShape(x, y, r, n, ci, big) {
+  // 果柄与叶子
+  ctx.strokeStyle = "#7a4a1f"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(x, y - r); ctx.lineTo(x, y - r - 12); ctx.stroke();
+  ctx.fillStyle = "#3e9c3e";
+  ctx.beginPath(); ctx.ellipse(x + 8, y - r - 8, 9, 5, 0.5, 0, Math.PI * 2); ctx.fill();
+  // 果身
+  const col = FRUIT_COLORS[ci % FRUIT_COLORS.length];
+  const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.35, r * 0.15, x, y, r);
+  g.addColorStop(0, "#ffffff");
+  g.addColorStop(0.25, col);
+  g.addColorStop(1, shade(col, -40));
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.18)"; ctx.lineWidth = 2; ctx.stroke();
+  // 数字
+  ctx.fillStyle = "#fff";
+  ctx.font = `bold ${big ? 30 : 26}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.shadowColor = "rgba(0,0,0,0.45)"; ctx.shadowBlur = 4;
+  ctx.fillText(String(n), x, y + 1);
+  ctx.shadowBlur = 0;
+}
+function shade(hex, d) {
+  const v = parseInt(hex.slice(1), 16);
+  const r = Math.max(0, Math.min(255, (v >> 16) + d));
+  const g = Math.max(0, Math.min(255, ((v >> 8) & 255) + d));
+  const b = Math.max(0, Math.min(255, (v & 255) + d));
+  return `rgb(${r},${g},${b})`;
+}
+
+function drawFruits() {
+  for (const f of fruits) {
+    if (f.st === "done" && level < 3) continue;      // 已进篮子，由篮子里的迷你果展示
+    const isDrag = f.st === "drag";
+    if (isDrag) {
+      ctx.fillStyle = "rgba(0,0,0,0.25)";
+      ctx.beginPath(); ctx.ellipse(f.x, f.hy + f.r + 8, f.r * 0.8, 8, 0, 0, Math.PI * 2); ctx.fill();
+    }
+    drawFruitShape(f.x, f.y, f.r * (isDrag ? 1.12 : 1), f.n, f.n - 1, isDrag);
+  }
+}
+
+function drawBasket() {
+  const { x, y, topW, botW, h } = BASKET;
+  // 篮身
+  ctx.fillStyle = "#b5772f";
+  ctx.beginPath();
+  ctx.moveTo(x - topW / 2, y - h / 2);
+  ctx.lineTo(x + topW / 2, y - h / 2);
+  ctx.lineTo(x + botW / 2, y + h / 2);
+  ctx.lineTo(x - botW / 2, y + h / 2);
+  ctx.closePath(); ctx.fill();
+  // 编织纹
+  ctx.strokeStyle = "rgba(90,50,10,0.5)"; ctx.lineWidth = 3;
+  for (let i = 1; i < 4; i++) {
+    const yy = y - h / 2 + (h / 4) * i;
+    const ww = topW - (topW - botW) * (i / 4);
+    ctx.beginPath(); ctx.moveTo(x - ww / 2, yy); ctx.lineTo(x + ww / 2, yy); ctx.stroke();
+  }
+  // 篮沿
+  ctx.fillStyle = "#8a5a2b";
+  roundRect(x - topW / 2 - 12, y - h / 2 - 14, topW + 24, 20, 10, true);
+  // 已摘的迷你果
+  picked.forEach((n, i) => {
+    const s = basketSlot(i);
+    drawFruitShape(s.x, s.y, 22, n, n - 1, false);
+  });
+  // 标签（篮子上方的小木牌）
+  if (level < 3) {
+    const label = `${PICK_LEVELS[level - 1].n} 的因数`;
+    ctx.font = 'bold 20px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    const lw = ctx.measureText(label).width + 30;
+    ctx.fillStyle = "rgba(255,250,230,0.92)";
+    roundRect(x - lw / 2, y - h / 2 - 46, lw, 30, 15, true);
+    ctx.strokeStyle = "#8a5a2b"; ctx.lineWidth = 2;
+    roundRect(x - lw / 2, y - h / 2 - 46, lw, 30, 15, false);
+    ctx.stroke();
+    ctx.fillStyle = "#5a3d00";
+    ctx.fillText(label, x, y - h / 2 - 30);
+  }
+}
+
+function drawVenn() {
+  // 两个半透明圆
+  ctx.fillStyle = "rgba(90,160,255,0.28)";
+  ctx.beginPath(); ctx.arc(VENN.l.x, VENN.l.y, VENN.l.r, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "rgba(255,170,60,0.28)";
+  ctx.beginPath(); ctx.arc(VENN.r.x, VENN.r.y, VENN.r.r, 0, Math.PI * 2); ctx.fill();
+  ctx.lineWidth = 4;
+  ctx.strokeStyle = "#3a78d0";
+  ctx.beginPath(); ctx.arc(VENN.l.x, VENN.l.y, VENN.l.r, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = "#e08a1e";
+  ctx.beginPath(); ctx.arc(VENN.r.x, VENN.r.y, VENN.r.r, 0, Math.PI * 2); ctx.stroke();
+  // 标签
+  ctx.font = 'bold 24px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#1e5cb8";
+  ctx.fillText("12 的因数", VENN.l.x - 55, VENN.l.y - VENN.l.r - 24);
+  ctx.fillStyle = "#b86810";
+  ctx.fillText("18 的因数", VENN.r.x + 55, VENN.r.y - VENN.r.r - 24);
+  ctx.fillStyle = "#7a3db8";
+  ctx.font = 'bold 22px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText("公因数", 600, 402);
+}
+
+function drawTrophy() {
+  const t = Math.min(1, trophyT / 0.6);
+  const s = easeOut(t);
+  const x = 600, y = 240 - 30 * s;
+  ctx.save();
+  ctx.translate(x, y); ctx.scale(s, s);
+  // 光芒
+  ctx.strokeStyle = "rgba(255,220,80,0.8)"; ctx.lineWidth = 5;
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2 + trophyT * 0.8;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * 78, Math.sin(a) * 78);
+    ctx.lineTo(Math.cos(a) * 100, Math.sin(a) * 100);
+    ctx.stroke();
+  }
+  // 杯身
+  const gold = ctx.createLinearGradient(-40, 0, 40, 0);
+  gold.addColorStop(0, "#d4a017"); gold.addColorStop(0.5, "#ffe066"); gold.addColorStop(1, "#d4a017");
+  ctx.fillStyle = gold;
+  ctx.beginPath();
+  ctx.moveTo(-42, -50); ctx.lineTo(42, -50);
+  ctx.quadraticCurveTo(42, 10, 0, 22);
+  ctx.quadraticCurveTo(-42, 10, -42, -50);
+  ctx.closePath(); ctx.fill();
+  // 杯耳
+  ctx.strokeStyle = "#d4a017"; ctx.lineWidth = 9;
+  ctx.beginPath(); ctx.arc(-48, -28, 16, Math.PI * 0.5, Math.PI * 1.6); ctx.stroke();
+  ctx.beginPath(); ctx.arc(48, -28, 16, -Math.PI * 0.6, Math.PI * 0.5); ctx.stroke();
+  // 杯柄与底座
+  ctx.fillStyle = "#d4a017";
+  ctx.fillRect(-8, 22, 16, 18);
+  roundRect(-34, 40, 68, 14, 6, true);
+  // 数字 6
+  ctx.fillStyle = "#8a5a00";
+  ctx.font = 'bold 34px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("6", 0, -20);
+  ctx.restore();
+  if (t >= 1) {
+    ctx.fillStyle = "#8a5a00";
+    ctx.font = 'bold 26px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.textAlign = "center";
+    ctx.fillText("🏆 最大公因数", x, y + 78);
+  }
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR * view.s, 0, 0, DPR * view.s, DPR * view.ox, DPR * view.oy);
+  ctx.clearRect(-view.ox / view.s, -view.oy / view.s, W / view.s, H / view.s);
+  drawBackground();
+  drawTree();
+  if (level === 3) drawVenn(); else drawBasket();
+  drawFruits();
+  if (showTrophy) drawTrophy();
+  drawConfetti();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function resumeAudio() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === "suspended") actx.resume();
+  } catch (e) {}
+}
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const wrong = () => tone(190, 0.25, 0.10, "triangle");
+function ding() { tone(880, 0.18, 0.14); setTimeout(() => tone(1318, 0.22, 0.12), 70); }
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+function spawnConfetti(n) {
+  const colors = ["#ff5a4e","#ffd54a","#5ac8ff","#8aff80","#ff7ab8","#c59aff"];
+  for (let i = 0; i < n; i++) {
+    confetti.push({
+      x: 600 + (Math.random() - 0.5) * 500,
+      y: 200 + (Math.random() - 0.5) * 100,
+      vx: (Math.random() - 0.5) * 300,
+      vy: -80 - Math.random() * 200,
+      rot: Math.random() * Math.PI, spin: (Math.random() - 0.5) * 12,
+      color: colors[i % colors.length], life: 2.2 + Math.random(),
+    });
+  }
+}
+panelBtn.addEventListener("click", () => {
+  levelPanel.style.display = "none";
+  pop(880);
+  if (level === 1) setupPickLevel(1); else setupLevel3();
+});
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+resetGame();
+
+/* ================= 测试钩子（无界面时用） ================= */
+window.__test = {
+  state: () => ({ level, picked: picked.slice(), placedCount, zoneCount: Object.assign({}, zoneCount) }),
+  fruit: n => fruits.find(f => f.n === n),
+  pick(n) { const f = this.fruit(n); if (f && f.st === "tree") tryPick(f); },
+  place(n, zone) { const f = this.fruit(n); if (f && f.st === "tree") tryPlace(f, zone); },
+  step(dt) { update(dt); },
+  zoneAt, needZone,
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

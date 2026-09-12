@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>弹珠直觉</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#173a5e; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,25,45,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  @media (max-width: 700px) {
+    #scorebar { left:12px; transform:none; font-size:15px; padding:8px 14px; }
+    #toolbar button { font-size:17px; padding:11px 18px; }
+  }
+  #toolbar {
+    position:absolute; top:12px; right:12px; z-index:10;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  #toolbar button {
+    font-size:20px; font-weight:bold; padding:13px 24px;
+    border-radius:28px; border:none; cursor:pointer;
+    box-shadow:0 4px 10px rgba(0,0,0,0.35);
+    font-family:inherit; white-space:nowrap;
+  }
+  #toolbar button:active { transform:scale(1.07); }
+  #drop1Btn { background:#ffd54a; color:#5a3d00; }
+  #drop10Btn { background:#7fd4ff; color:#083b5e; }
+  #clearBtn { background:#ffe9e9; color:#a03030; font-size:17px; }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,25,45,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🔮 已丢：0 颗</div>
+<div id="toolbar">
+  <button id="drop1Btn">丢 1 颗 ⬇</button>
+  <button id="drop10Btn">丢 10 颗 ⬇⬇</button>
+  <button id="clearBtn">清空重来</button>
+</div>
+<div id="hint">点右上角按钮丢球（点屏幕也可以），看球球会掉进哪个槽！点我可关掉提示</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 布局 ================= */
+// 6 排三角形钉子阵：第 r 排有 r+1 颗钉子；最底排 6 颗钉 -> 5 个槽
+const ROWS = 6, BINS = 5;
+const L = {};   // 布局参数，resize 时重算
+let pegs = [];  // {x, y}
+let binX = [];  // 每个槽中心 x
+let divX = [];  // 槽内隔板 x（4 块）
+function computeLayout() {
+  const dx = Math.min(W / 6.8, H * 0.098);
+  L.dx = dx;
+  L.cx = W / 2 - dx * 0.55;            // 给右侧按钮让一点位
+  L.ballR = dx * 0.21;
+  L.pegR = dx * 0.10;
+  L.rowGap = dx * 0.85;
+  L.topY = H * 0.28;
+  L.spawnY = L.topY - dx * 1.05;
+  L.bottomPegY = L.topY + (ROWS - 1) * L.rowGap;
+  L.divTop = L.bottomPegY + dx * 0.62;
+  L.floorY = H * 0.90;
+  L.divHalf = dx * 0.055;
+  L.wallL = L.cx - dx * 2.5;
+  L.wallR = L.cx + dx * 2.5;
+  L.unit = (L.floorY - L.divTop - 4) / 15;   // 每颗球的柱高
+  L.grav = dx * 26;
+  pegs = [];
+  for (let r = 0; r < ROWS; r++)
+    for (let i = 0; i <= r; i++)
+      pegs.push({ x: L.cx + (i - r / 2) * dx, y: L.topY + r * L.rowGap });
+  binX = [];
+  for (let i = 0; i < BINS; i++) binX.push(L.cx + (i - 2) * dx);
+  divX = [];
+  for (let i = 1; i < BINS; i++) divX.push(L.cx + (i - 2) * dx - dx / 2);
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  computeLayout();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+const BIN_COLORS = ["#ff6b6b", "#ffb84d", "#ffe14d", "#6bd98c", "#5aa8ff"];
+const BALL_COLORS = ["#ff5b5b", "#ff9f43", "#f9d423", "#4fd17c", "#4aa8ff", "#c56bff", "#ff7ad9"];
+let balls = [];            // 飞行中的球 {x,y,vx,vy,color,lastPeg,age}
+let binCounts = [0, 0, 0, 0, 0];
+let dispCounts = [0, 0, 0, 0, 0];   // 柱子显示高度（缓动）
+let totalCollected = 0;
+let spawnQueue = 0, spawnTimer = 0;
+let bellOn = false;        // 丢满 30 颗后叠加钟形曲线
+let celebrated = false;
+let flashes = [];          // 球落槽的小光圈 {x,y,t}
+let confetti = [];         // 庆祝彩纸 {x,y,vx,vy,color,rot,vr,life}
+
+function dropBall() {
+  balls.push({
+    x: L.cx + (Math.random() - 0.5) * L.dx * 0.3,
+    y: L.spawnY,
+    vx: (Math.random() - 0.5) * L.dx * 0.4,
+    vy: 0,
+    color: BALL_COLORS[(Math.random() * BALL_COLORS.length) | 0],
+    lastPeg: null,
+    age: 0
+  });
+}
+function dropMany(n) {
+  spawnQueue += n;
+  pop(660);
+}
+function resetGame() {
+  balls = [];
+  binCounts = [0, 0, 0, 0, 0];
+  dispCounts = [0, 0, 0, 0, 0];
+  totalCollected = 0;
+  spawnQueue = 0;
+  bellOn = false;
+  celebrated = false;
+  flashes = [];
+  confetti = [];
+  updateScore();
+  showHint("清空啦！再来丢一轮，看看是不是中间最多～", 2600);
+}
+function updateScore() {
+  scorebar.textContent = bellOn
+    ? `🔮 已丢：${totalCollected} 颗 · 中间的槽最多！`
+    : `🔮 已丢：${totalCollected} 颗`;
+}
+
+/* ================= 物理 ================= */
+// 简单物理：重力下落；碰到钉子 50% 随机向左/右偏；隔板与侧墙反弹衰减
+function physics(dt) {
+  // 连发
+  if (spawnQueue > 0) {
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) { spawnTimer = 0.15; spawnQueue--; dropBall(); }
+  }
+  for (let bi = balls.length - 1; bi >= 0; bi--) {
+    const b = balls[bi];
+    b.age += dt;
+    b.vy = Math.min(b.vy + L.grav * dt, L.dx * 13);
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    // --- 钉子碰撞 ---
+    const rs = L.ballR + L.pegR;
+    for (const p of pegs) {
+      if (Math.abs(p.y - b.y) > rs || Math.abs(p.x - b.x) > rs) continue;
+      if (b.lastPeg === p) continue;   // 刚碰过这颗钉，防抖动
+      const ddx = b.x - p.x, ddy = b.y - p.y;
+      const d = Math.hypot(ddx, ddy);
+      if (d > 0 && d < rs) {
+        // 推出钉面
+        b.x = p.x + ddx / d * rs;
+        b.y = p.y + ddy / d * rs;
+        // 50% 随机左右偏
+        const dir = Math.random() < 0.5 ? -1 : 1;
+        b.vx = dir * L.dx * (1.8 + Math.random() * 1.3);
+        if (b.vy < 0) b.vy *= -0.2;
+        b.vy = Math.min(b.vy, L.dx * 5.5);
+        b.lastPeg = p;
+        tick();
+      }
+    }
+    // --- 侧墙 ---
+    if (b.x < L.wallL + L.ballR) { b.x = L.wallL + L.ballR; b.vx = Math.abs(b.vx) * 0.5; }
+    if (b.x > L.wallR - L.ballR) { b.x = L.wallR - L.ballR; b.vx = -Math.abs(b.vx) * 0.5; }
+    // --- 槽区 ---
+    if (b.y > L.divTop) {
+      b.vx *= Math.max(0, 1 - 4 * dt);   // 进槽后快速消水平速度
+      // 隔板（含圆头顶端，球会滑进相邻槽）
+      for (const x of divX) {
+        const topD = Math.hypot(b.x - x, b.y - L.divTop);
+        const topR = L.ballR + L.divHalf + L.dx * 0.03;
+        if (topD < topR && topD > 0) {   // 圆头
+          const dir = Math.sign(b.x - x) || (Math.random() < 0.5 ? -1 : 1);
+          b.x = x + dir * topR;
+          b.vx = dir * Math.abs(b.vx) * 0.4 + dir * L.dx * 0.3;
+        } else if (Math.abs(b.x - x) < L.ballR + L.divHalf) {   // 板身
+          const dir = Math.sign(b.x - x) || 1;
+          b.x = x + dir * (L.ballR + L.divHalf);
+          b.vx = dir * Math.abs(b.vx) * 0.3;
+        }
+      }
+    }
+    // --- 落槽收集 ---
+    if (b.y + L.ballR >= L.floorY || b.age > 12) {
+      let idx = Math.round((b.x - L.cx) / L.dx) + 2;
+      idx = Math.max(0, Math.min(BINS - 1, idx));
+      collectBall(idx, b);
+      balls.splice(bi, 1);
+    }
+  }
+}
+
+function collectBall(idx, b) {
+  binCounts[idx]++;
+  totalCollected++;
+  flashes.push({ x: binX[idx], y: L.floorY - binCounts[idx] * L.unit, t: 0 });
+  pop(420 + idx * 90);
+  updateScore();
+  if (totalCollected >= 30 && !celebrated) {
+    celebrated = true;
+    bellOn = true;
+    updateScore();
+    showHint("🎉 发现了吗？中间的槽球最多！白白的那条线叫「钟形曲线」～", 6000);
+    fanfare();
+    burstConfetti();
+  }
+}
+
+function burstConfetti() {
+  for (let i = 0; i < 90; i++) {
+    confetti.push({
+      x: L.cx + (Math.random() - 0.5) * L.dx * 5,
+      y: L.topY - L.dx,
+      vx: (Math.random() - 0.5) * L.dx * 6,
+      vy: -Math.random() * L.dx * 5,
+      color: BALL_COLORS[(Math.random() * BALL_COLORS.length) | 0],
+      rot: Math.random() * 7, vr: (Math.random() - 0.5) * 10,
+      life: 2.2 + Math.random()
+    });
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBoard() {
+  // 背板
+  const bx = L.wallL - L.dx * 0.5, bw = L.wallR - L.wallL + L.dx;
+  const by = L.spawnY - L.dx * 1.0, bh = L.floorY - by + L.dx * 0.35;
+  ctx.fillStyle = "rgba(255,255,255,0.08)";
+  roundRect(bx, by, bw, bh, 26, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 3;
+  roundRect(bx, by, bw, bh, 26, false); ctx.stroke();
+  // 漏斗口
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(L.cx - L.dx * 1.3, L.spawnY - L.dx * 0.85);
+  ctx.lineTo(L.cx - L.dx * 0.28, L.spawnY - L.dx * 0.05);
+  ctx.moveTo(L.cx + L.dx * 1.3, L.spawnY - L.dx * 0.85);
+  ctx.lineTo(L.cx + L.dx * 0.28, L.spawnY - L.dx * 0.05);
+  ctx.stroke();
+  // 钉子
+  for (const p of pegs) {
+    ctx.beginPath(); ctx.arc(p.x, p.y, L.pegR, 0, 7);
+    ctx.fillStyle = "#f4f7ff"; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(p.x - L.pegR * 0.3, p.y - L.pegR * 0.35, L.pegR * 0.3, 0, 7);
+    ctx.fillStyle = "rgba(255,255,255,0.95)"; ctx.fill();
+  }
+  // 隔板
+  for (const x of divX) {
+    ctx.fillStyle = "#dfe9f5";
+    roundRect(x - L.divHalf, L.divTop, L.divHalf * 2, L.floorY - L.divTop, L.divHalf, true);
+    ctx.beginPath(); ctx.arc(x, L.divTop, L.divHalf + L.dx * 0.03, 0, 7);
+    ctx.fillStyle = "#f4f7ff"; ctx.fill();
+  }
+  // 侧墙
+  ctx.fillStyle = "#dfe9f5";
+  roundRect(L.wallL - L.divHalf, L.divTop - L.dx * 0.4, L.divHalf * 2, L.floorY - L.divTop + L.dx * 0.4, L.divHalf, true);
+  roundRect(L.wallR - L.divHalf, L.divTop - L.dx * 0.4, L.divHalf * 2, L.floorY - L.divTop + L.dx * 0.4, L.divHalf, true);
+  // 底板
+  ctx.fillStyle = "#c8d6e8";
+  roundRect(L.wallL - L.dx * 0.4, L.floorY, L.wallR - L.wallL + L.dx * 0.8, L.dx * 0.22, 8, true);
+}
+
+function drawBins() {
+  for (let i = 0; i < BINS; i++) {
+    // 柱子高度缓动，形成“长高”效果
+    dispCounts[i] += (binCounts[i] - dispCounts[i]) * 0.18;
+    const h = dispCounts[i] * L.unit;
+    const x0 = i === 0 ? L.wallL : divX[i - 1];
+    const x1 = i === BINS - 1 ? L.wallR : divX[i];
+    const bx = x0 + L.divHalf + 3, bw = x1 - x0 - L.divHalf * 2 - 6;
+    if (h > 0.5) {
+      ctx.fillStyle = BIN_COLORS[i];
+      roundRect(bx, L.floorY - h, bw, h, Math.min(8, h / 2), true);
+    }
+    // 槽底色条（空槽也能看出 5 个槽）
+    ctx.fillStyle = BIN_COLORS[i] + "55";
+    roundRect(bx, L.floorY - 5, bw, 5, 3, true);
+  }
+  // 落槽小光圈
+  for (let i = flashes.length - 1; i >= 0; i--) {
+    const f = flashes[i];
+    f.t += 0.05;
+    if (f.t >= 1) { flashes.splice(i, 1); continue; }
+    ctx.globalAlpha = 1 - f.t;
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(f.x, f.y, 6 + f.t * L.dx * 0.5, 0, 7); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+}
+
+// 槽计数：置顶绘制（在钟形曲线之上），柱够高时写在柱内，否则写在柱上方
+function drawCounts() {
+  const fs = Math.round(L.dx * 0.42);
+  ctx.font = `bold ${fs}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffffff";
+  ctx.shadowColor = "rgba(0,0,0,0.55)"; ctx.shadowBlur = 4;
+  for (let i = 0; i < BINS; i++) {
+    if (binCounts[i] === 0) continue;
+    const h = dispCounts[i] * L.unit;
+    if (h > fs + 10) {   // 柱内顶部
+      ctx.textBaseline = "top";
+      ctx.fillText(binCounts[i], binX[i], L.floorY - h + 5);
+    } else {             // 柱上方
+      ctx.textBaseline = "bottom";
+      ctx.fillText(binCounts[i], binX[i], L.floorY - h - 5);
+    }
+  }
+  ctx.shadowBlur = 0;
+}
+
+function drawBellCurve() {
+  if (!bellOn || totalCollected < 30) return;
+  // 二项分布（4 次左右选择）：1,4,6,4,1 / 16
+  const coef = [1, 4, 6, 4, 1];
+  const pts = coef.map(c => totalCollected * c / 16);
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,0.95)";
+  ctx.lineWidth = 4;
+  ctx.shadowColor = "rgba(255,255,255,0.8)"; ctx.shadowBlur = 10;
+  ctx.beginPath();
+  const py = i => L.floorY - pts[i] * L.unit;
+  ctx.moveTo(binX[0], py(0));
+  for (let i = 0; i < BINS - 1; i++) {
+    const mx = (binX[i] + binX[i + 1]) / 2, my = (py(i) + py(i + 1)) / 2;
+    ctx.quadraticCurveTo(binX[i], py(i), mx, my);
+  }
+  ctx.lineTo(binX[BINS - 1], py(BINS - 1));
+  ctx.stroke();
+  ctx.restore();
+  // 标注（放在峰值右上方，避开槽计数）
+  ctx.fillStyle = "rgba(255,255,255,0.95)";
+  ctx.font = `bold ${Math.round(L.dx * 0.34)}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+  ctx.shadowColor = "rgba(0,0,0,0.6)"; ctx.shadowBlur = 4;
+  ctx.fillText("← 钟形曲线", binX[2] + L.dx * 0.4, py(2) - L.dx * 0.3);
+  ctx.shadowBlur = 0;
+}
+
+function drawBalls() {
+  for (const b of balls) {
+    ctx.beginPath(); ctx.arc(b.x, b.y, L.ballR, 0, 7);
+    const g = ctx.createRadialGradient(b.x - L.ballR * 0.35, b.y - L.ballR * 0.4, 1, b.x, b.y, L.ballR);
+    g.addColorStop(0, "#ffffff");
+    g.addColorStop(0.35, b.color);
+    g.addColorStop(1, b.color);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2; ctx.stroke();
+  }
+}
+
+function drawConfetti(dt) {
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.life -= dt;
+    if (c.life <= 0) { confetti.splice(i, 1); continue; }
+    c.vy += L.grav * 0.35 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+}
+
+function draw(dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#1d4a7a"); bg.addColorStop(1, "#122c4c");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+  drawBoard();
+  drawBins();
+  drawBellCurve();
+  drawCounts();
+  drawBalls();
+  drawConfetti(dt);
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  const steps = 4;   // 子步进防穿模
+  for (let i = 0; i < steps; i++) physics(dt / steps);
+  draw(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+let lastTickT = 0;
+function tick() {   // 碰钉声，全局节流
+  const now = performance.now();
+  if (now - lastTickT < 40) return;
+  lastTickT = now;
+  tone(1500 + Math.random() * 700, 0.04, 0.05, "square");
+}
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 交互 ================= */
+canvas.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  dropBall();       // 点屏幕任意位置也能丢 1 颗
+  pop(660);
+  hintEl.style.opacity = "0";
+});
+document.getElementById("drop1Btn").addEventListener("click", () => { dropBall(); pop(660); });
+document.getElementById("drop10Btn").addEventListener("click", () => dropMany(10));
+document.getElementById("clearBtn").addEventListener("click", () => { resetGame(); pop(300); });
+
+/* ================= 提示条 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 1800);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 测试钩子 ================= */
+function __stats() {
+  return { collected: totalCollected, counts: binCounts.slice(), bell: bellOn, flying: balls.length };
+}
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

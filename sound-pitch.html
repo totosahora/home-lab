@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>声音的高低</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#bfe3f7; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #toolbar {
+    position:absolute; top:12px; left:12px; z-index:10; display:flex; gap:10px; flex-wrap:wrap;
+  }
+  .modeBtn {
+    font-size:19px; font-weight:bold; padding:12px 20px;
+    border-radius:26px; border:3px solid rgba(255,255,255,0.6);
+    background:rgba(20,50,70,0.55); color:#eaf6ff; cursor:pointer;
+  }
+  .modeBtn.active { background:#ffd54a; color:#4a3200; border-color:#ffd54a; }
+  .modeBtn:active { transform:scale(1.05); }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,70,0.75); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #waterBtns {
+    position:absolute; bottom:14px; right:14px; z-index:10;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  #waterBtns button {
+    font-size:20px; font-weight:bold; padding:13px 22px; min-width:118px;
+    border-radius:26px; border:none; cursor:pointer; color:#fff;
+    box-shadow:0 4px 10px rgba(0,0,0,0.25);
+  }
+  #fillBtn { background:#2f9bf0; }
+  #pourBtn { background:#f08c2f; }
+  #waterBtns button:active { transform:scale(1.07); }
+  #hint {
+    position:absolute; bottom:16px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,70,0.82); color:#fff; padding:10px 22px;
+    border-radius:24px; font-size:16px; z-index:9; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw; overflow:hidden; text-overflow:ellipsis;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="toolbar">
+  <button class="modeBtn active" id="btnFree">🎹 自由演奏</button>
+  <button class="modeBtn" id="btnFollow">🎵 跟弹模式</button>
+  <button class="modeBtn" id="btnListen" style="display:none">🔁 再听一遍</button>
+</div>
+<div id="scorebar" style="display:none">👂 仔细听…</div>
+<div id="waterBtns">
+  <button id="fillBtn">💧 加水</button>
+  <button id="pourBtn">🚰 倒水</button>
+</div>
+<div id="hint">点一点玻璃杯听声音，按住水面上下拖动可以加水、倒水！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+const scorebar = document.getElementById("scorebar");
+const btnFree = document.getElementById("btnFree");
+const btnFollow = document.getElementById("btnFollow");
+const btnListen = document.getElementById("btnListen");
+const fillBtn = document.getElementById("fillBtn");
+const pourBtn = document.getElementById("pourBtn");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+const NOTES = ["do", "re", "mi", "sol", "la"];
+const NOTE_FREQS = [261.63, 293.66, 329.63, 392.00, 440.00];   // C4 D4 E4 G4 A4
+const NOTE_COLORS = ["#e74c3c", "#f39c12", "#f1c40f", "#2fbf4a", "#2f9bf0"];
+const FREQ_EMPTY = 523.25;                                       // 空杯 = C5
+// 水位 0(空)→1(满)，水越多音越低
+function levelToFreq(level) { return FREQ_EMPTY * Math.pow(0.5, level); }
+// 由标准音反推默认水位，使每个杯子正好唱出自己的音名
+function freqToLevel(f) { return Math.log2(FREQ_EMPTY / f); }
+
+const N = 5;
+let cups = [];          // {level, shake, ring, hl, hlColor, cx, top, bottom, wTop, wBot}
+for (let i = 0; i < N; i++) {
+  cups.push({
+    level: Math.min(0.92, Math.max(0.1, freqToLevel(NOTE_FREQS[i]))),
+    shake: 0, ring: -1, hl: 0, hlColor: "#ffd54a",
+    cx: 0, top: 0, bottom: 0, wTop: 0, wBot: 0
+  });
+}
+let cupH = 240, tableTop = 0, wavePhase = 0;
+let confetti = [];      // {x,y,vx,vy,color,rot,vr}
+let floatNotes = [];    // 背景漂浮的♪
+
+function layout() {
+  tableTop = H * 0.74;
+  cupH = Math.min(H * 0.44, 280);
+  const cupW = Math.min(120, W / 7.2);
+  const gap = cupW * 0.42;
+  const totalW = N * cupW + (N - 1) * gap;
+  const x0 = (W - totalW) / 2 + cupW / 2;
+  for (let i = 0; i < N; i++) {
+    const c = cups[i];
+    c.cx = x0 + i * (cupW + gap);
+    c.bottom = tableTop - 6;
+    c.top = c.bottom - cupH;
+    c.wTop = cupW;
+    c.wBot = cupW * 0.8;
+  }
+  floatNotes = [];
+  for (let i = 0; i < 5; i++) {
+    floatNotes.push({
+      x: W * (0.1 + 0.2 * i) + 20, y: H * (0.14 + (i % 2) * 0.1),
+      ch: i % 2 ? "♪" : "♫", seed: i * 1.7, size: 26 + (i % 3) * 8
+    });
+  }
+}
+function waterY(c) { return c.bottom - 6 - c.level * (cupH - 16); }
+
+/* ================= 游戏状态 ================= */
+let mode = "free";               // free | follow
+let selected = 2;                // 当前选中的杯子（加水/倒水按钮作用于它）
+const MELODY = [0, 0, 3, 3];     // 小星星开头：do do sol sol
+let followIdx = 0;               // 孩子跟弹到第几个音符
+let acceptInput = false;         // 跟弹模式下是否轮到孩子
+let demoTimers = [];
+let roundNum = 1;
+let discovered = false;          // 是否已提示过"水越多音越低"
+
+function setMode(m) {
+  mode = m;
+  btnFree.classList.toggle("active", m === "free");
+  btnFollow.classList.toggle("active", m === "follow");
+  btnListen.style.display = m === "follow" ? "" : "none";
+  scorebar.style.display = m === "follow" ? "" : "none";
+  clearDemo();
+  if (m === "follow") {
+    showHint("👂 先听机器弹一遍《小星星》，然后跟着点同样的杯子！");
+    demoTimers.push(setTimeout(startDemo, 900));
+  } else {
+    showHint("🎹 自由演奏：点杯子创作你自己的音乐吧！");
+  }
+}
+function clearDemo() {
+  demoTimers.forEach(clearTimeout);
+  demoTimers = [];
+  acceptInput = false;
+}
+
+/* ================= 跟弹模式 ================= */
+function startDemo() {
+  clearDemo();
+  followIdx = 0;
+  updateScorebar("👂 仔细听：《小星星》");
+  MELODY.forEach((idx, k) => {
+    demoTimers.push(setTimeout(() => {
+      strikeCup(idx, "#ffd54a");
+    }, 500 + k * 620));
+  });
+  demoTimers.push(setTimeout(() => {
+    acceptInput = true;
+    updateScorebar(`🎵 轮到你啦！第 1 / ${MELODY.length} 个音符`);
+    showHint("轮到你了！按刚才的顺序点杯子");
+  }, 500 + MELODY.length * 620));
+}
+
+function kidTap(i) {
+  if (mode !== "follow" || !acceptInput) return;
+  if (i === MELODY[followIdx]) {
+    followIdx++;
+    strikeCup(i, "#2fbf4a");
+    if (followIdx >= MELODY.length) {
+      acceptInput = false;
+      updateScorebar("🎉 太棒了！全部跟对啦！");
+      showHint("🎉 你跟弹了《小星星》，真厉害！");
+      fanfare();
+      spawnConfetti();
+      roundNum++;
+      demoTimers.push(setTimeout(startDemo, 3200));
+    } else {
+      updateScorebar(`🎵 轮到你啦！第 ${followIdx + 1} / ${MELODY.length} 个音符`);
+      pop(700 + followIdx * 120);
+    }
+  } else {
+    // 点错了：不扣分不批评，温柔提示并重放正确的音
+    tone(180, 0.25, 0.08, "triangle");
+    showHint("没关系～听一听，是这个杯子哦");
+    const want = MELODY[followIdx];
+    acceptInput = false;
+    demoTimers.push(setTimeout(() => {
+      strikeCup(want, "#ffd54a");
+      acceptInput = true;
+    }, 650));
+  }
+}
+function updateScorebar(t) { scorebar.textContent = t; }
+
+/* ================= 交互 ================= */
+let press = null;    // {cup, startY, startLevel, moved, pointerId}
+
+function cupAt(x, y) {
+  for (let i = 0; i < N; i++) {
+    const c = cups[i];
+    if (x >= c.cx - c.wTop / 2 - 14 && x <= c.cx + c.wTop / 2 + 14 &&
+        y >= c.top - 14 && y <= c.bottom + 8) return i;
+  }
+  return -1;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  resumeAudio();
+  hintEl.style.opacity = "0";
+  const i = cupAt(e.clientX, e.clientY);
+  if (i < 0) return;
+  selected = i;
+  press = { cup: i, startY: e.clientY, startLevel: cups[i].level, moved: false, pointerId: e.pointerId };
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointermove", e => {
+  if (!press || e.pointerId !== press.pointerId) return;
+  const c = cups[press.cup];
+  const dy = e.clientY - press.startY;
+  if (!press.moved && Math.abs(dy) > 9) press.moved = true;   // 超过阈值才算拖水位
+  if (press.moved) {
+    const nl = Math.min(0.92, Math.max(0.08, press.startLevel - dy / (cupH - 16)));
+    if (Math.abs(nl - c.level) > 0.005) {
+      c.level = nl;
+      if (!discovered) {
+        discovered = true;
+        showHint("💡 发现了吗？水越多，声音越低；水越少，声音越高！");
+      }
+    }
+  }
+});
+window.addEventListener("pointerup", e => {
+  if (!press || e.pointerId !== press.pointerId) return;
+  const c = cups[press.cup];
+  if (press.moved) {
+    tone(levelToFreq(c.level), 0.5, 0.12);      // 松手听一听新水位的声音
+  } else {
+    strikeCup(press.cup, "#ffffff");            // 轻点 = 敲杯子
+    kidTap(press.cup);
+  }
+  press = null;
+});
+canvas.addEventListener("pointercancel", () => { press = null; });
+
+function strikeCup(i, hlColor) {
+  const c = cups[i];
+  c.shake = 1; c.ring = 0;
+  c.hl = 1; c.hlColor = hlColor || "#ffd54a";
+  glassTone(levelToFreq(c.level));
+}
+
+fillBtn.addEventListener("click", () => {
+  resumeAudio();
+  const c = cups[selected];
+  c.level = Math.min(0.92, c.level + 0.08);
+  tone(levelToFreq(c.level), 0.4, 0.1);
+  c.ring = 0;
+  showDiscovery();
+});
+pourBtn.addEventListener("click", () => {
+  resumeAudio();
+  const c = cups[selected];
+  c.level = Math.max(0.08, c.level - 0.08);
+  tone(levelToFreq(c.level), 0.4, 0.1);
+  c.ring = 0;
+  showDiscovery();
+});
+function showDiscovery() {
+  if (!discovered) {
+    discovered = true;
+    showHint("💡 发现了吗？水越多，声音越低；水越少，声音越高！");
+  }
+}
+
+btnFree.addEventListener("click", () => { resumeAudio(); pop(660); setMode("free"); });
+btnFollow.addEventListener("click", () => { resumeAudio(); pop(660); setMode("follow"); });
+btnListen.addEventListener("click", () => { resumeAudio(); pop(660); startDemo(); });
+
+/* ================= 绘制 ================= */
+function drawBackground(now) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#a8d8f0"); g.addColorStop(1, "#dff3ff");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 漂浮的音符装饰
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (const n of floatNotes) {
+    const y = n.y + Math.sin(now / 900 + n.seed) * 10;
+    ctx.font = `${n.size}px serif`;
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.fillText(n.ch, n.x, y);
+  }
+  // 木桌
+  const tg = ctx.createLinearGradient(0, tableTop, 0, H);
+  tg.addColorStop(0, "#d9a05e"); tg.addColorStop(1, "#b87f42");
+  ctx.fillStyle = tg;
+  ctx.fillRect(0, tableTop, W, H - tableTop);
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.fillRect(0, tableTop, W, 5);
+}
+
+function glassPath(c) {
+  const tW = c.wTop / 2, bW = c.wBot / 2, r = 10;
+  ctx.beginPath();
+  ctx.moveTo(c.cx - tW, c.top);
+  ctx.lineTo(c.cx - bW, c.bottom - r);
+  ctx.quadraticCurveTo(c.cx - bW, c.bottom, c.cx - bW + r, c.bottom);
+  ctx.lineTo(c.cx + bW - r, c.bottom);
+  ctx.quadraticCurveTo(c.cx + bW, c.bottom, c.cx + bW, c.bottom - r);
+  ctx.lineTo(c.cx + tW, c.top);
+}
+
+function drawCup(i, now) {
+  const c = cups[i];
+  const sx = c.shake > 0 ? Math.sin(now / 22) * 3.5 * c.shake : 0;
+  ctx.save();
+  ctx.translate(sx, 0);
+
+  // 高亮光晕
+  if (c.hl > 0.02) {
+    ctx.save();
+    ctx.globalAlpha = c.hl * 0.55;
+    ctx.fillStyle = c.hlColor;
+    ctx.beginPath();
+    ctx.ellipse(c.cx, (c.top + c.bottom) / 2, c.wTop * 0.85, cupH * 0.62, 0, 0, 7);
+    ctx.fill();
+    ctx.restore();
+  }
+  // 选中标记（金色小箭头）
+  if (i === selected) {
+    ctx.fillStyle = "#ffd54a";
+    const ay = c.top - 14 - Math.sin(now / 300) * 4;
+    ctx.beginPath();
+    ctx.moveTo(c.cx, ay + 12);
+    ctx.lineTo(c.cx - 10, ay - 4);
+    ctx.lineTo(c.cx + 10, ay - 4);
+    ctx.closePath(); ctx.fill();
+  }
+
+  // 杯内水（先裁剪到杯形）
+  ctx.save();
+  glassPath(c);
+  ctx.clip();
+  const wy = waterY(c);
+  const wg = ctx.createLinearGradient(0, wy, 0, c.bottom);
+  wg.addColorStop(0, "#5cc0ff"); wg.addColorStop(1, "#1e78d8");
+  ctx.fillStyle = wg;
+  ctx.fillRect(c.cx - c.wTop / 2 - 2, wy, c.wTop + 4, c.bottom - wy + 2);
+  // 波浪水面
+  ctx.beginPath();
+  ctx.moveTo(c.cx - c.wTop / 2 - 2, wy);
+  const amp = (c.ring >= 0 && c.ring < 1) ? 2 + (1 - c.ring) * 4 : 2;
+  for (let x = -c.wTop / 2 - 2; x <= c.wTop / 2 + 2; x += 6) {
+    ctx.lineTo(c.cx + x, wy + Math.sin(wavePhase + x / 14 + i) * amp);
+  }
+  ctx.lineTo(c.cx + c.wTop / 2 + 2, wy - 10);
+  ctx.lineTo(c.cx - c.wTop / 2 - 2, wy - 10);
+  ctx.closePath();
+  ctx.fillStyle = "#8fd8ff";
+  ctx.fill();
+  // 敲击后的扩散波纹
+  if (c.ring >= 0 && c.ring < 1) {
+    ctx.strokeStyle = `rgba(255,255,255,${0.8 * (1 - c.ring)})`;
+    ctx.lineWidth = 2.5;
+    for (let k = 0; k < 2; k++) {
+      const rr = c.ring * c.wTop * 0.55 + k * 9;
+      ctx.beginPath();
+      ctx.ellipse(c.cx, wy, rr, rr * 0.22, 0, 0, 7);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+
+  // 玻璃杯壁
+  ctx.save();
+  glassPath(c);
+  ctx.fillStyle = "rgba(255,255,255,0.16)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.95)";
+  ctx.lineWidth = 3.5;
+  ctx.stroke();
+  // 杯口
+  ctx.beginPath();
+  ctx.ellipse(c.cx, c.top, c.wTop / 2, 7, 0, 0, 7);
+  ctx.strokeStyle = "rgba(255,255,255,0.9)";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  // 高光条
+  ctx.beginPath();
+  ctx.moveTo(c.cx - c.wTop * 0.3, c.top + 14);
+  ctx.lineTo(c.cx - c.wTop * 0.24, c.bottom - 18);
+  ctx.strokeStyle = "rgba(255,255,255,0.5)";
+  ctx.lineWidth = 6;
+  ctx.lineCap = "round";
+  ctx.stroke();
+  ctx.restore();
+
+  // 桌面上的音名牌
+  const tagY = tableTop + (H - tableTop) / 2;
+  const tagW = 74, tagH = 52;
+  ctx.save();
+  ctx.fillStyle = NOTE_COLORS[i];
+  ctx.beginPath();
+  ctx.roundRect(c.cx - tagW / 2, tagY - tagH / 2, tagW, tagH, 14);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.7)";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 26px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(NOTES[i], c.cx, tagY);
+  ctx.restore();
+
+  ctx.restore();
+}
+
+function drawConfetti() {
+  for (const p of confetti) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+}
+
+function draw(now) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground(now);
+  for (let i = 0; i < N; i++) drawCup(i, now);
+  drawConfetti();
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function resumeAudio() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === "suspended") actx.resume();
+  } catch (e) {}
+}
+function tone(freq, dur, vol, type, delay) {
+  try {
+    resumeAudio();
+    if (!actx) return;
+    const t0 = actx.currentTime + (delay || 0);
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(t0); o.stop(t0 + dur + 0.05);
+  } catch (e) {}
+}
+// 玻璃杯清脆的"叮"：基音 + 泛音 + 短促的敲击声
+function glassTone(freq) {
+  tone(freq, 1.3, 0.22, "sine");
+  tone(freq * 2.76, 0.5, 0.05, "sine");        // 玻璃的非整数泛音
+  tone(freq * 5.4, 0.12, 0.03, "square");      // 敲击瞬态
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.3, 0.16, "sine", i * 0.13)); }
+
+function spawnConfetti() {
+  const colors = ["#e74c3c", "#f39c12", "#f1c40f", "#2fbf4a", "#2f9bf0", "#bf5af2"];
+  for (let i = 0; i < 90; i++) {
+    confetti.push({
+      x: W / 2 + (Math.random() - 0.5) * W * 0.5,
+      y: H * 0.2 + Math.random() * -40,
+      vx: (Math.random() - 0.5) * 240,
+      vy: -60 - Math.random() * 160,
+      color: colors[i % colors.length],
+      rot: Math.random() * 6.28,
+      vr: (Math.random() - 0.5) * 10
+    });
+  }
+}
+
+/* ================= 提示条 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2400);
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  wavePhase += dt * 3;
+  for (const c of cups) {
+    if (c.shake > 0) c.shake = Math.max(0, c.shake - dt * 3);
+    if (c.hl > 0) c.hl = Math.max(0, c.hl - dt * 0.9);
+    if (c.ring >= 0) { c.ring += dt * 1.4; if (c.ring >= 1) c.ring = -1; }
+  }
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const p = confetti[i];
+    p.vy += 420 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.rot += p.vr * dt;
+    if (p.y > H + 20) confetti.splice(i, 1);
+  }
+  draw(now);
+  requestAnimationFrame(loop);
+}
+
+/* ================= 初始化 ================= */
+resize();
+requestAnimationFrame(loop);
+
+// 测试钩子（不影响正常游戏）
+window.__T = {
+  cups, levelToFreq, freqToLevel, MELODY, NOTES, NOTE_FREQS,
+  setMode, startDemo, kidTap, strikeCup,
+  get mode() { return mode; },
+  get followIdx() { return followIdx; },
+  get acceptInput() { return acceptInput; }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

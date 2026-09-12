@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>能量滑板</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#aee3f5; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #toolbar {
+    position:absolute; top:10px; left:10px; z-index:10;
+    display:flex; flex-wrap:wrap; gap:8px; max-width:62vw;
+  }
+  #toolbar button {
+    font-size:16px; font-weight:bold; padding:10px 16px; border-radius:22px;
+    border:none; background:rgba(20,35,55,0.78); color:#fff; cursor:pointer;
+    box-shadow:0 3px 8px rgba(0,0,0,0.25); font-family:inherit;
+  }
+  #toolbar button:active { transform:scale(1.06); }
+  #toolbar button.active { background:#ffb800; color:#5a3d00; }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,35,55,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="toolbar">
+  <button id="btnNoFric" class="active">🛹 无摩擦</button>
+  <button id="btnFric">🧱 有摩擦</button>
+  <button id="btnEdit">✏️ 改轨道</button>
+  <button id="btnTrack">↩️ 还原轨道</button>
+  <button id="btnReset">↺ 复位小人</button>
+</div>
+<div id="hint">🛹 把小人拖到高处松手滑下，看右边能量条此消彼长！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 轨道与视图 ================= */
+// 世界坐标：米，x∈[0,22]，y∈[0,11]，y 向上
+const WORLD_W = 22, WORLD_H = 11;
+const PANEL_W = 235, RULER_W = 64, TOP_M = 64, BOT_M = 26;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  const aw = W - PANEL_W - RULER_W - 16, ah = H - TOP_M - BOT_M;
+  view.s = Math.min(aw / WORLD_W, ah / WORLD_H);
+  view.ox = RULER_W + 8 + (aw - WORLD_W * view.s) / 2;
+  view.oy = TOP_M + (ah - WORLD_H * view.s) / 2 + WORLD_H * view.s;
+}
+function SX(wx) { return view.ox + wx * view.s; }
+function SY(wy) { return view.oy - wy * view.s; }
+function toWorld(px, py) { return [(px - view.ox) / view.s, (view.oy - py) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+// 轨道控制点：两端固定（肩膀+上翘的端口），中间 3 个可拖动
+function defaultCtrl() {
+  return [
+    { x:1.0,  y:10.6, fixed:true  },
+    { x:1.8,  y:8.8,  fixed:true  },
+    { x:6.5,  y:2.2,  fixed:false },
+    { x:11.0, y:0.8,  fixed:false },
+    { x:15.5, y:2.2,  fixed:false },
+    { x:20.2, y:8.8,  fixed:true  },
+    { x:21.0, y:10.6, fixed:true  }
+  ];
+}
+let ctrl = defaultCtrl();
+let track = { xs:[], ys:[], cum:[], len:0 };
+
+// Catmull-Rom 样条采样成折线，并预计算弧长，物理按弧长参数化
+function buildTrack() {
+  const p = ctrl, SEG = 130;
+  const xs = [], ys = [];
+  for (let i = 0; i < p.length - 1; i++) {
+    const p0 = p[Math.max(0, i - 1)], p1 = p[i], p2 = p[i + 1], p3 = p[Math.min(p.length - 1, i + 2)];
+    for (let j = 0; j < SEG; j++) {
+      const t = j / SEG, t2 = t * t, t3 = t2 * t;
+      let x = 0.5 * ((2*p1.x) + (-p0.x+p2.x)*t + (2*p0.x-5*p1.x+4*p2.x-p3.x)*t2 + (-p0.x+3*p1.x-3*p2.x+p3.x)*t3);
+      let y = 0.5 * ((2*p1.y) + (-p0.y+p2.y)*t + (2*p0.y-5*p1.y+4*p2.y-p3.y)*t2 + (-p0.y+3*p1.y-3*p2.y+p3.y)*t3);
+      xs.push(x); ys.push(Math.max(0.15, y));
+    }
+  }
+  xs.push(p[p.length-1].x); ys.push(Math.max(0.15, p[p.length-1].y));
+  for (let i = 1; i < xs.length; i++) if (xs[i] <= xs[i-1]) xs[i] = xs[i-1] + 0.001;
+  const cum = [0];
+  for (let i = 1; i < xs.length; i++)
+    cum.push(cum[i-1] + Math.hypot(xs[i]-xs[i-1], ys[i]-ys[i-1]));
+  track = { xs, ys, cum, len: cum[cum.length-1] };
+}
+// 按弧长 s 查位置与方向（sin/cos 为切向的 y、x 分量）
+function trackAt(s) {
+  s = Math.max(0, Math.min(track.len, s));
+  const c = track.cum;
+  let lo = 0, hi = c.length - 1;
+  while (lo < hi - 1) { const mid = (lo + hi) >> 1; if (c[mid] <= s) lo = mid; else hi = mid; }
+  const seg = c[hi] - c[lo] || 1e-6, t = (s - c[lo]) / seg;
+  return {
+    x: track.xs[lo] + (track.xs[hi] - track.xs[lo]) * t,
+    y: track.ys[lo] + (track.ys[hi] - track.ys[lo]) * t,
+    sin: (track.ys[hi] - track.ys[lo]) / seg,
+    cos: (track.xs[hi] - track.xs[lo]) / seg
+  };
+}
+function nearestS(wx, wy) {
+  let best = 0, bd = 1e9;
+  for (let i = 0; i < track.xs.length; i++) {
+    const d = (track.xs[i]-wx)*(track.xs[i]-wx) + (track.ys[i]-wy)*(track.ys[i]-wy);
+    if (d < bd) { bd = d; best = i; }
+  }
+  return track.cum[best];
+}
+
+/* ================= 游戏状态 ================= */
+const G = 9.8, MASS = 50, MU = 0.10;   // 摩擦取 N≈mgcosθ（忽略向心修正）
+const ESCALE = MASS * G * 9.0;          // 能量条满格（≈最高点势能）
+let skater = { s:0, v:0 };              // s=弧长位置，v=沿轨道速度（带方向）
+let frictionOn = false, editMode = false, grabbed = false;
+let thermal = 0, E0 = 1, startH = 0;
+let wentLow = false, celebrated = false, stopAnnounced = false;
+
+function startRun() {
+  const p = trackAt(skater.s);
+  thermal = 0; startH = p.y;
+  E0 = MASS * G * p.y + 0.5 * MASS * skater.v * skater.v;
+  wentLow = false; celebrated = false; stopAnnounced = false;
+}
+function resetSkater() {
+  skater.s = nearestS(1.8, 8.8); skater.v = 0;
+  startRun();
+}
+buildTrack();
+resetSkater();
+
+/* ================= 物理 ================= */
+function physics(dt) {
+  if (grabbed) return;
+  let p = trackAt(skater.s);
+  const sinT = p.sin, cosT = Math.max(0.05, Math.abs(p.cos));
+  // 静摩擦：速度为 0 且坡度不够陡（tanθ<μ）时保持静止
+  if (frictionOn && skater.v === 0) {
+    if (G * Math.abs(sinT) <= MU * G * cosT) {
+      if (!stopAnnounced && thermal > 1) {
+        stopAnnounced = true;
+        showHint("摩擦力把机械能全部变成了热能，小人停在了坡底 🌡️");
+        stopTone();
+      }
+      return;
+    }
+  }
+  // 重力沿轨道分量
+  skater.v += -G * sinT * dt;
+  // 摩擦生热 + 摩擦减速（减速不把速度反向）
+  if (frictionOn) {
+    thermal += MU * MASS * G * cosT * Math.abs(skater.v) * dt;
+    const df = MU * G * cosT * dt;
+    if (Math.abs(skater.v) <= df) skater.v = 0;
+    else skater.v -= df * Math.sign(skater.v);
+  }
+  skater.s += skater.v * dt;
+  if (skater.s < 0) { skater.s = 0; skater.v = Math.max(0, skater.v); }
+  if (skater.s > track.len) { skater.s = track.len; skater.v = Math.min(0, skater.v); }
+  // 无摩擦：滑回出发高度时庆祝一次
+  p = trackAt(skater.s);
+  if (!frictionOn) {
+    if (p.y < startH - 1.5) wentLow = true;
+    if (wentLow && !celebrated && p.y >= startH - 0.1 && Math.abs(skater.v) < 2) {
+      celebrated = true;
+      showHint("✨ 无摩擦时滑回了原来的高度——机械能守恒！");
+      fanfare();
+    }
+  }
+}
+
+/* ================= 交互（拖拽） ================= */
+let drag = null;   // {type:'skater'|'handle', idx, id}
+canvas.addEventListener("pointerdown", e => {
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  // 编辑模式下优先抓手柄
+  if (editMode) {
+    for (let i = 0; i < ctrl.length; i++) {
+      if (ctrl[i].fixed) continue;
+      if (Math.hypot(ctrl[i].x - wx, ctrl[i].y - wy) < 1.1) {
+        drag = { type:"handle", idx:i, id:e.pointerId };
+        canvas.setPointerCapture(e.pointerId);
+        pop(520);
+        return;
+      }
+    }
+  }
+  const p = trackAt(skater.s);
+  if (Math.hypot(p.x - wx, p.y - wy) < 1.5) {
+    drag = { type:"skater", id:e.pointerId };
+    grabbed = true; skater.v = 0;
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(660);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  if (drag.type === "handle") {
+    const c = ctrl[drag.idx];
+    const prev = ctrl[drag.idx - 1], next = ctrl[drag.idx + 1];
+    c.x = Math.max(prev.x + 1.5, Math.min(next.x - 1.5, wx));
+    c.y = Math.max(0.5, Math.min(8.5, wy));
+    buildTrack();
+    skater.s = Math.min(skater.s, track.len);
+  } else {
+    skater.s = nearestS(wx, wy);
+  }
+});
+window.addEventListener("pointerup", e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  if (drag.type === "skater") {
+    grabbed = false;
+    startRun();
+    whoosh(0.6);
+  } else {
+    pop(760);
+  }
+  drag = null;
+});
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+function applyWorld() {
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, -view.s);
+}
+
+function drawTrackWorld() {
+  ctx.save();
+  applyWorld();
+  // 地面（轨道以下填草地）
+  const g = ctx.createLinearGradient(0, 0, 0, 11);
+  g.addColorStop(0, "#5da03c"); g.addColorStop(1, "#8fce63");
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(-0.5, 0);
+  ctx.lineTo(track.xs[0], 0);
+  for (let i = 0; i < track.xs.length; i++) ctx.lineTo(track.xs[i], track.ys[i]);
+  ctx.lineTo(track.xs[track.xs.length-1], 0);
+  ctx.lineTo(WORLD_W, 0);
+  ctx.lineTo(WORLD_W, -0.5);
+  ctx.lineTo(-0.5, -0.5);
+  ctx.closePath(); ctx.fill();
+  // 轨道面：外框 + 浅色面
+  ctx.lineJoin = "round"; ctx.lineCap = "round";
+  ctx.beginPath();
+  for (let i = 0; i < track.xs.length; i++) i ? ctx.lineTo(track.xs[i], track.ys[i]) : ctx.moveTo(track.xs[i], track.ys[i]);
+  ctx.strokeStyle = "#7d97ac"; ctx.lineWidth = 0.46; ctx.stroke();
+  ctx.strokeStyle = "#e9f1f7"; ctx.lineWidth = 0.3; ctx.stroke();
+  // 有摩擦时轨道面画橙点提示"粗糙"
+  if (frictionOn) {
+    ctx.fillStyle = "rgba(230,110,40,0.55)";
+    for (let i = 0; i < track.xs.length; i += 22) {
+      ctx.beginPath(); ctx.arc(track.xs[i], track.ys[i] + 0.06, 0.07, 0, 7); ctx.fill();
+    }
+  }
+  // 控制点手柄
+  if (editMode) {
+    for (let i = 0; i < ctrl.length; i++) {
+      const c = ctrl[i];
+      if (c.fixed) {
+        ctx.beginPath(); ctx.arc(c.x, c.y, 0.16, 0, 7);
+        ctx.fillStyle = "rgba(60,70,80,0.6)"; ctx.fill();
+        continue;
+      }
+      ctx.beginPath(); ctx.arc(c.x, c.y, 0.46, 0, 7);
+      ctx.fillStyle = "#ffb800"; ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 0.09; ctx.stroke();
+      // 上下小箭头提示可拖
+      ctx.fillStyle = "#5a3d00";
+      ctx.beginPath(); ctx.moveTo(c.x, c.y + 0.3); ctx.lineTo(c.x - 0.14, c.y + 0.1); ctx.lineTo(c.x + 0.14, c.y + 0.1); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(c.x, c.y - 0.3); ctx.lineTo(c.x - 0.14, c.y - 0.1); ctx.lineTo(c.x + 0.14, c.y - 0.1); ctx.closePath(); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+function drawSkater() {
+  const p = trackAt(skater.s);
+  const ang = Math.atan2(p.sin, p.cos);
+  ctx.save();
+  applyWorld();
+  // 高度虚线（到左侧高度尺）
+  ctx.save();
+  ctx.setLineDash([0.3, 0.25]);
+  ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 0.05;
+  ctx.beginPath(); ctx.moveTo(0.1, p.y); ctx.lineTo(p.x, p.y); ctx.stroke();
+  ctx.restore();
+  // 速度箭头（沿轨道切向，绿色）
+  if (!grabbed && Math.abs(skater.v) > 0.5) {
+    const dir = Math.sign(skater.v), L = Math.min(3.2, 0.35 * Math.abs(skater.v));
+    const tx = p.cos * dir, ty = p.sin * dir;
+    ctx.strokeStyle = "#2fbf4a"; ctx.fillStyle = "#2fbf4a"; ctx.lineWidth = 0.14; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(p.x, p.y + 0.5); ctx.lineTo(p.x + tx * L, p.y + 0.5 + ty * L); ctx.stroke();
+    const hx = p.x + tx * L, hy = p.y + 0.5 + ty * L, nx = -ty, ny = tx;
+    ctx.beginPath();
+    ctx.moveTo(hx + tx * 0.4, hy + ty * 0.4);
+    ctx.lineTo(hx + nx * 0.2, hy + ny * 0.2);
+    ctx.lineTo(hx - nx * 0.2, hy - ny * 0.2);
+    ctx.closePath(); ctx.fill();
+  }
+  // 摩擦发热光晕
+  if (frictionOn && Math.abs(skater.v) > 0.8 && !grabbed) {
+    const fg = ctx.createRadialGradient(p.x, p.y, 0.1, p.x, p.y, 1.1);
+    fg.addColorStop(0, "rgba(255,120,30," + Math.min(0.55, Math.abs(skater.v) / 18) + ")");
+    fg.addColorStop(1, "rgba(255,120,30,0)");
+    ctx.fillStyle = fg;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 1.1, 0, 7); ctx.fill();
+  }
+  // 小人
+  ctx.translate(p.x, p.y);
+  ctx.rotate(ang);
+  if (grabbed) {
+    ctx.beginPath(); ctx.arc(0, 0.9, 1.05, 0, 7);
+    ctx.strokeStyle = "rgba(255,213,74,0.9)"; ctx.lineWidth = 0.07;
+    ctx.setLineDash([0.18, 0.14]); ctx.stroke(); ctx.setLineDash([]);
+  }
+  // 滑板
+  ctx.fillStyle = "#e94f3d";
+  roundRect(-0.65, 0.03, 1.3, 0.13, 0.06, true);
+  ctx.fillStyle = "#333";
+  ctx.beginPath(); ctx.arc(-0.4, 0, 0.09, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(0.4, 0, 0.09, 0, 7); ctx.fill();
+  // 腿
+  ctx.strokeStyle = "#2b4a7a"; ctx.lineWidth = 0.15; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-0.15, 0.14); ctx.lineTo(-0.08, 0.62); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0.2, 0.14); ctx.lineTo(0.06, 0.62); ctx.stroke();
+  // 身体
+  ctx.strokeStyle = "#ff8a3d"; ctx.lineWidth = 0.26;
+  ctx.beginPath(); ctx.moveTo(0, 0.6); ctx.lineTo(-0.05, 1.16); ctx.stroke();
+  // 手臂
+  ctx.lineWidth = 0.11;
+  ctx.beginPath(); ctx.moveTo(-0.02, 1.02); ctx.lineTo(0.42, 0.86); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-0.02, 1.02); ctx.lineTo(-0.48, 0.92); ctx.stroke();
+  // 头 + 头盔
+  ctx.fillStyle = "#ffd9b0";
+  ctx.beginPath(); ctx.arc(-0.05, 1.4, 0.23, 0, 7); ctx.fill();
+  ctx.fillStyle = "#e94f3d";
+  ctx.beginPath(); ctx.arc(-0.05, 1.45, 0.24, Math.PI, 0); ctx.fill();
+  ctx.restore();
+}
+
+function drawRuler(hNow) {
+  const x = view.ox - 20;
+  const yb = SY(0), yt = SY(10);
+  ctx.strokeStyle = "rgba(40,60,80,0.75)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, yb); ctx.lineTo(x, yt); ctx.stroke();
+  ctx.fillStyle = "rgba(40,60,80,0.9)";
+  ctx.font = "12px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let m = 0; m <= 10; m++) {
+    const y = SY(m);
+    ctx.lineWidth = m % 2 === 0 ? 2 : 1;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + (m % 2 === 0 ? 9 : 5), y); ctx.stroke();
+    if (m % 2 === 0) ctx.fillText(m + "m", x - 4, y);
+  }
+  // 当前高度标记
+  const y = SY(hNow);
+  ctx.fillStyle = "#e94f3d";
+  ctx.beginPath(); ctx.moveTo(x - 2, y); ctx.lineTo(x - 12, y - 7); ctx.lineTo(x - 12, y + 7); ctx.closePath(); ctx.fill();
+  ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+  ctx.font = "bold 14px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.fillStyle = "#c03028";
+  ctx.fillText("h=" + hNow.toFixed(1) + "m", x + 14, y - 4);
+}
+
+function drawPanel(pe, ke) {
+  const x0 = W - PANEL_W - 10, y0 = 12, pw = PANEL_W, ph = H - 24;
+  ctx.fillStyle = "rgba(20,32,50,0.6)";
+  roundRect(x0, y0, pw, ph, 18, true);
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 18px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("⚡ 能量条", x0 + pw / 2, y0 + 28);
+  // 三根能量条
+  const barTop = y0 + 56, barH = Math.min(ph * 0.38, 290), barBot = barTop + barH;
+  const bars = [
+    { name:"势能", v:pe,      c:"#3d8bff" },
+    { name:"动能", v:ke,      c:"#ffb800" },
+    { name:"热能", v:thermal, c:"#ff5240" }
+  ];
+  const bw = 48, gap = (pw - 40 - 3 * bw) / 2;
+  ctx.textBaseline = "middle";
+  bars.forEach((b, i) => {
+    const bx = x0 + 20 + i * (bw + gap);
+    ctx.fillStyle = "rgba(255,255,255,0.10)";
+    roundRect(bx, barTop, bw, barH, 8, true);
+    const h = barH * Math.min(1, Math.max(0, b.v) / ESCALE);
+    if (h > 0.5) {
+      ctx.fillStyle = b.c;
+      roundRect(bx, barBot - h, bw, h, h < 16 ? h / 2 : 8, true);
+    }
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 15px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.fillText(b.name, bx + bw / 2, barBot + 16);
+    ctx.font = "12px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    ctx.fillText((b.v / 1000).toFixed(1) + " kJ", bx + bw / 2, barBot + 36);
+  });
+  // 总能量参考线
+  const tot = pe + ke + thermal;
+  const ty = barBot - barH * Math.min(1, tot / ESCALE);
+  ctx.save();
+  ctx.setLineDash([6, 5]);
+  ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(x0 + 14, ty); ctx.lineTo(x0 + pw - 14, ty); ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.font = "12px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textAlign = "right";
+  ctx.fillText("总能量 " + (tot / 1000).toFixed(1) + " kJ", x0 + pw - 16, ty - 10);
+  // 速度表
+  drawGauge(Math.abs(skater.v), x0 + pw / 2, barBot + 148, 60);
+}
+
+function drawGauge(v, cx, cy, R) {
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 15px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.fillText("速度表", cx, cy - R - 16);
+  const frac = Math.min(1, v / 15);
+  // 底弧 + 彩色弧
+  ctx.lineCap = "round";
+  ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 11;
+  ctx.beginPath(); ctx.arc(cx, cy, R, Math.PI, 2 * Math.PI); ctx.stroke();
+  if (frac > 0.005) {
+    ctx.strokeStyle = frac > 0.7 ? "#ff5240" : frac > 0.4 ? "#ffb800" : "#2fbf4a";
+    ctx.beginPath(); ctx.arc(cx, cy, R, Math.PI, Math.PI + frac * Math.PI); ctx.stroke();
+  }
+  // 刻度
+  ctx.fillStyle = "rgba(255,255,255,0.8)";
+  ctx.font = "11px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 1.5;
+  for (let tv = 0; tv <= 15; tv += 5) {
+    const a = Math.PI + tv / 15 * Math.PI;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(a) * (R - 10), cy + Math.sin(a) * (R - 10));
+    ctx.lineTo(cx + Math.cos(a) * (R + 2), cy + Math.sin(a) * (R + 2));
+    ctx.stroke();
+    ctx.fillText(tv, cx + Math.cos(a) * (R - 22), cy + Math.sin(a) * (R - 22));
+  }
+  // 指针
+  const a = Math.PI + frac * Math.PI;
+  ctx.strokeStyle = "#ff5240"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(a) * (R - 8), cy + Math.sin(a) * (R - 8)); ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.arc(cx, cy, 4, 0, 7); ctx.fill();
+  // 数字读数
+  ctx.font = "bold 15px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.fillText(v.toFixed(1) + " m/s", cx, cy + 22);
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 天空
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, "#bfe9f8"); sky.addColorStop(1, "#e8f7ee");
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+  drawTrackWorld();
+  const p = trackAt(skater.s);
+  const pe = MASS * G * p.y, ke = 0.5 * MASS * skater.v * skater.v;
+  drawSkater();
+  drawRuler(p.y);
+  drawPanel(pe, ke);
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  const steps = 4;
+  for (let i = 0; i < steps; i++) physics(dt / steps);
+  draw();
+  requestAnimationFrame(loop);
+}
+draw();   // 先画一帧，保证立即有画面
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const whoosh = p => tone(300 + 400 * p, 0.14, 0.09, "triangle");
+const stopTone = () => { tone(220, 0.3, 0.1, "triangle"); setTimeout(() => tone(165, 0.45, 0.1, "triangle"), 220); };
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3200);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+const btnNoFric = document.getElementById("btnNoFric");
+const btnFric = document.getElementById("btnFric");
+const btnEdit = document.getElementById("btnEdit");
+function setFriction(on) {
+  frictionOn = on;
+  btnNoFric.classList.toggle("active", !on);
+  btnFric.classList.toggle("active", on);
+  celebrated = false; stopAnnounced = false;
+  pop(on ? 440 : 620);
+  showHint(on
+    ? "有摩擦：机械能不断变成热能（红条），越滑越低，最后停住"
+    : "无摩擦：势能⇄动能来回转换，永远滑回原来的高度！");
+}
+btnNoFric.addEventListener("click", () => setFriction(false));
+btnFric.addEventListener("click", () => setFriction(true));
+btnEdit.addEventListener("click", () => {
+  editMode = !editMode;
+  btnEdit.classList.toggle("active", editMode);
+  pop(editMode ? 700 : 500);
+  showHint(editMode
+    ? "✏️ 拖动黄色圆点改变轨道——试试加一个小坡！（再点一次退出）"
+    : "已退出编辑，继续滑行吧！");
+});
+document.getElementById("btnTrack").addEventListener("click", () => {
+  ctrl = defaultCtrl();
+  buildTrack();
+  skater.s = Math.min(skater.s, track.len);
+  pop(560);
+  showHint("轨道还原成 U 形啦");
+});
+document.getElementById("btnReset").addEventListener("click", () => {
+  resetSkater();
+  pop(880);
+  showHint("小人回到左边最高点，松手就滑！");
+});
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

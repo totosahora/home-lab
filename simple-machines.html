@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>简单机械大挑战</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#bfe3f7; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,80,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,80,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:94%;
+  }
+  #btns {
+    position:absolute; right:14px; top:150px; z-index:10;
+    display:flex; flex-direction:column; gap:10px; align-items:flex-end;
+  }
+  #btns button {
+    font-family:inherit; font-weight:bold; border:none; cursor:pointer;
+    border-radius:30px; box-shadow:0 4px 10px rgba(0,0,0,0.25);
+  }
+  #testBtn {
+    font-size:24px; padding:16px 40px; background:#2fbf4a; color:#fff;
+  }
+  #testBtn:active { transform:scale(1.07); }
+  #testBtn:disabled { background:#9e9e9e; }
+  #clearBtn {
+    font-size:16px; padding:9px 20px; background:rgba(255,255,255,0.92); color:#345;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.45);
+  }
+  #winPanel .msg {
+    font-size:38px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🧩 第 1 / 3 关</div>
+<div id="hint">从左边零件箱把机械拖出来，靠近石头或彼此就会自动连上，然后点「测试」！</div>
+<div id="btns">
+  <button id="testBtn">▶ 测试！</button>
+  <button id="clearBtn">🧹 清空零件</button>
+</div>
+<div id="winPanel">
+  <div class="msg">🎉 第 1 关完成！</div>
+  <button id="nextBtn">下一关 ▶</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const testBtn = document.getElementById("testBtn");
+let W = 0, H = 0, DPR = 1;
+
+const PALETTE_W = 124;        // 左侧零件箱宽度
+function groundY() { return H - 80; }
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layoutScene();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 关卡与场景数据 ================= */
+const STONE_KG = 100;
+const LEVELS = [
+  { strength:50, need:2, platH:90,  tip:"第 1 关：把 100kg 大石头抬上高台！你的力气是 50kg，需要 ×2 增益" },
+  { strength:25, need:4, platH:140, tip:"第 2 关：高台更高了！需要 ×4 增益，试试两种机械组合" },
+  { strength:17, need:6, platH:195, tip:"第 3 关：终极挑战！需要 ×6 增益，要三种机械一起上！" }
+];
+// gain = 该零件提供的力气倍数
+const PART_DEF = {
+  lever:  { name:"杠杆",   gain:2, hit:56, color:"#c98a4b", desc:"杠杆：×2 力气！支点越对越省力" },
+  fixed:  { name:"定滑轮", gain:1, hit:46, color:"#4a90d9", desc:"定滑轮：×1，只改变用力方向，不省力" },
+  moving: { name:"动滑轮", gain:2, hit:46, color:"#2fbf4a", desc:"动滑轮：×2 力气！省一半力" },
+  ramp:   { name:"斜面",   gain:3, hit:62, color:"#9b6dd6", desc:"斜面：×3 力气！坡越缓越省力" },
+  wheel:  { name:"轮子",   gain:2, hit:46, color:"#e07830", desc:"轮子（轮轴）：×2 力气！滚动更省力" }
+};
+const PALETTE_ITEMS = ["lever", "fixed", "moving", "ramp", "wheel"];
+const SNAP_DIST = 105;        // 两个零件中心距离小于它就连上
+
+let levelIdx = 0;
+let parts = [];               // {type, x, y}
+let stone = { x:0, y:0, r:34 };
+let plat = { x0:0, x1:0, top:0 };
+let kidX = 0;
+let state = "build";          // build | shaking | lifting | sliding | done
+let frozen = null;            // 测试期间锁定的机械组合 {gain, cluster}（石头升起后绳子不会半路断开）
+let animT = 0;
+let selected = null;          // 被选中的零件（显示 ✕ 手柄）
+
+function layoutScene() {
+  const gy = groundY();
+  if (state === "build") {
+    stone.x = W - 320; stone.y = gy - stone.r + 4;
+  }
+  plat.x1 = W - 24; plat.x0 = plat.x1 - 190;
+  plat.top = gy - LEVELS[levelIdx].platH;
+  kidX = PALETTE_W + 62;
+  for (const p of parts) {
+    p.x = clampX(p.x); p.y = clampY(p.y);
+  }
+}
+function clampX(x) { return Math.max(PALETTE_W + 52, Math.min(W - 44, x)); }
+function clampY(y) { return Math.max(70, Math.min(groundY() - 26, y)); }
+
+function resetLevel() {
+  parts = [];
+  selected = null;
+  frozen = null;
+  state = "build"; animT = 0;
+  stone.x = W - 320; stone.y = groundY() - stone.r + 4;
+  winPanel.style.display = "none";
+  testBtn.disabled = false;
+  showHint(LEVELS[levelIdx].tip);
+  updateScore(computeGain().gain);
+}
+
+/* ================= 机械增益（把不可见的力画出来） ================= */
+// 从石头出发，沿「靠近就连上」的边找连在一起的所有零件
+function computeGain() {
+  if (frozen && state !== "build") return frozen;
+  const anchor = { x: stone.x, y: stone.y - 10 };
+  // BFS：从石头出发，把距离够近的零件逐个拉进组合
+  const linkedSet = new Set();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const p of parts) {
+      if (linkedSet.has(p)) continue;
+      if (Math.hypot(p.x - anchor.x, p.y - anchor.y) < SNAP_DIST) { linkedSet.add(p); changed = true; continue; }
+      for (const q of linkedSet) {
+        if (Math.hypot(p.x - q.x, p.y - q.y) < SNAP_DIST) { linkedSet.add(p); changed = true; break; }
+      }
+    }
+  }
+  let gain = 1;
+  for (const p of linkedSet) gain *= PART_DEF[p.type].gain;
+  gain = Math.min(gain, 24);
+  return { gain, cluster: [...linkedSet] };
+}
+
+function edgePairs() {
+  // 所有互相靠近的零件对 + 与石头的连接，用于画绳子/连杆
+  const pairs = [];
+  const anchor = { x: stone.x, y: stone.y - 10, isStone: true };
+  for (const p of parts)
+    if (Math.hypot(p.x - anchor.x, p.y - anchor.y) < SNAP_DIST) pairs.push([anchor, p]);
+  for (let i = 0; i < parts.length; i++)
+    for (let j = i + 1; j < parts.length; j++)
+      if (Math.hypot(parts[i].x - parts[j].x, parts[i].y - parts[j].y) < SNAP_DIST)
+        pairs.push([parts[i], parts[j]]);
+  return pairs;
+}
+
+let lastGain = -1;
+function updateScore(gain) {
+  const lv = LEVELS[levelIdx];
+  scorebar.textContent = `🧩 第 ${levelIdx + 1} / 3 关 · 💪力气 ${lv.strength}kg × 增益 ×${gain} · 需要 ×${lv.need}`;
+}
+
+/* ================= 测试流程 ================= */
+function startTest() {
+  if (state !== "build") return;
+  const { gain, cluster } = computeGain();
+  const lv = LEVELS[levelIdx];
+  pop(660);
+  if (cluster.length === 0) {
+    state = "shaking"; animT = 0; bonk();
+    showHint("机械还没连到石头上！把零件拖到石头旁边，靠近就会自动连上");
+    return;
+  }
+  if (lv.strength * gain >= STONE_KG) {
+    frozen = { gain, cluster: [...cluster] };
+    state = "lifting"; animT = 0;
+    testBtn.disabled = true;
+    showHint(`💪 ${lv.strength}kg × 增益 ×${gain} = ${lv.strength * gain}kg ≥ 石头 ${STONE_KG}kg，抬起来啦！`);
+    rumble();
+  } else {
+    state = "shaking"; animT = 0; bonk();
+    // 石头纹丝不动，给孩子具体的提示
+    const types = new Set(cluster.map(p => p.type));
+    if (gain === 1 && types.has("fixed") && cluster.length === types.size) {
+      showHint("定滑轮只改变方向不省力哦，试试加个动滑轮！");
+    } else if (!types.has("moving")) {
+      showHint("力气还不够，试试加个动滑轮！");
+    } else {
+      showHint(`力气还不够（${lv.strength}×${gain}=${lv.strength * gain}kg < 100kg），再加一个机械试试！`);
+    }
+  }
+}
+
+function updateTest(dt) {
+  if (state === "shaking") {
+    animT += dt;
+    if (animT > 0.9) { state = "build"; animT = 0; stone.x = W - 320; }
+  } else if (state === "lifting") {
+    animT += dt;
+    const targetY = plat.top - stone.r + 2;
+    stone.y -= 95 * dt;
+    if (Math.random() < dt * 6) rumble();
+    if (stone.y <= targetY) { stone.y = targetY; state = "sliding"; pop(880); }
+  } else if (state === "sliding") {
+    animT += dt;
+    const targetX = (plat.x0 + plat.x1) / 2;
+    stone.x += 110 * dt;
+    if (stone.x >= targetX) {
+      stone.x = targetX;
+      state = "done";
+      onLevelDone();
+    }
+  }
+}
+
+function onLevelDone() {
+  const { gain } = computeGain();
+  fanfare();
+  burst(stone.x, stone.y - 40, ["#ffd54a", "#ffb800", "#fff59d", "#ff8a65"], 40, 340, 0.12);
+  setTimeout(() => {
+    if (levelIdx < LEVELS.length - 1) {
+      winPanel.querySelector(".msg").innerHTML =
+        `🎉 第 ${levelIdx + 1} 关完成！<br><span style="font-size:22px">增益 ×${gain}，大石头飞上高台！</span>`;
+      document.getElementById("nextBtn").textContent = "下一关 ▶";
+    } else {
+      winPanel.querySelector(".msg").innerHTML =
+        `🏆 全部通关！<br><span style="font-size:22px">你是简单机械小大师！</span>`;
+      document.getElementById("nextBtn").textContent = "再玩一次";
+    }
+    winPanel.style.display = "flex";
+    bigFanfare();
+  }, 800);
+}
+
+/* ================= 交互（拖拽 / 吸附 / 删除手柄） ================= */
+let drag = null;   // {part, dx, dy, moved, downX, downY, downT, overPal, fromPalette}
+
+function palettePos(i) {
+  const top = 130, bottom = H - 110;
+  const step = Math.min(116, (bottom - top) / (PALETTE_ITEMS.length - 1));
+  return { x: PALETTE_W / 2, y: top + i * step };
+}
+function paletteItemAt(x, y) {
+  if (x > PALETTE_W) return null;
+  for (let i = 0; i < PALETTE_ITEMS.length; i++) {
+    const p = palettePos(i);
+    if (Math.hypot(x - p.x, y - p.y) < 46) return PALETTE_ITEMS[i];
+  }
+  return null;
+}
+function partAt(x, y) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    if (Math.hypot(x - p.x, y - p.y) < PART_DEF[p.type].hit) return p;
+  }
+  return null;
+}
+function deleteHandlePos(p) { return { x: p.x + 44, y: p.y - 48 }; }
+
+canvas.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  hintEl.style.opacity = "0";
+  if (state !== "build") return;
+  // 0. 选中零件的 ✕ 删除手柄
+  if (selected && parts.includes(selected)) {
+    const h = deleteHandlePos(selected);
+    if (Math.hypot(x - h.x, y - h.y) < 22) {
+      parts = parts.filter(p => p !== selected);
+      selected = null;
+      pop(240);
+      showHint("零件放回零件箱啦");
+      return;
+    }
+  }
+  // 1. 零件箱：生成新零件
+  const item = paletteItemAt(x, y);
+  if (item) {
+    const p = { type: item, x, y };
+    parts.push(p);
+    drag = { part: p, dx: 0, dy: 0, moved: false, downX: x, downY: y, downT: performance.now(), overPal: true, fromPalette: true };
+    selected = null;
+    pop(700);
+    return;
+  }
+  // 2. 画布上的零件：拖动 / 点选
+  const p = partAt(x, y);
+  if (p) {
+    drag = { part: p, dx: p.x - x, dy: p.y - y, moved: false, downX: x, downY: y, downT: performance.now(), overPal: false, fromPalette: false };
+    parts = parts.filter(o => o !== p).concat([p]);   // 提到最上层
+    pop(500);
+    return;
+  }
+  // 3. 点空白：取消选中
+  selected = null;
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const x = e.clientX, y = e.clientY;
+  if (Math.hypot(x - drag.downX, y - drag.downY) > 8) drag.moved = true;
+  drag.part.x = clampX(x + drag.dx);
+  drag.part.y = clampY(y + drag.dy);
+  drag.overPal = x < PALETTE_W;
+});
+
+function endDrag() {
+  if (!drag) return;
+  const p = drag.part;
+  // 拖回零件箱 = 收回去
+  if (drag.overPal) {
+    parts = parts.filter(o => o !== p);
+    pop(240);
+    if (drag.fromPalette && !drag.moved) {
+      // 只是点了一下零件箱图标：介绍这个零件
+      showHint(PART_DEF[p.type].desc);
+      pop(880);
+    } else {
+      showHint("零件放回零件箱啦");
+    }
+  } else if (!drag.moved && performance.now() - drag.downT < 300) {
+    // 快速点按 = 选中，出现 ✕ 删除手柄
+    selected = p;
+    pop(880);
+    showHint(`${PART_DEF[p.type].name}：增益 ×${PART_DEF[p.type].gain} · 点红色 ✕ 可以删除`);
+  }
+  drag = null;
+}
+window.addEventListener("pointerup", endDrag);
+window.addEventListener("pointercancel", endDrag);
+
+testBtn.addEventListener("click", startTest);
+document.getElementById("clearBtn").addEventListener("click", () => {
+  if (state !== "build") return;
+  parts = []; selected = null;
+  pop(300);
+  showHint("清空啦，重新搭一个更厉害的机械组合！");
+});
+document.getElementById("nextBtn").addEventListener("click", () => {
+  if (levelIdx < LEVELS.length - 1) levelIdx++;
+  else levelIdx = 0;
+  layoutScene();
+  resetLevel();
+  pop(880);
+});
+
+/* ================= 粒子（庆祝烟花） ================= */
+let sparks = [];
+function burst(x, y, colors, n, speed, grav) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = speed * (0.3 + Math.random() * 0.7);
+    sparks.push({
+      x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - speed * 0.25,
+      life: 0, maxLife: 0.7 + Math.random() * 0.8,
+      color: colors[Math.floor(Math.random() * colors.length)],
+      size: 2.5 + Math.random() * 3, grav: grav || 0.1
+    });
+  }
+}
+function updateSparks(dt) {
+  for (const s of sparks) {
+    s.life += dt;
+    s.vy += s.grav * 900 * dt / 10;
+    s.x += s.vx * dt; s.y += s.vy * dt;
+    s.vx *= 0.985; s.vy *= 0.985;
+  }
+  sparks = sparks.filter(s => s.life < s.maxLife);
+}
+function drawSparks() {
+  for (const s of sparks) {
+    ctx.globalAlpha = Math.max(0, 1 - s.life / s.maxLife);
+    ctx.fillStyle = s.color;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.size, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#bfe3f7"); g.addColorStop(1, "#e8f6ff");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 太阳
+  ctx.beginPath(); ctx.arc(W - 90, 84, 38, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  // 云朵
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  for (const [cx, cy, s] of [[W * 0.35, 90, 1], [W * 0.62, 150, 0.7]]) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, 22 * s, 0, 7);
+    ctx.arc(cx + 24 * s, cy + 4 * s, 17 * s, 0, 7);
+    ctx.arc(cx - 24 * s, cy + 5 * s, 16 * s, 0, 7);
+    ctx.fill();
+  }
+  // 地面
+  const gy = groundY();
+  ctx.fillStyle = "#7cc46a";
+  ctx.fillRect(0, gy, W, H - gy);
+  ctx.fillStyle = "#5da34e";
+  ctx.fillRect(0, gy, W, 6);
+}
+
+function drawPlatform() {
+  const gy = groundY();
+  // 高台本体
+  const g = ctx.createLinearGradient(plat.x0, plat.top, plat.x1, gy);
+  g.addColorStop(0, "#a9805a"); g.addColorStop(1, "#8a6844");
+  ctx.fillStyle = g;
+  roundRect(plat.x0, plat.top, plat.x1 - plat.x0, gy - plat.top, 8, true);
+  ctx.fillStyle = "#6f5335";
+  roundRect(plat.x0, plat.top, plat.x1 - plat.x0, 10, 5, true);
+  // 小旗子
+  const fx = plat.x1 - 22;
+  ctx.strokeStyle = "#5a3d00"; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(fx, plat.top); ctx.lineTo(fx, plat.top - 52); ctx.stroke();
+  ctx.fillStyle = "#ff5252";
+  ctx.beginPath();
+  ctx.moveTo(fx, plat.top - 52); ctx.lineTo(fx - 34, plat.top - 42); ctx.lineTo(fx, plat.top - 32);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 16px 'PingFang SC', sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("高台", (plat.x0 + plat.x1) / 2, plat.top + 34);
+}
+
+function drawStone() {
+  let sx = stone.x, sy = stone.y;
+  // 增益不足：石头纹丝不动（只有极轻微颤动）
+  if (state === "shaking") sx += Math.sin(animT * 60) * 2.2 * Math.max(0, 1 - animT / 0.9);
+  ctx.save();
+  ctx.translate(sx, sy);
+  // 石头影子
+  ctx.beginPath(); ctx.ellipse(0, stone.r - 2, stone.r * 1.1, 8, 0, 0, 7);
+  ctx.fillStyle = "rgba(0,0,0,0.15)"; ctx.fill();
+  // 石头本体（不规则多边形）
+  const g = ctx.createRadialGradient(-10, -12, 6, 0, 0, stone.r + 6);
+  g.addColorStop(0, "#b0b6bd"); g.addColorStop(1, "#7d848d");
+  ctx.beginPath();
+  for (let i = 0; i < 9; i++) {
+    const a = i / 9 * Math.PI * 2;
+    const rr = stone.r * (0.88 + 0.14 * Math.sin(i * 2.7));
+    const px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "#5f666e"; ctx.lineWidth = 3; ctx.stroke();
+  // 重量标签
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 17px 'PingFang SC', sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("100kg", 0, 1);
+  ctx.restore();
+}
+
+function drawKid() {
+  const gy = groundY();
+  const pulling = state === "lifting" || state === "sliding";
+  const lean = pulling ? Math.sin(animT * 8) * 3 : 0;
+  ctx.save();
+  ctx.translate(kidX + lean, gy);
+  // 腿
+  ctx.strokeStyle = "#37474f"; ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-4, -34); ctx.lineTo(-10, 0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(4, -34); ctx.lineTo(12, 0); ctx.stroke();
+  // 身体
+  ctx.strokeStyle = "#2f7fe9"; ctx.lineWidth = 16;
+  ctx.beginPath(); ctx.moveTo(0, -34); ctx.lineTo(0, -64); ctx.stroke();
+  // 手臂（朝右拉绳子）
+  ctx.strokeStyle = "#ffcba8"; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.moveTo(0, -58); ctx.lineTo(24, -70); ctx.stroke();
+  // 头
+  ctx.beginPath(); ctx.arc(0, -78, 13, 0, 7);
+  ctx.fillStyle = "#ffcba8"; ctx.fill();
+  // 头发
+  ctx.beginPath(); ctx.arc(0, -82, 12, Math.PI, 0);
+  ctx.fillStyle = "#4e342e"; ctx.fill();
+  // 眼睛（看着石头方向）
+  ctx.fillStyle = "#333";
+  ctx.beginPath(); ctx.arc(6, -78, 2, 0, 7); ctx.fill();
+  ctx.restore();
+  // 力气气泡
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  roundRect(kidX - 52, gy - 142, 104, 30, 15, true);
+  ctx.fillStyle = "#e07830";
+  ctx.font = "bold 15px 'PingFang SC', sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(`💪 ${LEVELS[levelIdx].strength}kg`, kidX, gy - 127);
+}
+
+// 零件绘制（s = 缩放，零件箱里用小号；labelColor 零件箱里用浅色）
+function drawPart(p, s, bob, labelColor) {
+  const def = PART_DEF[p.type];
+  ctx.save();
+  ctx.translate(p.x, p.y + (bob || 0));
+  ctx.scale(s, s);
+  if (p.type === "lever") {
+    // 支点三角
+    ctx.fillStyle = "#8d6e63";
+    ctx.beginPath(); ctx.moveTo(-14, 26); ctx.lineTo(14, 26); ctx.lineTo(0, 2); ctx.closePath(); ctx.fill();
+    // 杠杆木板（一边长一边短，长边下压）
+    ctx.save();
+    ctx.rotate(-0.12);
+    ctx.fillStyle = def.color;
+    roundRect(-58, -12, 116, 14, 6, true);
+    ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2;
+    roundRect(-58, -12, 116, 14, 6, false); ctx.stroke();
+    ctx.restore();
+    // 支点圆点
+    ctx.beginPath(); ctx.arc(0, -2, 5, 0, 7);
+    ctx.fillStyle = "#5a3d00"; ctx.fill();
+  } else if (p.type === "fixed") {
+    // 吊架
+    ctx.strokeStyle = "#607d8b"; ctx.lineWidth = 6; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(0, -44); ctx.lineTo(0, -26); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-16, -44); ctx.lineTo(16, -44); ctx.stroke();
+    // 轮子
+    ctx.beginPath(); ctx.arc(0, 0, 26, 0, 7);
+    ctx.fillStyle = def.color; ctx.fill();
+    ctx.strokeStyle = "#1a4a9e"; ctx.lineWidth = 4; ctx.stroke();
+    // 轮槽
+    ctx.beginPath(); ctx.arc(0, 0, 18, 0, 7);
+    ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, 5, 0, 7);
+    ctx.fillStyle = "#fff"; ctx.fill();
+  } else if (p.type === "moving") {
+    // 轮子
+    ctx.beginPath(); ctx.arc(0, -4, 24, 0, 7);
+    ctx.fillStyle = def.color; ctx.fill();
+    ctx.strokeStyle = "#1e7a34"; ctx.lineWidth = 4; ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, -4, 16, 0, 7);
+    ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, -4, 5, 0, 7);
+    ctx.fillStyle = "#fff"; ctx.fill();
+    // 下方挂钩
+    ctx.strokeStyle = "#607d8b"; ctx.lineWidth = 5; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(0, 20); ctx.lineTo(0, 30); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 34, 7, -Math.PI / 2, Math.PI * 0.9); ctx.stroke();
+  } else if (p.type === "ramp") {
+    // 直角三角形斜面
+    ctx.beginPath();
+    ctx.moveTo(-52, 26); ctx.lineTo(52, 26); ctx.lineTo(52, -34); ctx.closePath();
+    const g = ctx.createLinearGradient(-52, 26, 52, -34);
+    g.addColorStop(0, "#b08ae0"); g.addColorStop(1, def.color);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = "#6d429e"; ctx.lineWidth = 3; ctx.stroke();
+    // 坡面台阶纹
+    ctx.strokeStyle = "rgba(255,255,255,0.45)"; ctx.lineWidth = 2;
+    for (let i = 1; i <= 3; i++) {
+      const t = i / 4;
+      ctx.beginPath();
+      ctx.moveTo(-52 + 104 * t, 26);
+      ctx.lineTo(-52 + 104 * t, 26 - 60 * (1 - t));
+      ctx.stroke();
+    }
+  } else if (p.type === "wheel") {
+    // 轮胎
+    ctx.beginPath(); ctx.arc(0, 0, 28, 0, 7);
+    ctx.fillStyle = "#455a64"; ctx.fill();
+    ctx.beginPath(); ctx.arc(0, 0, 20, 0, 7);
+    ctx.fillStyle = def.color; ctx.fill();
+    // 轮辐
+    ctx.strokeStyle = "rgba(255,255,255,0.75)"; ctx.lineWidth = 4; ctx.lineCap = "round";
+    for (let i = 0; i < 4; i++) {
+      const a = i * Math.PI / 4;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * 6, Math.sin(a) * 6);
+      ctx.lineTo(Math.cos(a) * 17, Math.sin(a) * 17);
+      ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(0, 0, 6, 0, 7);
+    ctx.fillStyle = "#fff"; ctx.fill();
+  }
+  // 增益徽章
+  ctx.beginPath(); ctx.arc(30, -36, 15, 0, 7);
+  ctx.fillStyle = def.gain > 1 ? "#ffd54a" : "#cfd8dc"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.2)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#5a3d00";
+  ctx.font = "bold 15px 'PingFang SC', sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("×" + def.gain, 30, -35);
+  // 名字
+  ctx.fillStyle = labelColor || "rgba(30,50,80,0.85)";
+  ctx.font = "bold 15px 'PingFang SC', sans-serif";
+  ctx.fillText(def.name, 0, 48);
+  ctx.restore();
+}
+
+function drawRopes(cluster) {
+  // 零件之间的绳子/连杆
+  for (const [a, b] of edgePairs()) {
+    const ropey = (!a.isStone && (a.type === "fixed" || a.type === "moving")) ||
+                  (b.type === "fixed" || b.type === "moving");
+    ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+    ctx.strokeStyle = ropey ? "#c9a86a" : "#90a4ae";
+    ctx.lineWidth = ropey ? 5 : 8;
+    ctx.stroke();
+    if (ropey) {
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+      ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+  // 小孩的手 → 机械组合 → 用力的绳子
+  if (cluster.length) {
+    const gy = groundY();
+    const hand = { x: kidX + 24, y: gy - 70 };
+    const chain = [...cluster].sort((p, q) => p.x - q.x);
+    ctx.save();
+    ctx.strokeStyle = "#c9a86a"; ctx.lineWidth = 5; ctx.lineCap = "round";
+    if (state === "lifting" || state === "sliding") {
+      ctx.setLineDash([12, 9]);
+      ctx.lineDashOffset = -animT * 120;
+    }
+    ctx.beginPath();
+    ctx.moveTo(hand.x, hand.y);
+    for (const p of chain) ctx.lineTo(p.x, p.y);
+    ctx.lineTo(stone.x, stone.y - 10);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawForcePanel(gain) {
+  // 把不可见的力气算式画出来
+  const lv = LEVELS[levelIdx];
+  const total = lv.strength * gain;
+  const ok = total >= STONE_KG;
+  const pw = 250, px = W - pw - 14, py = 58;
+  ctx.fillStyle = "rgba(255,255,255,0.88)";
+  roundRect(px, py, pw, 78, 16, true);
+  ctx.strokeStyle = ok ? "#2fbf4a" : "#ff9800"; ctx.lineWidth = 3;
+  roundRect(px, py, pw, 78, 16, false); ctx.stroke();
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#345";
+  ctx.font = "bold 16px 'PingFang SC', sans-serif";
+  ctx.fillText(`${lv.strength}kg × 增益 ×${gain} = ${total}kg`, px + pw / 2, py + 22);
+  // 力气进度条：总力气 vs 石头重量
+  const bx = px + 18, bw = pw - 36, by = py + 44;
+  ctx.fillStyle = "rgba(0,0,0,0.12)";
+  roundRect(bx, by, bw, 16, 8, true);
+  const frac = Math.min(1, total / STONE_KG);
+  ctx.fillStyle = ok ? "#2fbf4a" : "#ff9800";
+  if (frac > 0.02) roundRect(bx + 2, by + 2, (bw - 4) * frac, 12, 6, true);
+  ctx.fillStyle = ok ? "#1e7a34" : "#b26a00";
+  ctx.font = "bold 13px 'PingFang SC', sans-serif";
+  ctx.fillText(ok ? "✅ 够力气抬起来！" : `目标：${STONE_KG}kg 石头`, px + pw / 2, by + 26);
+}
+
+function drawSelection() {
+  if (!selected || !parts.includes(selected) || state !== "build") return;
+  const p = selected;
+  // 选中虚线圈
+  ctx.save();
+  ctx.setLineDash([8, 7]);
+  ctx.strokeStyle = "#2f7fe9"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(p.x, p.y, PART_DEF[p.type].hit - 4, 0, 7); ctx.stroke();
+  ctx.restore();
+  // 红色 ✕ 删除手柄
+  const h = deleteHandlePos(p);
+  ctx.beginPath(); ctx.arc(h.x, h.y, 17, 0, 7);
+  ctx.fillStyle = "#ff5252"; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 4; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(h.x - 6, h.y - 6); ctx.lineTo(h.x + 6, h.y + 6);
+  ctx.moveTo(h.x + 6, h.y - 6); ctx.lineTo(h.x - 6, h.y + 6);
+  ctx.stroke();
+}
+
+function drawSnapPreview() {
+  if (!drag || drag.overPal) return;
+  const p = drag.part;
+  let near = null, nd = SNAP_DIST;
+  const anchor = { x: stone.x, y: stone.y - 10 };
+  const da = Math.hypot(p.x - anchor.x, p.y - anchor.y);
+  if (da < nd) { near = anchor; nd = da; }
+  for (const q of parts) {
+    if (q === p) continue;
+    const d = Math.hypot(p.x - q.x, p.y - q.y);
+    if (d < nd) { near = q; nd = d; }
+  }
+  if (near) {
+    ctx.save();
+    ctx.setLineDash([10, 8]);
+    ctx.strokeStyle = "rgba(47,191,74,0.9)"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(near.x, near.y, 56, 0, 7); ctx.stroke();
+    ctx.beginPath(); ctx.arc(p.x, p.y, PART_DEF[p.type].hit, 0, 7); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawPalette() {
+  const over = drag && drag.overPal && !drag.fromPalette;
+  ctx.fillStyle = over ? "rgba(46,80,130,0.95)" : "rgba(30,50,86,0.92)";
+  roundRect(8, 8, PALETTE_W - 16, H - 16, 20, true);
+  ctx.fillStyle = "#ffd54a";
+  ctx.font = "bold 19px 'PingFang SC', sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("零件箱", PALETTE_W / 2, 40);
+  ctx.font = "13px 'PingFang SC', sans-serif";
+  ctx.fillStyle = over ? "#ffe082" : "rgba(255,255,255,0.65)";
+  ctx.fillText(over ? "松手放回" : "拖我出去→", PALETTE_W / 2, 66);
+  for (let i = 0; i < PALETTE_ITEMS.length; i++) {
+    const t = PALETTE_ITEMS[i], pos = palettePos(i);
+    drawPart({ type: t, x: pos.x, y: pos.y }, 0.62, 0, "#ffffff");
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const { gain, cluster } = computeGain();
+  drawBackground();
+  drawPlatform();
+  drawRopes(cluster);
+  // 测试时组合里的零件上下抖动
+  const bob = (state === "lifting" || state === "sliding") ? Math.sin(animT * 10) * 3 : 0;
+  for (const p of parts) drawPart(p, 1, cluster.includes(p) ? bob : 0);
+  drawStone();
+  drawKid();
+  drawSnapPreview();
+  drawSelection();
+  drawSparks();
+  drawForcePanel(gain);
+  drawPalette();
+  if (gain !== lastGain) { lastGain = gain; updateScore(gain); }
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+let prevEdgeCount = 0;
+function step(dt) {
+  updateTest(dt);
+  updateSparks(dt);
+  // 新连接成立时「咔哒」一声
+  const ec = edgePairs().length;
+  if (ec > prevEdgeCount && state === "build") snapSound();
+  prevEdgeCount = ec;
+}
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  step(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+const snapSound = () => { tone(320, 0.06, 0.12, "square"); tone(640, 0.08, 0.08, "square"); };
+const bonk = () => tone(140, 0.25, 0.14, "triangle");
+const rumble = () => tone(90 + Math.random() * 30, 0.1, 0.05, "sawtooth");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+function bigFanfare() { [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => setTimeout(() => pop(f), i * 150)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3200);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+resize();
+resetLevel();
+requestAnimationFrame(loop);
+
+// 暴露给自动化测试
+window.__test = {
+  parts, stone, LEVELS, PART_DEF,
+  addPart: (t, x, y) => { const p = { type: t, x, y }; parts.push(p); return p; },
+  computeGain, startTest, step, resetLevel,
+  getState: () => state,
+  setLevel: i => { levelIdx = i; layoutScene(); resetLevel(); }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

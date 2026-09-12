@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>抛体运动炮台</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#0e1a2e; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,20,40,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,20,40,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  #toolbar {
+    position:absolute; top:12px; right:12px; z-index:10;
+    display:flex; gap:8px;
+  }
+  #toolbar button {
+    font-size:15px; font-weight:bold; padding:8px 14px;
+    border-radius:20px; border:2px solid rgba(255,255,255,0.25);
+    background:rgba(10,20,40,0.85); color:#cfd8e8; cursor:pointer;
+  }
+  #toolbar button.on { background:#ffd54a; color:#4a3500; border-color:#ffd54a; }
+  #fireBtn {
+    position:absolute; top:70px; right:24px; z-index:10;
+    font-size:22px; font-weight:bold; padding:16px 34px;
+    border-radius:34px; border:none; background:#ff7043; color:#fff;
+    cursor:pointer; box-shadow:0 4px 12px rgba(0,0,0,0.45);
+  }
+  #fireBtn:active { transform:scale(1.07); }
+  #fireBtn:disabled { opacity:0.35; }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:38px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar"></div>
+<div id="toolbar">
+  <button id="earthBtn" class="on">🌍 地球</button>
+  <button id="moonBtn">🌙 月球</button>
+</div>
+<button id="fireBtn">发射！</button>
+<div id="hint">拖动炮管调角度，拖动黄色滑杆调初速度，点「发射」命中靶子！</div>
+<div id="winPanel">
+  <div class="msg">🎯 三关全部命中！<br>你是抛体运动大师！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const fireBtn = document.getElementById("fireBtn");
+const earthBtn = document.getElementById("earthBtn");
+const moonBtn = document.getElementById("moonBtn");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 场景与视图 ================= */
+// 世界坐标：单位米，地面 y=0，原点在左侧炮台下方
+const WORLD_W = 1500, WORLD_H = 620;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / WORLD_W, H / WORLD_H);
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, WORLD_H - (sy - view.oy) / view.s]; }
+function toScreen(wx, wy) { return [view.ox + wx * view.s, view.oy + (WORLD_H - wy) * view.s]; }
+// 世界 y 向上；渲染时垂直翻转
+function applyWorldTransform() {
+  ctx.translate(view.ox, view.oy + WORLD_H * view.s);
+  ctx.scale(view.s, -view.s);
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+const PIVOT = { x:80, y:70 };          // 炮管转轴
+const BARREL_LEN = 95;                 // 炮管长度（炮弹从炮口射出）
+const MIN_ANG = 10 * Math.PI / 180, MAX_ANG = 80 * Math.PI / 180;
+const V_MIN = 20, V_MAX = 120;         // 初速度范围 m/s
+const TARGET_R = 32;
+const PLANETS = {
+  earth: { g:9.8,  name:"🌍 地球 g=9.8 m/s²" },
+  moon:  { g:1.62, name:"🌙 月球 g=1.62 m/s²" }
+};
+const LEVELS = [
+  { x:560,  y:0,   label:"近处靶" },
+  { x:880,  y:170, label:"高台靶" },
+  { x:1180, y:0,   label:"远处靶" }
+];
+
+let planet = "earth";
+let G = PLANETS.earth.g;
+let levelIdx = 0;
+let hits = 0;
+let angle = 45 * Math.PI / 180;   // 炮管角度
+let power = 0.55;                 // 0..1 蓄力
+let ball = null;                  // {x,y,vx,vy,t,trail:[],offT}
+let landed = null;                // {range, T, Hmax} 上一次实际结果
+let state = "aim";                // aim | flying
+let confetti = [];
+let targetPulse = 0;
+
+function muzzle(a) {
+  return { x:PIVOT.x + Math.cos(a) * BARREL_LEN, y:PIVOT.y + Math.sin(a) * BARREL_LEN };
+}
+function aimV0() { return V_MIN + power * (V_MAX - V_MIN); }
+function target() { return LEVELS[levelIdx]; }
+
+function resetGame() {
+  levelIdx = 0; hits = 0;
+  ball = null; landed = null; confetti = [];
+  state = "aim";
+  winPanel.style.display = "none";
+  updateScore(); updateFireBtn();
+}
+function updateScore() {
+  scorebar.textContent = `第 ${Math.min(levelIdx + 1, LEVELS.length)} / ${LEVELS.length} 关 · ${PLANETS[planet].name} · 已命中 ${hits}`;
+}
+function updateFireBtn() { fireBtn.disabled = (state !== "aim"); }
+
+/* ================= 物理 ================= */
+// 解析预测：从炮口以 v0、角度 a 发射，落到地面 y=0
+function predict(a, v0) {
+  const m = muzzle(a);
+  const vx = v0 * Math.cos(a), vy = v0 * Math.sin(a);
+  const T = (vy + Math.sqrt(vy * vy + 2 * G * m.y)) / G;   // 总飞行时间
+  const R = vx * T;                                        // 水平射程（从炮口算起）
+  const Hmax = m.y + vy * vy / (2 * G);                    // 最高点
+  return { m, vx, vy, T, R, Hmax };
+}
+
+function fire() {
+  if (state !== "aim") return;
+  const p = predict(angle, aimV0());
+  ball = { x:p.m.x, y:p.m.y, vx:p.vx, vy:p.vy, t:0, trail:[], offT:0 };
+  landed = null;
+  state = "flying";
+  updateFireBtn();
+  whoosh(power);
+  hintEl.style.opacity = "0";
+}
+
+function physics(dt) {
+  if (state === "flying" && ball) {
+    // 飞出视野后自动加速，避免月球上久等
+    const spd = (ball.x > WORLD_W || ball.y > WORLD_H) ? 6 : 1;
+    const sdt = dt * spd;
+    ball.t += sdt;
+    ball.vy -= G * sdt;               // 竖直方向：匀加速
+    // vx 不变：水平匀速
+    ball.x += ball.vx * sdt;
+    ball.y += ball.vy * sdt;
+    if (ball.trail.length === 0 || Math.hypot(ball.x - ball.trail[ball.trail.length-1][0], ball.y - ball.trail[ball.trail.length-1][1]) > 14) {
+      ball.trail.push([ball.x, ball.y]);
+      if (ball.trail.length > 400) ball.trail.shift();
+    }
+    const tg = target();
+    // 命中判定
+    if (Math.hypot(ball.x - tg.x, ball.y - (tg.y + TARGET_R)) < TARGET_R + 10) {
+      onHit();
+      return;
+    }
+    // 落地判定（未命中）
+    if (ball.y <= 0 && ball.vy < 0) {
+      ball.y = 0;
+      const m = muzzle(angle);
+      landed = { range:ball.x - m.x, T:ball.t };
+      onMiss(ball.x);
+      ball = null;
+      state = "aim";
+      updateFireBtn();
+    }
+  }
+  // 庆祝彩纸
+  for (const c of confetti) {
+    c.vy -= 500 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += c.vr * dt; c.life -= dt;
+  }
+  confetti = confetti.filter(c => c.life > 0 && c.y > -30);
+}
+
+function onHit() {
+  const tg = target();
+  hits++;
+  spawnConfetti(tg.x, tg.y + TARGET_R);
+  fanfare();
+  ball = null;
+  landed = null;
+  levelIdx++;
+  state = "aim";
+  if (levelIdx >= LEVELS.length) {
+    updateScore(); updateFireBtn();
+    setTimeout(() => { winPanel.style.display = "flex"; fanfare(); }, 1000);
+  } else {
+    showHint(`🎯 命中！下一关：${target().label}`);
+    updateScore(); updateFireBtn();
+  }
+}
+function onMiss(x) {
+  const tg = target();
+  const d = x - tg.x;
+  if (Math.abs(d) < 90) showHint(d > 0 ? "差一点点！稍微飞过头了，减点速度或压低点角度" : "差一点点！再加点速度或抬高角度");
+  else if (d > 0) showHint("飞过靶子了：减小初速度，或降低角度");
+  else showHint("没飞到靶子：加大初速度，或试试 45° 附近的角度");
+  thud();
+}
+
+/* ================= 交互 ================= */
+// 蓄力滑杆（世界坐标：炮右侧竖直轨道）
+const SLIDER = { x:230, y0:35, y1:225 };
+function sliderY() { return SLIDER.y0 + power * (SLIDER.y1 - SLIDER.y0); }
+let dragMode = null;   // "angle" | "power"
+
+function distToBarrel(wx, wy) {
+  // 点到炮管线段的最短距离
+  const ex = PIVOT.x + Math.cos(angle) * BARREL_LEN, ey = PIVOT.y + Math.sin(angle) * BARREL_LEN;
+  const dx = ex - PIVOT.x, dy = ey - PIVOT.y;
+  const len2 = dx * dx + dy * dy;
+  let t = ((wx - PIVOT.x) * dx + (wy - PIVOT.y) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(wx - (PIVOT.x + dx * t), wy - (PIVOT.y + dy * t));
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (state !== "aim" || winPanel.style.display === "flex") return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  if (Math.hypot(wx - SLIDER.x, wy - sliderY()) < 40 ||
+      (Math.abs(wx - SLIDER.x) < 30 && wy > SLIDER.y0 - 20 && wy < SLIDER.y1 + 20)) {
+    dragMode = "power";
+    setPowerFromY(wy);
+  } else if (distToBarrel(wx, wy) < 55 || Math.hypot(wx - PIVOT.x, wy - PIVOT.y) < 130) {
+    dragMode = "angle";
+    setAngleFromPoint(wx, wy);
+  } else {
+    // 点在别处：把炮管转过去，方便直接拖
+    dragMode = "angle";
+    setAngleFromPoint(wx, wy);
+  }
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragMode) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  if (dragMode === "power") setPowerFromY(wy);
+  else setAngleFromPoint(wx, wy);
+});
+window.addEventListener("pointerup", () => { dragMode = null; });
+
+function setAngleFromPoint(wx, wy) {
+  let a = Math.atan2(wy - PIVOT.y, wx - PIVOT.x);
+  angle = Math.max(MIN_ANG, Math.min(MAX_ANG, a));
+  blip();
+}
+function setPowerFromY(wy) {
+  power = Math.max(0, Math.min(1, (wy - SLIDER.y0) / (SLIDER.y1 - SLIDER.y0)));
+  blip();
+}
+let lastBlip = 0;
+function blip() {
+  const n = performance.now();
+  if (n - lastBlip > 90) { lastBlip = n; pop(500 + power * 500, 0.03, 0.05); }
+}
+fireBtn.addEventListener("click", fire);
+earthBtn.addEventListener("click", () => setPlanet("earth"));
+moonBtn.addEventListener("click", () => setPlanet("moon"));
+function setPlanet(p) {
+  if (planet === p) return;
+  planet = p; G = PLANETS[p].g;
+  earthBtn.classList.toggle("on", p === "earth");
+  moonBtn.classList.toggle("on", p === "moon");
+  updateScore();
+  pop(p === "moon" ? 660 : 440);
+  showHint(p === "moon" ? "🌙 月球重力只有地球的 1/6：同样的速度飞得又高又远！" : "🌍 回到地球：g = 9.8 m/s²");
+}
+
+/* ================= 绘制 ================= */
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  if (planet === "earth") { g.addColorStop(0, "#1b3a6b"); g.addColorStop(0.7, "#4a7dbd"); g.addColorStop(1, "#7fa8d9"); }
+  else { g.addColorStop(0, "#05060e"); g.addColorStop(1, "#1a1c2e"); }
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  if (planet === "moon") {
+    // 星星
+    ctx.fillStyle = "rgba(255,255,255,0.7)";
+    for (let i = 0; i < 60; i++) {
+      const sx = (i * 197.3) % W, sy = (i * 89.7) % (H * 0.6);
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+    // 远处的地球
+    const [ex, ey] = toScreen(1250, 480);
+    ctx.beginPath(); ctx.arc(ex, ey, 26, 0, 7);
+    ctx.fillStyle = "#3a6fd8"; ctx.fill();
+    ctx.fillStyle = "#4a9e5c";
+    ctx.beginPath(); ctx.arc(ex - 7, ey - 5, 8, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(ex + 8, ey + 7, 6, 0, 7); ctx.fill();
+  } else {
+    // 太阳与云
+    const [sx, sy] = toScreen(1280, 500);
+    ctx.beginPath(); ctx.arc(sx, sy, 34, 0, 7);
+    ctx.fillStyle = "#ffd54a"; ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    for (const [cx, cy, r] of [[420,520,26],[455,528,20],[390,528,18],[900,545,22],[930,552,16]]) {
+      const [px, py] = toScreen(cx, cy);
+      ctx.beginPath(); ctx.arc(px, py, r, 0, 7); ctx.fill();
+    }
+  }
+}
+
+function drawGround() {
+  ctx.save();
+  applyWorldTransform();
+  // 地面
+  const g = ctx.createLinearGradient(0, 0, 0, -160);
+  if (planet === "earth") { g.addColorStop(0, "#4a7c3a"); g.addColorStop(1, "#33552a"); }
+  else { g.addColorStop(0, "#8a8a92"); g.addColorStop(1, "#5a5a62"); }
+  ctx.fillStyle = g;
+  ctx.fillRect(-400, -400, WORLD_W + 800, 400);
+  ctx.fillStyle = planet === "earth" ? "#5c9049" : "#9a9aa2";
+  ctx.fillRect(-400, -6, WORLD_W + 800, 6);
+  // 距离刻度（每 100 m）
+  ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 2;
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  ctx.save();
+  ctx.scale(1, -1);
+  ctx.font = "22px sans-serif"; ctx.textAlign = "center";
+  for (let x = 200; x <= WORLD_W - 50; x += 200) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 12); ctx.stroke();
+    ctx.fillText(x + " m", x, 34);
+  }
+  ctx.restore();
+  ctx.restore();
+}
+
+function drawCannon() {
+  ctx.save();
+  applyWorldTransform();
+  // 底座
+  ctx.fillStyle = "#4d463f";
+  ctx.beginPath(); ctx.arc(PIVOT.x, 30, 46, 0, 7); ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 4; ctx.stroke();
+  // 轮子
+  ctx.fillStyle = "#2e2a26";
+  ctx.beginPath(); ctx.arc(PIVOT.x - 28, 14, 16, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(PIVOT.x + 28, 14, 16, 0, 7); ctx.fill();
+  // 炮管
+  ctx.save();
+  ctx.translate(PIVOT.x, PIVOT.y);
+  ctx.rotate(angle);
+  const bg = ctx.createLinearGradient(0, -17, 0, 17);
+  bg.addColorStop(0, "#7a8288"); bg.addColorStop(0.5, "#4a5158"); bg.addColorStop(1, "#2c3136");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, -15, BARREL_LEN, 30);
+  ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 3;
+  ctx.strokeRect(0, -15, BARREL_LEN, 30);
+  // 炮口
+  ctx.fillStyle = "#1c2024";
+  ctx.fillRect(BARREL_LEN - 10, -18, 12, 36);
+  ctx.restore();
+  // 转轴盖
+  ctx.beginPath(); ctx.arc(PIVOT.x, PIVOT.y, 20, 0, 7);
+  ctx.fillStyle = "#8a6d3b"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 3; ctx.stroke();
+
+  // 蓄力滑杆
+  ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 10;
+  ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(SLIDER.x, SLIDER.y0); ctx.lineTo(SLIDER.x, SLIDER.y1); ctx.stroke();
+  ctx.strokeStyle = "#ffb800"; ctx.lineWidth = 10;
+  ctx.beginPath(); ctx.moveTo(SLIDER.x, SLIDER.y0); ctx.lineTo(SLIDER.x, sliderY()); ctx.stroke();
+  ctx.beginPath(); ctx.arc(SLIDER.x, sliderY(), 18, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 3; ctx.stroke();
+  // 滑杆标签
+  ctx.save();
+  ctx.scale(1, -1);
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.font = "bold 24px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("初速度", SLIDER.x, -(SLIDER.y1 + 40));
+  ctx.fillText(aimV0().toFixed(0) + " m/s", SLIDER.x, -(SLIDER.y0 - 34));
+  ctx.restore();
+  ctx.restore();
+}
+
+function drawTarget() {
+  const tg = target();
+  targetPulse += 0.05;
+  ctx.save();
+  applyWorldTransform();
+  // 高台
+  if (tg.y > 0) {
+    ctx.fillStyle = planet === "earth" ? "#6b5a44" : "#6a6a72";
+    ctx.fillRect(tg.x - 55, 0, 110, tg.y);
+    ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 3;
+    ctx.strokeRect(tg.x - 55, 0, 110, tg.y);
+  } else {
+    // 旗杆
+    ctx.strokeStyle = "#c9c9c9"; ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(tg.x, 0); ctx.lineTo(tg.x, TARGET_R); ctx.stroke();
+  }
+  // 靶盘
+  const cy = tg.y + TARGET_R;
+  const rings = [["#e93b3b", TARGET_R], ["#ffffff", TARGET_R * 0.72], ["#e93b3b", TARGET_R * 0.45], ["#ffd54a", TARGET_R * 0.2]];
+  for (const [c, r] of rings) {
+    ctx.beginPath(); ctx.arc(tg.x, cy, r, 0, 7);
+    ctx.fillStyle = c; ctx.fill();
+  }
+  // 呼吸光环提示
+  const pr = TARGET_R + 8 + Math.sin(targetPulse) * 5;
+  ctx.beginPath(); ctx.arc(tg.x, cy, pr, 0, 7);
+  ctx.strokeStyle = "rgba(255,213,74,0.55)"; ctx.lineWidth = 4; ctx.stroke();
+  ctx.restore();
+}
+
+function drawPrediction() {
+  if (state !== "aim") return;
+  const v0 = aimV0();
+  const p = predict(angle, v0);
+  // 虚线轨迹（解析曲线采样）
+  ctx.save();
+  applyWorldTransform();
+  ctx.setLineDash([12, 12]);
+  ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 3.5;
+  ctx.beginPath();
+  const steps = 70;
+  let started = false;
+  for (let i = 0; i <= steps; i++) {
+    const t = p.T * i / steps;
+    const x = p.m.x + p.vx * t;
+    const y = p.m.y + p.vy * t - 0.5 * G * t * t;
+    if (y < 0) break;
+    if (!started) { ctx.moveTo(x, y); started = true; }
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+  // 落点标记
+  ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 3;
+  const lx = p.m.x + p.R;
+  ctx.beginPath(); ctx.moveTo(lx - 14, 0); ctx.lineTo(lx + 14, 0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(lx, -10); ctx.lineTo(lx, 16); ctx.stroke();
+  ctx.restore();
+}
+
+function drawBall() {
+  if (!ball) return;
+  ctx.save();
+  applyWorldTransform();
+  // 飞行轨迹
+  if (ball.trail.length > 1) {
+    ctx.strokeStyle = "rgba(255,213,74,0.55)"; ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(ball.trail[0][0], ball.trail[0][1]);
+    for (const [x, y] of ball.trail) ctx.lineTo(x, y);
+    ctx.stroke();
+  }
+  // 炮弹
+  ctx.beginPath(); ctx.arc(ball.x, ball.y, 12, 0, 7);
+  const g = ctx.createRadialGradient(ball.x - 4, ball.y + 4, 2, ball.x, ball.y, 12);
+  g.addColorStop(0, "#8a929a"); g.addColorStop(1, "#22262b");
+  ctx.fillStyle = g; ctx.fill();
+  // 速度矢量分解：vx（绿，水平不变）+ vy（橙，竖直变化）
+  drawVector(ball.x, ball.y, ball.vx, 0, "#2fd65a", "vx");
+  drawVector(ball.x, ball.y, 0, ball.vy, "#ff9d2e", "vy");
+  drawVector(ball.x, ball.y, ball.vx, ball.vy, "rgba(255,255,255,0.9)", "v");
+  ctx.restore();
+}
+
+const V_SCALE = 1.1;   // 矢量箭头：世界单位 / (m/s)
+function drawVector(x, y, vx, vy, color, label) {
+  const len = Math.hypot(vx, vy);
+  if (len < 3) return;
+  const ex = x + vx * V_SCALE, ey = y + vy * V_SCALE;
+  ctx.strokeStyle = color; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(ex, ey); ctx.stroke();
+  // 箭头
+  const a = Math.atan2(vy, vx);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(ex + Math.cos(a) * 14, ey + Math.sin(a) * 14);
+  ctx.lineTo(ex + Math.cos(a + 2.5) * 10, ey + Math.sin(a + 2.5) * 10);
+  ctx.lineTo(ex + Math.cos(a - 2.5) * 10, ey + Math.sin(a - 2.5) * 10);
+  ctx.closePath(); ctx.fill();
+  // 标签
+  ctx.save();
+  ctx.translate(ex + Math.cos(a) * 30, ey + Math.sin(a) * 30);
+  ctx.scale(1, -1);
+  ctx.font = "bold 24px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(label, 0, 0);
+  ctx.restore();
+}
+
+function drawConfetti() {
+  ctx.save();
+  applyWorldTransform();
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.max(0, Math.min(1, c.life));
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-6, -4, 12, 8);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+function spawnConfetti(x, y) {
+  const colors = ["#ffd54a", "#ff7043", "#2fd65a", "#42a5f5", "#ec407a"];
+  for (let i = 0; i < 60; i++) {
+    const a = Math.random() * Math.PI;
+    const sp = 150 + Math.random() * 350;
+    confetti.push({
+      x, y, vx:Math.cos(a) * sp, vy:Math.sin(a) * sp + 200,
+      rot:Math.random() * 6, vr:(Math.random() - 0.5) * 12,
+      life:1.6 + Math.random(), color:colors[i % colors.length]
+    });
+  }
+}
+
+// 屏幕空间数据面板
+function drawPanel() {
+  const v0 = aimV0();
+  const p = predict(angle, v0);
+  const lines = [];
+  lines.push(`角度 θ = ${(angle * 180 / Math.PI).toFixed(0)}°    初速度 v₀ = ${v0.toFixed(0)} m/s`);
+  if (state === "flying" && ball) {
+    lines.push(`t = ${ball.t.toFixed(1)} s    高度 y = ${Math.max(0, ball.y).toFixed(0)} m`);
+    lines.push(`vx = ${ball.vx.toFixed(1)} m/s（水平匀速，不变）`);
+    lines.push(`vy = ${ball.vy.toFixed(1)} m/s（竖直方向，受 g 变化）`);
+  } else if (landed) {
+    lines.push(`上次：射程 ${landed.range.toFixed(0)} m · 飞行 ${landed.T.toFixed(1)} s`);
+  } else {
+    lines.push(`预测：最高点 ${p.Hmax.toFixed(0)} m`);
+    lines.push(`预测：射程 ${p.R.toFixed(0)} m · 飞行时间 ${p.T.toFixed(1)} s`);
+  }
+  lines.push(`目标：${target().label}（${target().x} m 处）`);
+
+  ctx.save();
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.font = "14px 'PingFang SC','Microsoft YaHei',monospace";
+  let wMax = 0;
+  for (const l of lines) wMax = Math.max(wMax, ctx.measureText(l).width);
+  const pw = wMax + 28, ph = lines.length * 21 + 20;
+  const px = 12, py = 12;
+  ctx.fillStyle = "rgba(10,20,40,0.72)";
+  ctx.beginPath();
+  ctx.roundRect(px, py, pw, ph, 12);
+  ctx.fill();
+  ctx.fillStyle = "#e8eef8";
+  ctx.textAlign = "left";
+  lines.forEach((l, i) => ctx.fillText(l, px + 14, py + 24 + i * 21));
+  ctx.restore();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawSky();
+  drawGround();
+  drawPrediction();
+  drawTarget();
+  drawCannon();
+  drawBall();
+  drawConfetti();
+  drawPanel();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+resetGame();
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = (f, d, v) => tone(f, d || 0.15, v || 0.12);
+const whoosh = p => tone(200 + 400 * p, 0.25, 0.12, "triangle");
+const thud = () => tone(90, 0.18, 0.16, "square");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

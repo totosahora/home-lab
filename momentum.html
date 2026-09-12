@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>动量守恒实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#101826; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,20,35,0.85); color:#7dffb0; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; border:2px solid rgba(125,255,176,0.35);
+  }
+  #scorebar.warn { color:#ffcf6e; border-color:rgba(255,207,110,0.45); }
+  #hint {
+    position:absolute; bottom:118px; left:50%; transform:translateX(-50%);
+    background:rgba(10,20,35,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:94vw;
+  }
+  #toolbar {
+    position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+    display:flex; flex-wrap:wrap; justify-content:center; align-items:center; gap:8px;
+    z-index:10; max-width:96vw;
+  }
+  #toolbar .grp {
+    display:flex; align-items:center; gap:4px;
+    background:rgba(10,20,35,0.8); border-radius:20px; padding:5px 10px;
+    color:#cfe0f5; font-size:14px; white-space:nowrap;
+  }
+  #toolbar button {
+    font-family:inherit; font-size:14px; font-weight:bold; cursor:pointer;
+    border:none; border-radius:16px; padding:5px 12px;
+    background:#2a3a52; color:#cfe0f5;
+  }
+  #toolbar button.on { background:#3a86d8; color:#fff; }
+  #toolbar button.onA { background:#3a86d8; color:#fff; }
+  #toolbar button.onB { background:#ef7d1a; color:#fff; }
+  #toolbar button.slowOn { background:#9b3de0; color:#fff; }
+  #toolbar button:active { transform:scale(1.08); }
+  .lblA { color:#7fb2ff; font-weight:bold; }
+  .lblB { color:#ffb066; font-weight:bold; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">系统总动量 p = 0 kg·m/s</div>
+<div id="hint">拖动滑块上方的箭头设置初速度（左右拖），直接拖动滑块可以改变位置！</div>
+<div id="toolbar">
+  <span class="grp"><span class="lblA">A 质量</span>
+    <button data-cart="0" data-m="1">1kg</button><button data-cart="0" data-m="2" class="onA">2kg</button><button data-cart="0" data-m="3">3kg</button>
+  </span>
+  <span class="grp">碰撞模式
+    <button id="modeElastic" class="on">弹性（弹开）</button><button id="modeSticky">完全非弹性（粘住）</button>
+  </span>
+  <span class="grp"><span class="lblB">B 质量</span>
+    <button data-cart="1" data-m="1" class="onB">1kg</button><button data-cart="1" data-m="2">2kg</button><button data-cart="1" data-m="3">3kg</button>
+  </span>
+  <span class="grp"><button id="slowBtn">🐢 慢放</button><button id="resetBtn">↺ 复位</button></span>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 导轨与视图 ================= */
+// 世界坐标：气垫导轨长 10 米，滑块在 x ∈ [0.4, 9.6] 内运动，无摩擦
+const TRACK = { x0: 0.4, x1: 9.6 };
+const V_MAX = 5;              // 可设置的最大速度 m/s
+const V_ARROW = 30;           // 速度箭头比例 px / (m/s)
+const view = { s: 1, ox: 0 }; // 世界→屏幕：sx = ox + x*s
+let trackY = 0;               // 导轨面的屏幕 y
+function fitView() {
+  view.s = (W - 120) / 10;
+  view.ox = 60;
+  trackY = Math.round(H * 0.40);
+}
+function sx(x) { return view.ox + x * view.s; }
+function toWorldX(px) { return (px - view.ox) / view.s; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 场景数据 ================= */
+// 两个滑块：x 单位米，v 单位 m/s，m 单位 kg
+const carts = [
+  { name:"A", color:"#3a86d8", light:"#7fb2ff", m:2, x:2.2, v:3 },
+  { name:"B", color:"#ef7d1a", light:"#ffb066", m:1, x:6.5, v:0 }
+];
+const CART_H = 54;            // 滑块高度 px
+function cartW(c) { return (0.42 + 0.16 * c.m) * view.s; }  // 质量越大块头越大
+let mode = "elastic";         // elastic | sticky
+let stuck = false;            // 完全非弹性碰撞后粘在一起
+let timeScale = 1;            // 慢放系数
+
+// 守恒观察基线
+let external = false;         // 是否受过外力（撞挡板）
+let collidedOnce = false;     // 本次基线内是否已碰撞
+let keGhost = 0;              // 碰撞前的总动能（幽灵刻度）
+let keScale = 1;              // 动能条满刻度
+let heatLoss = 0;             // 碰撞损失的动能（变热）
+let lastCollision = null;     // {pB, pA, keB, keA}
+let particles = [];           // 火花/热浪粒子
+
+function totalP() { return carts[0].m * carts[0].v + carts[1].m * carts[1].v; }
+function totalKE() { return 0.5 * carts[0].m * carts[0].v * carts[0].v + 0.5 * carts[1].m * carts[1].v * carts[1].v; }
+function rebaseline() {
+  external = false; collidedOnce = false;
+  keGhost = totalKE(); keScale = Math.max(0.001, keGhost);
+  heatLoss = 0; lastCollision = null;
+  updateScore();
+}
+function resetRun() {
+  carts[0].x = 2.2; carts[1].x = 6.5;
+  stuck = false; particles = [];
+  rebaseline();
+}
+function fmt(num, unit) { return (num >= 0 ? "+" : "") + num.toFixed(1) + " " + unit; }
+resetRun();
+
+/* ================= 物理 ================= */
+function physics(dt) {
+  const [a, b] = carts;
+  // 匀速直线运动（气垫导轨无摩擦）
+  for (const c of carts) c.x += c.v * dt;
+  if (stuck) {
+    // 粘在一起：保持接触、速度一致
+    const gap = ((0.42 + 0.16 * a.m) + (0.42 + 0.16 * b.m)) / 2;
+    b.x = a.x + gap;
+    b.v = a.v;
+    // 整体碰挡板
+    const hwA = (0.42 + 0.16 * a.m) / 2, hwB = (0.42 + 0.16 * b.m) / 2;
+    if (a.x - hwA < TRACK.x0) { a.x = TRACK.x0 + hwA; a.v = Math.abs(a.v); b.v = a.v; wallHit(); }
+    if (b.x + hwB > TRACK.x1) { a.x = TRACK.x1 - hwB - gap; a.v = -Math.abs(a.v); b.v = a.v; wallHit(); }
+    b.x = a.x + gap;
+    return;
+  }
+  // 挡板（弹性反弹——挡板对滑块施加外力，系统总动量会改变）
+  for (const c of carts) {
+    const hw = (0.42 + 0.16 * c.m) / 2;
+    if (c.x - hw < TRACK.x0) { c.x = TRACK.x0 + hw; c.v = Math.abs(c.v); wallHit(); }
+    if (c.x + hw > TRACK.x1) { c.x = TRACK.x1 - hw; c.v = -Math.abs(c.v); wallHit(); }
+  }
+  // 碰撞检测（A 在左、B 在右，靠近时触发）
+  const gap = ((0.42 + 0.16 * a.m) + (0.42 + 0.16 * b.m)) / 2;
+  if (b.x - a.x < gap && a.v - b.v > 0) {
+    b.x = a.x + gap;
+    collide();
+  }
+  // 粒子
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy -= 60 * dt; p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function collide() {
+  const [a, b] = carts;
+  const pB = totalP(), keB = totalKE();
+  if (mode === "elastic") {
+    // 一维弹性碰撞公式
+    const m1 = a.m, m2 = b.m, v1 = a.v, v2 = b.v;
+    a.v = ((m1 - m2) * v1 + 2 * m2 * v2) / (m1 + m2);
+    b.v = ((m2 - m1) * v2 + 2 * m1 * v1) / (m1 + m2);
+    clack(0.9);
+    spawnSparks((a.x + b.x) / 2, "#ffffff");
+  } else {
+    // 完全非弹性：共同速度 v' = p总 / (m1+m2)
+    const v = (a.m * a.v + b.m * b.v) / (a.m + b.m);
+    a.v = v; b.v = v; stuck = true;
+    thud();
+    spawnSparks((a.x + b.x) / 2, "#ff9a3c");
+  }
+  const pA = totalP(), keA = totalKE();
+  heatLoss = Math.max(0, keB - keA);
+  keGhost = keB;
+  lastCollision = { pB, pA, keB, keA };
+  if (!collidedOnce) {
+    collidedOnce = true;
+    setTimeout(fanfare, 250);
+    showHint(mode === "elastic"
+      ? "弹性碰撞：总动量不变，总动能也不变！"
+      : "完全非弹性碰撞：总动量不变，但一部分动能变成了热能！");
+  }
+}
+
+function wallHit() {
+  knock();
+  if (!external) {
+    external = true;
+    showHint("滑块撞到挡板：挡板施加了外力，系统总动量不再守恒！");
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawTrack() {
+  // 支脚
+  ctx.fillStyle = "#223048";
+  ctx.fillRect(sx(1.6) - 8, trackY + 26, 16, 40);
+  ctx.fillRect(sx(8.4) - 8, trackY + 26, 16, 40);
+  // 导轨主体（铝型材质感）
+  const g = ctx.createLinearGradient(0, trackY - 16, 0, trackY + 26);
+  g.addColorStop(0, "#c9d6e8"); g.addColorStop(0.5, "#8fa3bd"); g.addColorStop(1, "#5a6c86");
+  ctx.fillStyle = g;
+  roundRect(sx(TRACK.x0) - 30, trackY - 16, sx(TRACK.x1) - sx(TRACK.x0) + 60, 42, 8, true);
+  // 喷气小孔
+  ctx.fillStyle = "rgba(30,45,70,0.55)";
+  for (let x = TRACK.x0 + 0.25; x < TRACK.x1; x += 0.5) {
+    ctx.beginPath(); ctx.arc(sx(x), trackY - 4, 2.2, 0, 7); ctx.fill();
+  }
+  // 两端挡板（弹簧缓冲器）
+  for (const wx of [TRACK.x0, TRACK.x1]) {
+    const px = sx(wx);
+    ctx.strokeStyle = "#ffcf6e"; ctx.lineWidth = 3;
+    ctx.beginPath();
+    const dir = wx === TRACK.x0 ? 1 : -1;
+    for (let i = 0; i <= 6; i++) {
+      const xx = px + dir * (i * 5), yy = trackY - 34 + (i % 2 === 0 ? -7 : 7);
+      if (i === 0) ctx.moveTo(px, trackY - 34); else ctx.lineTo(xx, yy);
+    }
+    ctx.stroke();
+    ctx.fillStyle = "#8fa3bd";
+    ctx.fillRect(px - (wx === TRACK.x0 ? 8 : 0), trackY - 56, 8, 44);
+  }
+  // 标尺
+  ctx.fillStyle = "rgba(207,224,245,0.5)";
+  ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+  for (let m = 1; m <= 9; m++) {
+    ctx.fillRect(sx(m) - 1, trackY + 18, 2, 8);
+    ctx.fillText(m + " m", sx(m), trackY + 44);
+  }
+  ctx.fillStyle = "rgba(207,224,245,0.7)"; ctx.font = "bold 15px sans-serif";
+  ctx.fillText("气垫导轨（无摩擦）", sx(5), trackY + 68);
+}
+
+function drawArrow(x1, y1, x2, y2, color, width) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const L = Math.hypot(dx, dy);
+  if (L < 4) return;
+  const ux = dx / L, uy = dy / L;
+  ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2 - ux * 2, y2 - uy * 2); ctx.stroke();
+  const hl = 10 + width * 1.5;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x2 + ux * 4, y2 + uy * 4);
+  ctx.lineTo(x2 - ux * hl - uy * hl * 0.55, y2 - uy * hl + ux * hl * 0.55);
+  ctx.lineTo(x2 - ux * hl + uy * hl * 0.55, y2 - uy * hl - ux * hl * 0.55);
+  ctx.closePath(); ctx.fill();
+}
+
+function drawCart(c) {
+  const cx = sx(c.x), w = cartW(c), top = trackY - 22 - CART_H;
+  // 悬浮气隙微光
+  ctx.fillStyle = "rgba(125,255,176,0.18)";
+  roundRect(cx - w / 2, trackY - 20, w, 6, 3, true);
+  // 车体
+  const g = ctx.createLinearGradient(0, top, 0, top + CART_H);
+  g.addColorStop(0, c.light); g.addColorStop(1, c.color);
+  ctx.fillStyle = g;
+  roundRect(cx - w / 2, top, w, CART_H, 10, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 2;
+  roundRect(cx - w / 2, top, w, CART_H, 10, false); ctx.stroke();
+  // 名称与质量
+  ctx.fillStyle = "#fff"; ctx.textAlign = "center";
+  ctx.font = "bold 20px sans-serif";
+  ctx.fillText(c.name, cx, top + 24);
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillText(c.m + " kg", cx, top + 44);
+  // 粘住时的连接闪电标记
+  if (stuck && c === carts[0]) {
+    ctx.fillStyle = "#ffd54a"; ctx.font = "18px sans-serif";
+    ctx.fillText("🔗", cx + w / 2 + (cartW(carts[1]) + w) / 4, top + 30);
+  }
+  // 速度/动量箭头与数值（粘住时两滑块标签会重叠，合并成一组画在整体中点）
+  if (stuck && c === carts[1]) {
+    // 跳过 B 的标签，由 A 统一绘制
+  } else if (stuck) {
+    const mx2 = (cx + sx(carts[1].x)) / 2;
+    if (Math.abs(c.v) > 0.05) {
+      drawArrow(mx2, top - 16, mx2 + c.v * V_ARROW, top - 16, "rgba(255,255,255,0.95)", 3);
+    }
+    ctx.font = "bold 13px sans-serif"; ctx.fillStyle = "#eaf2fc";
+    ctx.fillText("共同速度 v = " + fmt(c.v, "m/s"), mx2, top - 26 - 14);
+    const p = totalP(), pScale = momentumScale();
+    if (Math.abs(p) > 0.05) {
+      drawArrow(mx2, top - 58, mx2 + p * pScale, top - 58, "#ffd54a", 6);
+    }
+    ctx.font = "bold 13px sans-serif"; ctx.fillStyle = "#ffd54a";
+    ctx.fillText("p_A + p_B = " + fmt(p, "kg·m/s"), mx2, top - 68 - 14);
+  } else {
+    const vLen = c.v * V_ARROW;
+    if (Math.abs(c.v) > 0.05) {
+      drawArrow(cx, top - 16, cx + vLen, top - 16, "rgba(255,255,255,0.95)", 3);
+    }
+    ctx.font = "bold 13px sans-serif"; ctx.fillStyle = "#eaf2fc";
+    ctx.fillText("v = " + fmt(c.v, "m/s"), cx, top - 26 - 14);
+    // 动量箭头（更粗、车体颜色）与数值
+    const p = c.m * c.v;
+    const pScale = momentumScale();
+    if (Math.abs(p) > 0.05) {
+      drawArrow(cx, top - 58, cx + p * pScale, top - 58, c.light, 6);
+    }
+    ctx.font = "bold 13px sans-serif"; ctx.fillStyle = c.light;
+    ctx.fillText("p = mv = " + fmt(p, "kg·m/s"), cx, top - 68 - 14);
+  }
+  // 拖拽提示圈
+  if (drag && drag.cart === c) {
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3; ctx.setLineDash([6, 5]);
+    roundRect(cx - w / 2 - 5, top - 5, w + 10, CART_H + 10, 12, false); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  return { cx, top, w };
+}
+
+// 动量箭头自适应比例：最长不超过屏宽 0.3
+function momentumScale() {
+  let maxP = 1;
+  for (const c of carts) maxP = Math.max(maxP, Math.abs(c.m * c.v));
+  maxP = Math.max(maxP, Math.abs(totalP()));
+  return Math.min(26, (W * 0.3) / maxP);
+}
+
+function drawPanels() {
+  const px = Math.max(60, W / 2 - Math.min(300, W * 0.36));
+  const pw = Math.min(600, W * 0.72);
+  let y = H * 0.60;
+  const barH = 22, rowGap = 44;
+  ctx.textAlign = "left";
+
+  // ---- 系统总动量条（双向，中点为 0）----
+  const mid = px + pw / 2;
+  const pScale = (pw / 2 - 8) / Math.max(1, maxPseen());
+  ctx.font = "bold 15px sans-serif"; ctx.fillStyle = "#7dffb0";
+  ctx.fillText("系统总动量 p₁+p₂", px, y - 8);
+  // 守恒徽章
+  if (!external) {
+    const pulse = 0.75 + 0.25 * Math.sin(performance.now() / 300);
+    ctx.fillStyle = `rgba(60,220,130,${pulse})`;
+    roundRect(px + pw - 96, y - 30, 96, 26, 13, true);
+    ctx.fillStyle = "#062a16"; ctx.textAlign = "center"; ctx.font = "bold 15px sans-serif";
+    ctx.fillText("✅ 守恒！", px + pw - 48, y - 12);
+    ctx.textAlign = "left";
+  } else {
+    ctx.fillStyle = "rgba(255,180,80,0.9)";
+    roundRect(px + pw - 150, y - 30, 150, 26, 13, true);
+    ctx.fillStyle = "#3a2404"; ctx.textAlign = "center"; ctx.font = "bold 14px sans-serif";
+    ctx.fillText("⚠️ 受外力改变", px + pw - 75, y - 12);
+    ctx.textAlign = "left";
+  }
+  ctx.fillStyle = "rgba(255,255,255,0.10)";
+  roundRect(px, y, pw, barH, 11, true);
+  ctx.strokeStyle = "rgba(125,255,176,0.5)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(mid, y - 3); ctx.lineTo(mid, y + barH + 3); ctx.stroke();
+  const p = totalP();
+  if (Math.abs(p) > 0.01) {
+    ctx.fillStyle = "#3cdc82";
+    const w2 = Math.min(Math.abs(p) * pScale, pw / 2 - 4);
+    roundRect(p >= 0 ? mid : mid - w2, y + 3, w2, barH - 6, 8, true);
+  }
+  ctx.fillStyle = "#7dffb0"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(fmt(p, "kg·m/s"), mid, y + barH + 17);
+  ctx.textAlign = "left";
+  y += rowGap + 14;
+
+  // ---- 动能条 ----
+  keScale = Math.max(keScale * 0.999, totalKE(), keGhost, 0.001);
+  const keBar = (label, val, color, ghost) => {
+    ctx.font = "bold 15px sans-serif"; ctx.fillStyle = color;
+    ctx.fillText(label, px, y - 8);
+    ctx.fillStyle = "rgba(255,255,255,0.10)";
+    roundRect(px, y, pw, barH, 11, true);
+    const wv = Math.min(1, val / keScale) * (pw - 6);
+    if (wv > 2) { ctx.fillStyle = color; roundRect(px + 3, y + 3, wv, barH - 6, 8, true); }
+    if (ghost != null && ghost > 0.05) {
+      const gw = Math.min(1, ghost / keScale) * (pw - 6);
+      ctx.strokeStyle = "rgba(255,255,255,0.65)"; ctx.lineWidth = 2; ctx.setLineDash([5, 4]);
+      roundRect(px + 3, y + 3, gw, barH - 6, 8, false); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.fillStyle = color; ctx.font = "bold 13px sans-serif";
+    ctx.fillText(val.toFixed(1) + " J", px + pw + 10, y + 16);
+    y += rowGap;
+  };
+  keBar("动能 A  ½mv²", 0.5 * carts[0].m * carts[0].v ** 2, "#7fb2ff", null);
+  keBar("动能 B  ½mv²", 0.5 * carts[1].m * carts[1].v ** 2, "#ffb066", null);
+  keBar(collidedOnce ? "总动能（虚线 = 碰前）" : "总动能", totalKE(), "#ffe08a", collidedOnce ? keGhost : null);
+
+  // ---- 碰撞结论 / 热能 ----
+  ctx.font = "bold 15px sans-serif";
+  if (lastCollision) {
+    const lc = lastCollision;
+    ctx.fillStyle = "#7dffb0";
+    ctx.fillText(`碰撞前 p总 = ${fmt(lc.pB, "kg·m/s")}  →  碰撞后 p总 = ${fmt(lc.pA, "kg·m/s")}  ✅ 动量守恒！`, px, y + 4);
+    if (heatLoss > 0.05) {
+      ctx.fillStyle = "#ff9a5c";
+      ctx.fillText(`🔥 动能损失 ${heatLoss.toFixed(1)} J → 转化为热能（内能）`, px, y + 28);
+    } else {
+      ctx.fillStyle = "#ffe08a";
+      ctx.fillText(`动能：碰前 ${lc.keB.toFixed(1)} J = 碰后 ${lc.keA.toFixed(1)} J ✅ 动能也守恒！`, px, y + 28);
+    }
+  } else {
+    ctx.fillStyle = "rgba(207,224,245,0.55)";
+    ctx.fillText("等待碰撞发生……观察碰撞前后总动量与总动能的变化", px, y + 4);
+  }
+}
+let maxPseenVal = 1;
+function maxPseen() {
+  maxPseenVal = Math.max(maxPseenVal * 0.999, Math.abs(totalP()), 1);
+  return maxPseenVal;
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const t = Math.max(0, p.life / p.max);
+    ctx.globalAlpha = t;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(sx(p.x), trackY - 50 + p.y, p.r * t + 1, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#16233a"); g.addColorStop(1, "#0c1420");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  drawTrack();
+  for (const c of carts) drawCart(c);
+  drawParticles();
+  drawPanels();
+  updateScore();
+}
+
+function updateScore() {
+  if (external) {
+    scorebar.textContent = `系统总动量 p = ${fmt(totalP(), "kg·m/s")} ｜ ⚠️ 挡板施加了外力`;
+    scorebar.classList.add("warn");
+  } else {
+    scorebar.textContent = `系统总动量 p = ${fmt(totalP(), "kg·m/s")} ｜ ✅ 守恒！`;
+    scorebar.classList.remove("warn");
+  }
+}
+
+/* ================= 交互 ================= */
+let drag = null;   // {cart, kind:"move"|"vel", dx}
+function cartRect(c) {
+  return { cx: sx(c.x), w: cartW(c), top: trackY - 22 - CART_H };
+}
+canvas.addEventListener("pointerdown", e => {
+  for (const c of carts) {
+    const r = cartRect(c);
+    // 速度箭头热区（车顶上方一条横带）
+    if (e.clientY > r.top - 96 && e.clientY < r.top - 4 &&
+        Math.abs(e.clientX - r.cx) < V_MAX * V_ARROW + 40) {
+      drag = { cart: c, kind: "vel" };
+      c.v = clampVel((e.clientX - r.cx) / V_ARROW);
+      canvas.setPointerCapture(e.pointerId);
+      hintEl.style.opacity = "0";
+      return;
+    }
+    // 车体：拖动位置（抓住即停）
+    if (e.clientY > r.top - 4 && e.clientY < r.top + CART_H + 8 &&
+        Math.abs(e.clientX - r.cx) < r.w / 2 + 8) {
+      drag = { cart: c, kind: "move", dx: e.clientX - r.cx };
+      c.v = 0;
+      stuck = false;
+      canvas.setPointerCapture(e.pointerId);
+      hintEl.style.opacity = "0";
+      return;
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const c = drag.cart;
+  if (drag.kind === "vel") {
+    c.v = clampVel((e.clientX - sx(c.x)) / V_ARROW);
+  } else {
+    let nx = toWorldX(e.clientX - drag.dx);
+    const hw = (0.42 + 0.16 * c.m) / 2;
+    nx = Math.max(TRACK.x0 + hw, Math.min(TRACK.x1 - hw, nx));
+    // 不允许穿过另一个滑块
+    const other = carts[carts[0] === c ? 1 : 0];
+    const gap = ((0.42 + 0.16 * c.m) + (0.42 + 0.16 * other.m)) / 2;
+    if (c === carts[0]) nx = Math.min(nx, other.x - gap);
+    else nx = Math.max(nx, other.x + gap);
+    c.x = nx;
+  }
+});
+window.addEventListener("pointerup", () => {
+  if (!drag) return;
+  if (drag.kind === "vel") pop(660);
+  rebaseline();   // 用户重新设置了初始条件，重新建立守恒基线
+  drag = null;
+});
+function clampVel(v) { return Math.max(-V_MAX, Math.min(V_MAX, Math.round(v * 2) / 2)); }
+
+// 工具条按钮
+document.querySelectorAll("#toolbar button[data-cart]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const c = carts[+btn.dataset.cart];
+    c.m = +btn.dataset.m;
+    document.querySelectorAll(`#toolbar button[data-cart="${btn.dataset.cart}"]`)
+      .forEach(b => b.classList.remove("onA", "onB"));
+    btn.classList.add(btn.dataset.cart === "0" ? "onA" : "onB");
+    resetRun(); pop(520);
+    showHint(`${c.name} 滑块质量改为 ${c.m} kg，p = mv 一起变了！`);
+  });
+});
+const modeElastic = document.getElementById("modeElastic");
+const modeSticky = document.getElementById("modeSticky");
+function setMode(m) {
+  mode = m;
+  modeElastic.classList.toggle("on", m === "elastic");
+  modeSticky.classList.toggle("on", m === "sticky");
+  resetRun(); pop(740);
+  showHint(m === "elastic" ? "弹性碰撞：滑块会弹开，动能也守恒" : "完全非弹性碰撞：滑块粘在一起，损失的动能变成热");
+}
+modeElastic.addEventListener("click", () => setMode("elastic"));
+modeSticky.addEventListener("click", () => setMode("sticky"));
+const slowBtn = document.getElementById("slowBtn");
+slowBtn.addEventListener("click", () => {
+  timeScale = timeScale === 1 ? 0.18 : 1;
+  slowBtn.classList.toggle("slowOn", timeScale !== 1);
+  slowBtn.textContent = timeScale === 1 ? "🐢 慢放" : "🐢 慢放中…点按恢复";
+  pop(timeScale === 1 ? 880 : 440);
+});
+document.getElementById("resetBtn").addEventListener("click", () => { resetRun(); pop(880); showHint("已复位：保留你设置的速度和质量"); });
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000) * timeScale;
+  lastT = now;
+  const steps = 6;   // 子步进，保证碰撞瞬间精确
+  for (let i = 0; i < steps; i++) physics(dt / steps);
+  if (!collidedOnce) keGhost = totalKE();
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const clack = v => tone(1500, 0.06, 0.06 + 0.18 * v, "square");
+const thud = () => { tone(140, 0.18, 0.2, "sawtooth"); tone(90, 0.25, 0.15, "triangle"); };
+const knock = () => tone(240, 0.06, 0.06, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+function spawnSparks(wx, color) {
+  for (let i = 0; i < 22; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 40 + Math.random() * 120;
+    particles.push({
+      x: wx, y: 0,
+      vx: Math.cos(a) * sp / view.s, vy: Math.sin(a) * sp,
+      r: 3 + Math.random() * 4, life: 0.5 + Math.random() * 0.5, max: 1,
+      color
+    });
+  }
+}
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

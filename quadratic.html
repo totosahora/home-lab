@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>抛物线魔术师 · 二次函数与最值</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#eef4fb; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,35,60,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; max-width:96vw;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,35,60,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:94vw;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(240,246,255,0.6);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#1a4fc0;
+    text-shadow:0 2px 6px rgba(255,255,255,0.8); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.25);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar"></div>
+<div id="hint">拖动 🔴 顶点移动抛物线，拖动 🟣 菱形手柄改变开口大小和方向！</div>
+<div id="winPanel">
+  <div class="msg">🎉 全部通关！你是抛物线大师！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 坐标系与视图 ================= */
+// 数学坐标范围：x ∈ [-8, 10]，y ∈ [-6.5, 7.5]（等比例缩放，y 轴向上）
+const XR = { min: -8, max: 10 };
+const YR = { min: -6.5, max: 7.5 };
+const view = { s: 1, ox: 0, oy: 0 };
+function fitView() {
+  view.s = Math.min(W / (XR.max - XR.min), H / (YR.max - YR.min));
+  view.ox = W / 2 - (XR.min + XR.max) / 2 * view.s;
+  view.oy = H / 2 + (YR.min + YR.max) / 2 * view.s;
+}
+function sx(x) { return view.ox + x * view.s; }
+function sy(y) { return view.oy - y * view.s; }
+function toWorld(px, py) { return [(px - view.ox) / view.s, (view.oy - py) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 抛物线状态 ================= */
+// y = a(x − h)² + k
+const P = { a: 1, h: 0, k: -1 };
+function f(x) { return P.a * (x - P.h) * (x - P.h) + P.k; }
+function roots() {           // 与 x 轴交点，无则返回 null
+  const d = -P.k / P.a;
+  if (d < 0) return null;
+  const r = Math.sqrt(d);
+  return [P.h - r, P.h + r];
+}
+
+/* ================= 关卡 ================= */
+const POOL = { x0: 5.5, x1: 7.5 };   // 第 4 关喷泉水池
+const LEVELS = [
+  {
+    goal: "让抛物线同时穿过 (0,0) 和 (4,0)",
+    win: "🎯 两个点都穿过啦！过两点的抛物线有无数条哦",
+    check() { return Math.abs(f(0)) <= 0.3 && Math.abs(f(4)) <= 0.3; },
+    draw() {
+      targetRing(0, 0); targetRing(4, 0);
+      tag(0, -0.9, "(0,0)"); tag(4, -0.9, "(4,0)");
+    }
+  },
+  {
+    goal: "让抛物线的最高点正好在 y = 5",
+    win: "🎯 最高点 = 5！开口向下时，k 就是最大值",
+    check() { return P.a < 0 && Math.abs(P.k - 5) <= 0.25; },
+    draw() {
+      ctx.save();
+      ctx.setLineDash([10, 8]);
+      ctx.strokeStyle = "#ff7a1a"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(sx(XR.min), sy(5)); ctx.lineTo(sx(XR.max), sy(5)); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+      tag(XR.min + 0.3, 5.55, "最高点要落在 y = 5 上（开口要朝下）", "#e06000", true);
+    }
+  },
+  {
+    goal: "让开口向上的抛物线顶点落在 (−2, −3)",
+    win: "🎯 顶点命中！开口向上时，k 就是最小值",
+    check() { return P.a > 0 && Math.abs(P.h + 2) <= 0.25 && Math.abs(P.k + 3) <= 0.25; },
+    draw() {
+      targetRing(-2, -3);
+      tag(-2, -3.9, "顶点 (−2,−3)，开口向上", "#2fbf4a", true);
+    }
+  },
+  {
+    goal: "喷泉剧场：水从 (0,0) 喷出，恰好落进水池，最高点 ≥ 3.5 米",
+    win: null,   // 动态生成
+    check() {
+      if (P.a >= 0 || P.k < 3.5 || Math.abs(f(0)) > 0.3) return false;
+      const r2 = P.h + Math.sqrt(-P.k / P.a);
+      return r2 >= POOL.x0 && r2 <= POOL.x1;
+    },
+    draw() { drawFountain(); }
+  }
+];
+let levelIdx = 0;
+let celebrating = false;
+
+function updateScore() {
+  scorebar.textContent = `第 ${Math.min(levelIdx + 1, LEVELS.length)} / ${LEVELS.length} 关 · ${LEVELS[Math.min(levelIdx, LEVELS.length - 1)].goal}`;
+}
+function resetGame() {
+  levelIdx = 0; celebrating = false;
+  P.a = 1; P.h = 0; P.k = -1;
+  confetti.length = 0;
+  winPanel.style.display = "none";
+  updateScore();
+}
+updateScore();   // resetGame 引用后面才声明的 confetti，初始化只需刷新分数条
+
+/* ================= 关卡流程 ================= */
+function checkLevel() {
+  if (celebrating || winPanel.style.display === "flex") return;
+  if (!LEVELS[levelIdx].check()) return;
+  celebrating = true;
+  fanfare();
+  spawnConfetti();
+  const lv = LEVELS[levelIdx];
+  showHint(levelIdx === 3 ? `🎉 水柱恰好进池！喷泉最高点 ${fmt(P.k)} 米` : lv.win);
+  setTimeout(() => {
+    levelIdx++;
+    celebrating = false;
+    if (levelIdx >= LEVELS.length) {
+      winPanel.style.display = "flex";
+      fanfare();
+    } else {
+      updateScore();
+      pop(880);
+    }
+  }, 2000);
+}
+
+/* ================= 拖拽交互 ================= */
+let drag = null;   // "vertex" | "open"
+const snap = (v, step) => Math.round(v / step) * step;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function openHandlePos() { return [P.h + 1, P.k + P.a]; }   // 开口手柄：顶点右移 1 个单位处
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const [hx, hy] = openHandlePos();
+  const dOpen = Math.hypot(e.clientX - sx(hx), e.clientY - sy(hy));
+  const dVert = Math.hypot(e.clientX - sx(P.h), e.clientY - sy(P.k));
+  if (dOpen < 30 && dOpen <= dVert) drag = "open";
+  else if (dVert < 30) drag = "vertex";
+  if (!drag) return;
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  if (drag === "vertex") {
+    const nh = clamp(snap(wx, 0.5), XR.min + 0.5, XR.max - 1.5);
+    const nk = clamp(snap(wy, 0.5), YR.min + 0.5, YR.max - 0.5);
+    if (nh !== P.h || nk !== P.k) { P.h = nh; P.k = nk; tick(); }
+  } else {
+    let na = wy - P.k;
+    na = na >= 0 ? clamp(na, 0.25, 4) : clamp(na, -4, -0.25);
+    na = snap(na, 0.25);
+    if (na !== P.a) { P.a = na; tick(); }
+  }
+});
+window.addEventListener("pointerup", () => { drag = null; });
+
+/* ================= 数字格式化 ================= */
+function fmt(n) {
+  const v = Math.round(n * 100) / 100;
+  return String(Object.is(v, -0) ? 0 : v).replace("-", "−");
+}
+function fmtA(a) {   // 二次项系数：1 省略，−1 只写负号
+  if (a === 1) return "";
+  if (a === -1) return "−";
+  return fmt(a);
+}
+function vertexForm() {
+  let s = "y = " + fmtA(P.a);
+  if (P.h === 0) s += "x²";
+  else if (P.h > 0) s += `(x − ${fmt(P.h)})²`;
+  else s += `(x + ${fmt(-P.h)})²`;
+  if (P.k > 0) s += ` + ${fmt(P.k)}`;
+  else if (P.k < 0) s += ` − ${fmt(-P.k)}`;
+  return s;
+}
+function generalForm() {   // 展开：y = ax² + bx + c
+  const b = -2 * P.a * P.h, c = P.a * P.h * P.h + P.k;
+  let s = "y = " + fmtA(P.a) + "x²";
+  if (b !== 0) s += b > 0 ? ` + ${fmtA(b)}x` : ` − ${fmtA(-b)}x`;
+  if (c !== 0) s += c > 0 ? ` + ${fmt(c)}` : ` − ${fmt(-c)}`;
+  return s;
+}
+
+/* ================= 绘制 ================= */
+function drawGrid() {
+  ctx.save();
+  ctx.lineWidth = 1;
+  ctx.font = "12px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let x = Math.ceil(XR.min); x <= XR.max; x++) {
+    ctx.strokeStyle = x === 0 ? "rgba(60,80,120,0.5)" : "rgba(120,150,190,0.25)";
+    ctx.lineWidth = x === 0 ? 2 : 1;
+    ctx.beginPath(); ctx.moveTo(sx(x), sy(YR.min)); ctx.lineTo(sx(x), sy(YR.max)); ctx.stroke();
+    if (x !== 0) { ctx.fillStyle = "rgba(60,80,120,0.6)"; ctx.fillText(String(x), sx(x), sy(0) + 5); }
+  }
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let y = Math.ceil(YR.min); y <= YR.max; y++) {
+    ctx.strokeStyle = y === 0 ? "rgba(60,80,120,0.5)" : "rgba(120,150,190,0.25)";
+    ctx.lineWidth = y === 0 ? 2 : 1;
+    ctx.beginPath(); ctx.moveTo(sx(XR.min), sy(y)); ctx.lineTo(sx(XR.max), sy(y)); ctx.stroke();
+    if (y !== 0) { ctx.fillStyle = "rgba(60,80,120,0.6)"; ctx.fillText(String(y), sx(0) - 6, sy(y)); }
+  }
+  // 轴箭头
+  ctx.fillStyle = "rgba(60,80,120,0.8)";
+  ctx.beginPath(); ctx.moveTo(sx(XR.max) + 10, sy(0)); ctx.lineTo(sx(XR.max) - 2, sy(0) - 5); ctx.lineTo(sx(XR.max) - 2, sy(0) + 5); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(sx(0), sy(YR.max) - 10); ctx.lineTo(sx(0) - 5, sy(YR.max) + 2); ctx.lineTo(sx(0) + 5, sy(YR.max) + 2); ctx.fill();
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillText("x", sx(XR.max) + 4, sy(0) + 6);
+  ctx.fillText("y", sx(0) + 8, sy(YR.max) - 2);
+  ctx.restore();
+}
+
+function drawParabola() {
+  ctx.save();
+  ctx.strokeStyle = "#2f7fe9";
+  ctx.lineWidth = 4;
+  ctx.lineJoin = "round";
+  ctx.shadowColor = "rgba(47,127,233,0.4)"; ctx.shadowBlur = 8;
+  ctx.beginPath();
+  let started = false;
+  for (let x = XR.min - 1; x <= XR.max + 1; x += 0.05) {
+    const py = sy(f(x));
+    if (py < -300 || py > H + 300) { started = false; continue; }
+    if (!started) { ctx.moveTo(sx(x), py); started = true; }
+    else ctx.lineTo(sx(x), py);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawAnnotations() {
+  // 对称轴
+  ctx.save();
+  ctx.setLineDash([6, 6]);
+  ctx.strokeStyle = "rgba(155,61,224,0.55)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(sx(P.h), sy(YR.min)); ctx.lineTo(sx(P.h), sy(YR.max)); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "rgba(155,61,224,0.9)";
+  ctx.font = "12px sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillText(`对称轴 x = ${fmt(P.h)}`, sx(P.h) + 5, sy(YR.max) + 16);
+  ctx.restore();
+
+  // 与 x 轴交点实时标注
+  const r = roots();
+  if (r) {
+    for (const rx of r) {
+      if (rx < XR.min - 0.5 || rx > XR.max + 0.5) continue;
+      ctx.beginPath(); ctx.arc(sx(rx), sy(0), 6, 0, 7);
+      ctx.fillStyle = "#2fbf4a"; ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+      tag(rx, 0.75, `(${fmt(rx)}, 0)`, "#1a8a35");
+    }
+  } else {
+    // 无交点提示
+    tag(P.h, P.k + (P.a > 0 ? 1.1 : -1.1), "与 x 轴无交点", "#999");
+  }
+
+  // 顶点标签：坐标 + 最值含义
+  const isMax = P.a < 0;
+  tag(P.h, P.k + (isMax ? 1.15 : -1.15),
+    `顶点 (${fmt(P.h)}, ${fmt(P.k)}) · ${isMax ? "最大值" : "最小值"} ${fmt(P.k)}`,
+    "#d32f2f", true);
+}
+
+function drawHandles() {
+  // 🔴 顶点手柄
+  ctx.save();
+  ctx.beginPath(); ctx.arc(sx(P.h), sy(P.k), 13, 0, 7);
+  const g = ctx.createRadialGradient(sx(P.h) - 4, sy(P.k) - 5, 2, sx(P.h), sy(P.k), 13);
+  g.addColorStop(0, "#ff8a80"); g.addColorStop(1, "#d32f2f");
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+  if (drag === "vertex") { ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(sx(P.h), sy(P.k), 18, 0, 7); ctx.stroke(); }
+
+  // 🟣 开口手柄（菱形），虚线连到顶点
+  const [hx, hy] = openHandlePos();
+  if (hy >= YR.min && hy <= YR.max) {
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = "rgba(155,61,224,0.6)"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(sx(P.h), sy(P.k)); ctx.lineTo(sx(hx), sy(hy)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.save();
+    ctx.translate(sx(hx), sy(hy));
+    ctx.rotate(Math.PI / 4);
+    const s = drag === "open" ? 12 : 10;
+    ctx.fillStyle = "#9b3de0";
+    ctx.fillRect(-s / 1.4, -s / 1.4, s * 1.43, s * 1.43);
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5;
+    ctx.strokeRect(-s / 1.4, -s / 1.4, s * 1.43, s * 1.43);
+    ctx.restore();
+    tag(hx, hy + (P.a > 0 ? 1.0 : -1.0), `a = ${fmt(P.a)}（拖我）`, "#9b3de0");
+  }
+  ctx.restore();
+}
+
+// 公式面板（顶点式 + 一般式实时展开）
+function drawFormula() {
+  ctx.save();
+  ctx.font = "bold 17px 'PingFang SC','Microsoft YaHei',sans-serif";
+  const l1 = "顶点式  " + vertexForm();
+  const l2 = "一般式  " + generalForm();
+  const w = Math.max(ctx.measureText(l1).width, ctx.measureText(l2).width) + 30;
+  const x = 14, y = 14;
+  ctx.fillStyle = "rgba(255,255,255,0.88)";
+  roundRect(x, y, w, 64, 12, true);
+  ctx.strokeStyle = "rgba(47,127,233,0.5)"; ctx.lineWidth = 2;
+  roundRect(x, y, w, 64, 12, false);
+  ctx.fillStyle = "#1a4fc0";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText(l1, x + 15, y + 20);
+  ctx.fillStyle = "#333";
+  ctx.fillText(l2, x + 15, y + 46);
+  ctx.restore();
+}
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill(); else ctx.stroke();
+}
+
+// 目标点脉冲光圈
+function targetRing(x, y) {
+  const t = performance.now() / 1000;
+  const r = 12 + 4 * Math.sin(t * 4);
+  ctx.save();
+  ctx.beginPath(); ctx.arc(sx(x), sy(y), r, 0, 7);
+  ctx.strokeStyle = "#ffb800"; ctx.lineWidth = 4; ctx.stroke();
+  ctx.beginPath(); ctx.arc(sx(x), sy(y), 5, 0, 7);
+  ctx.fillStyle = "#ffb800"; ctx.fill();
+  ctx.restore();
+}
+
+// 文字小标签（数学坐标定位，自动白底）
+function tag(wx, wy, text, color, bold) {
+  ctx.save();
+  ctx.font = (bold ? "bold " : "") + "13px 'PingFang SC','Microsoft YaHei',sans-serif";
+  const tw = ctx.measureText(text).width;
+  let px = sx(wx) - tw / 2 - 6, py = sy(wy) - 10;
+  px = clamp(px, 4, W - tw - 16);
+  py = clamp(py, 4, H - 24);
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  roundRect(px, py, tw + 12, 20, 8, true);
+  ctx.fillStyle = color || "#333";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText(text, px + 6, py + 10);
+  ctx.restore();
+}
+
+/* ================= 第 4 关：喷泉剧场 ================= */
+let waterT = 0;
+function drawFountain() {
+  // 水池
+  ctx.save();
+  ctx.fillStyle = "#7ec8f5";
+  roundRect(sx(POOL.x0), sy(0) - 2, (POOL.x1 - POOL.x0) * view.s, 20, 6, true);
+  ctx.strokeStyle = "#2f7fe9"; ctx.lineWidth = 2;
+  roundRect(sx(POOL.x0), sy(0) - 2, (POOL.x1 - POOL.x0) * view.s, 20, 6, false);
+  ctx.fillStyle = "#1a4fc0"; ctx.font = "bold 13px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  ctx.fillText("水池", sx((POOL.x0 + POOL.x1) / 2), sy(0) + 22);
+  // 喷头
+  ctx.fillStyle = "#666";
+  ctx.beginPath();
+  ctx.moveTo(sx(0) - 8, sy(0) + 12); ctx.lineTo(sx(0) + 8, sy(0) + 12);
+  ctx.lineTo(sx(0) + 3, sy(0)); ctx.lineTo(sx(0) - 3, sy(0));
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#1a4fc0";
+  ctx.fillText("喷头 (0,0)", sx(0), sy(0) + 24);
+
+  // 水珠沿抛物线飞行：从 x=0 到右侧落点
+  if (P.a < 0 && P.k > 0) {
+    const r2 = P.h + Math.sqrt(-P.k / P.a);
+    if (r2 > 0.5 && r2 < XR.max + 2) {
+      const N = 26;
+      for (let i = 0; i < N; i++) {
+        const ph = ((waterT * 0.5 + i / N) % 1);
+        const x = ph * r2, y = f(x);
+        if (y < 0) continue;
+        ctx.beginPath(); ctx.arc(sx(x), sy(y), 3.2, 0, 7);
+        ctx.fillStyle = "rgba(80,170,250,0.85)"; ctx.fill();
+      }
+      // 落水点水花
+      const inPool = r2 >= POOL.x0 && r2 <= POOL.x1 && Math.abs(f(0)) <= 0.3;
+      for (let i = 0; i < 6; i++) {
+        const a = -Math.PI / 2 + (i - 2.5) * 0.4;
+        const sp = 0.5 + 0.5 * Math.sin(waterT * 6 + i);
+        const px2 = sx(r2) + Math.cos(a) * 14 * sp, py2 = sy(0) + Math.sin(a) * 14 * sp * 0.7;
+        ctx.beginPath(); ctx.arc(px2, py2, inPool ? 3.5 : 2.5, 0, 7);
+        ctx.fillStyle = inPool ? "rgba(80,170,250,0.9)" : "rgba(150,150,150,0.6)";
+        ctx.fill();
+      }
+    }
+  }
+  // 当前最高点提示
+  tag(XR.max - 3.6, YR.max - 1.7, `当前最高点：${fmt(Math.max(P.k, 0))} 米（需要 ≥ 3.5）`, P.k >= 3.5 ? "#1a8a35" : "#e06000");
+  ctx.restore();
+}
+
+/* ================= 庆祝彩带 ================= */
+const confetti = [];
+const CCOLORS = ["#ff5252", "#ffb800", "#2fbf4a", "#2f7fe9", "#9b3de0", "#ff7a1a"];
+function spawnConfetti() {
+  for (let i = 0; i < 120; i++) {
+    confetti.push({
+      x: W / 2 + (Math.random() - 0.5) * 200,
+      y: H / 3,
+      vx: (Math.random() - 0.5) * 500,
+      vy: -Math.random() * 500 - 100,
+      s: 5 + Math.random() * 6,
+      c: CCOLORS[i % CCOLORS.length],
+      rot: Math.random() * 7, vr: (Math.random() - 0.5) * 10
+    });
+  }
+}
+function updateConfetti(dt) {
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const p = confetti[i];
+    p.vy += 900 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.rot += p.vr * dt;
+    if (p.y > H + 30) confetti.splice(i, 1);
+  }
+}
+function drawConfetti() {
+  for (const p of confetti) {
+    ctx.save();
+    ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+    ctx.fillStyle = p.c;
+    ctx.fillRect(-p.s / 2, -p.s / 3, p.s, p.s * 0.66);
+    ctx.restore();
+  }
+}
+
+/* ================= 绘制总入口 ================= */
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#eef4fb";
+  ctx.fillRect(0, 0, W, H);
+  drawGrid();
+  LEVELS[Math.min(levelIdx, LEVELS.length - 1)].draw();
+  drawParabola();
+  drawAnnotations();
+  drawHandles();
+  drawFormula();
+  drawConfetti();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  waterT += dt;
+  updateConfetti(dt);
+  checkLevel();
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const tick = () => tone(660, 0.04, 0.05, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3200);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+// 供自动化测试使用
+window.__q = {
+  P, LEVELS,
+  get levelIdx() { return levelIdx; },
+  setState(a, h, k) { P.a = a; P.h = h; P.k = k; },
+  isDone() { return LEVELS[levelIdx].check(); },
+  checkAt(li, a, h, k) { P.a = a; P.h = h; P.k = k; return LEVELS[li].check(); }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

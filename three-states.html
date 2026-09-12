@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>三态变化小实验</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#d6eafa; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #hint {
+    position:absolute; bottom:132px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,70,0.82); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:16px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #cmpBtn {
+    position:absolute; top:12px; right:12px; z-index:10;
+    font-size:18px; font-weight:bold; padding:12px 22px;
+    border-radius:26px; border:none; background:#ffffff; color:#1a5fa8;
+    box-shadow:0 3px 8px rgba(30,60,100,0.25); cursor:pointer;
+  }
+  #cmpBtn:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<button id="cmpBtn">🆚 对比看看</button>
+<div id="hint">拖动下面的滑杆，给分子加热（🔥）或降温（❄️）！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+const cmpBtn = document.getElementById("cmpBtn");
+let W = 0, H = 0, DPR = 1;
+let tableY = 0;            // 桌面高度（杯子放在桌面上）
+let waveT = 0;             // 水面波动动画时钟
+
+// 温度滑杆几何（layout() 里计算）
+let SX0 = 0, SX1 = 0, SY = 0;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据：烧杯与分子 ================= */
+const MOL_R = 9;           // 分子半径
+const N_MOL = 36;          // 每杯分子数
+const WALL = 7;            // 杯壁厚
+const GRAV = 520;          // 重力（液态用）
+const T_MELT = 0.33, T_BOIL = 0.67;   // 临界点
+
+const STATE_INFO = {
+  solid:  { label:"🧊 冰（固态）",     color:"#155e9e", mol:"#dbeeff" },
+  liquid: { label:"💧 水（液态）",     color:"#0f6fd0", mol:"#4aa8f0" },
+  gas:    { label:"💨 水蒸气（气态）", color:"#b06428", mol:"rgba(245,246,250,0.92)" }
+};
+
+class Beaker {
+  constructor() {
+    this.mols = [];
+    for (let i = 0; i < N_MOL; i++)
+      this.mols.push({ x:0, y:0, vx:0, vy:0, hx:0, hy:0 });
+    this.t = 0.12;                 // 温度 0..1
+    this.st = "solid";
+    this.cx = 0; this.top = 0; this.w = 0; this.h = 0;
+    this.left = 0; this.right = 0; this.bottom = 0;
+    this.cmpLabel = null;          // 对比模式自定义标签
+    this.announce = null;          // 跨临界回调
+    this.escapeNotified = false;   // 气态逸出提示只弹一次
+  }
+  setGeo(cx, top, w, h) {
+    this.cx = cx; this.top = top; this.w = w; this.h = h;
+    this.left = cx - w / 2; this.right = cx + w / 2; this.bottom = top + h;
+    if (this.st === "solid") this.arrange(true);
+  }
+  stateOf() { return this.t < T_MELT ? "solid" : this.t < T_BOIL ? "liquid" : "gas"; }
+  // 固态：分子排到杯底晶格上（snap=true 时直接归位）
+  arrange(snap) {
+    const spacing = MOL_R * 2 + 3;
+    const cols = Math.max(1, Math.floor((this.w - 2 * WALL) / spacing));
+    this.mols.forEach((m, i) => {
+      const r = Math.floor(i / cols), c = i % cols;
+      const rowCount = Math.min(cols, this.mols.length - r * cols);
+      m.hx = this.cx - (rowCount - 1) * spacing / 2 + c * spacing;
+      m.hy = this.bottom - WALL - MOL_R - 4 - r * spacing;
+      if (snap) { m.x = m.hx; m.y = m.hy; m.vx = 0; m.vy = 0; }
+    });
+  }
+  setTemp(t, silent) {
+    const oldSt = this.st;
+    this.t = Math.max(0, Math.min(1, t));
+    this.st = this.stateOf();
+    if (this.st === oldSt) return;
+    if (this.st === "solid") {
+      this.arrange(true);                       // 冻住：归位到晶格
+    } else if (this.st === "gas") {
+      this.escapeNotified = false;
+      for (const m of this.mols) {              // 沸腾：高速乱飞
+        const a = Math.random() * Math.PI * 2, s = 300 + Math.random() * 180;
+        m.vx = Math.cos(a) * s; m.vy = Math.sin(a) * s;
+      }
+    } else {
+      if (oldSt === "solid")
+        for (const m of this.mols) { m.vx = (Math.random() - 0.5) * 60; m.vy = (Math.random() - 0.5) * 60; }
+      // 凝结：杯外的分子回到杯子里
+      for (const m of this.mols) {
+        if (m.x < this.left || m.x > this.right || m.y < this.top) {
+          m.x = this.cx + (Math.random() - 0.5) * (this.w - 2 * WALL - 2 * MOL_R);
+          m.y = this.top + 20 + Math.random() * 40;
+          m.vx = 0; m.vy = 0;
+        }
+      }
+    }
+    if (!silent && this.announce) this.announce(oldSt, this.st);
+  }
+  /* ---------- 物理 ---------- */
+  step(dt) {
+    if (this.st === "solid") this.stepSolid(dt);
+    else if (this.st === "liquid") this.stepLiquid(dt);
+    else this.stepGas(dt);
+  }
+  // 固态：弹簧绑在晶格点上，轻微抖动，温度越高抖得越厉害
+  stepSolid(dt) {
+    const noise = 6 + (this.t / T_MELT) * 22;
+    const damp = Math.exp(-4 * dt);
+    for (const m of this.mols) {
+      m.vx += (m.hx - m.x) * 60 * dt + (Math.random() - 0.5) * noise * 60 * dt;
+      m.vy += (m.hy - m.y) * 60 * dt + (Math.random() - 0.5) * noise * 60 * dt;
+      m.vx *= damp; m.vy *= damp;
+      m.x += m.vx * dt; m.y += m.vy * dt;
+    }
+  }
+  // 液态：重力落底 + 随机热扰动 + 互相碰撞（随机游走）
+  stepLiquid(dt) {
+    const heat = 1600 + ((this.t - T_MELT) / (T_BOIL - T_MELT)) * 4200;
+    const damp = Math.exp(-0.4 * dt);
+    for (const m of this.mols) {
+      m.vy += GRAV * dt;
+      m.vx += (Math.random() - 0.5) * heat * dt;
+      m.vy += (Math.random() - 0.5) * heat * 0.4 * dt;
+      m.vx *= damp; m.vy *= damp;
+      m.x += m.vx * dt; m.y += m.vy * dt;
+      this.confine(m, 0.45);
+    }
+    collidePairs(this.mols);
+  }
+  // 气态：高速满杯乱飞，杯口关不住，会逸出到杯外
+  stepGas(dt) {
+    const target = 320 + ((this.t - T_BOIL) / (1 - T_BOIL)) * 430;
+    for (const m of this.mols) {
+      // 速度大小向目标靠拢
+      const sp = Math.hypot(m.vx, m.vy) || 1;
+      const ns = sp + (target - sp) * Math.min(1, 3 * dt);
+      m.vx *= ns / sp; m.vy *= ns / sp;
+      // 随机转向
+      if (Math.random() < dt * 2.5) {
+        const a = (Math.random() - 0.5) * 1.6, c = Math.cos(a), s = Math.sin(a);
+        const vx = m.vx * c - m.vy * s, vy = m.vx * s + m.vy * c;
+        m.vx = vx; m.vy = vy;
+      }
+      const wasIn = m.y > this.top;
+      m.x += m.vx * dt; m.y += m.vy * dt;
+      this.confine(m, 0.92);
+      // 屏幕边界（逸出杯口后在房间里飞）
+      if (m.x < MOL_R) { m.x = MOL_R; m.vx = Math.abs(m.vx) * 0.92; }
+      if (m.x > W - MOL_R) { m.x = W - MOL_R; m.vx = -Math.abs(m.vx) * 0.92; }
+      if (m.y < MOL_R) { m.y = MOL_R; m.vy = Math.abs(m.vy) * 0.92; }
+      if (wasIn && m.y < this.top && !this.escapeNotified) {
+        this.escapeNotified = true;
+        showHint("水蒸气从杯口跑出来啦，杯子关不住它！💨");
+        pop(988);
+      }
+    }
+    collidePairs(this.mols);
+  }
+  // 容器约束：杯口以下是杯壁+桌面；杯口敞开，分子可以飞出去
+  confine(m, rest) {
+    if (m.y > this.top + MOL_R * 0.5) {
+      if (m.x > this.left - MOL_R && m.x < this.right + MOL_R) {
+        if (m.x < this.left + MOL_R) { m.x = this.left + MOL_R; m.vx = Math.abs(m.vx) * rest; }
+        if (m.x > this.right - MOL_R) { m.x = this.right - MOL_R; m.vx = -Math.abs(m.vx) * rest; }
+      } else {
+        // 杯外撞外壁
+        if (m.x <= this.left - MOL_R && m.vx > 0) m.vx = -Math.abs(m.vx) * rest;
+        if (m.x >= this.right + MOL_R && m.vx < 0) m.vx = Math.abs(m.vx) * rest;
+      }
+      if (m.y > this.bottom - MOL_R) {
+        m.y = this.bottom - MOL_R;
+        m.vy = -Math.abs(m.vy) * rest;
+        if (Math.abs(m.vy) < 25) m.vy = 0;
+      }
+    }
+  }
+  // 估算液面高度
+  waterH() {
+    return Math.min(this.h * 0.5,
+      this.mols.length * Math.PI * MOL_R * MOL_R / (this.w - 2 * WALL) * 1.5 + 26);
+  }
+}
+
+// 等质量弹性碰撞（沿用 billiards 的做法）
+function collidePairs(mols) {
+  for (let i = 0; i < mols.length; i++) {
+    const a = mols[i];
+    for (let j = i + 1; j < mols.length; j++) {
+      const b = mols[j];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const d = Math.hypot(dx, dy);
+      if (d > 0 && d < MOL_R * 2) {
+        const nx = dx / d, ny = dy / d;
+        const ov = (MOL_R * 2 - d) / 2;
+        a.x -= nx * ov; a.y -= ny * ov;
+        b.x += nx * ov; b.y += ny * ov;
+        const va = a.vx * nx + a.vy * ny, vb = b.vx * nx + b.vy * ny;
+        if (va - vb > 0) {
+          a.vx += (vb - va) * nx; a.vy += (vb - va) * ny;
+          b.vx += (va - vb) * nx; b.vy += (va - vb) * ny;
+        }
+      }
+    }
+  }
+}
+
+/* ================= 游戏状态 ================= */
+const beakers = [new Beaker(), new Beaker()];
+const mainBeaker = beakers[0];
+beakers[1].cmpLabel = "💧 热水 · 热";
+let cmpMode = false;
+let gasCelebrated = false;
+
+function activeBeakers() { return cmpMode ? beakers : [beakers[0]]; }
+
+mainBeaker.announce = (from, to) => {
+  if (to === "liquid" && from === "solid") { showHint("冰化成水啦！💧"); stateJingle(true); }
+  else if (to === "solid") { showHint("水冻成冰啦！🧊"); stateJingle(false); }
+  else if (to === "gas") {
+    showHint("水变成水蒸气啦！💨"); stateJingle(true);
+    if (!gasCelebrated) { gasCelebrated = true; fanfare(); }
+  }
+  else if (to === "liquid" && from === "gas") { showHint("水蒸气变回水啦！💧"); stateJingle(false); }
+};
+
+function layout() {
+  tableY = Math.round(H * 0.72);
+  if (cmpMode) {
+    const w = Math.min(230, W * 0.34), h = Math.max(170, Math.min(280, tableY - 150));
+    beakers[0].setGeo(W * 0.29, tableY - h, w, h);
+    beakers[1].setGeo(W * 0.71, tableY - h, w, h);
+  } else {
+    const w = Math.min(280, W * 0.6), h = Math.max(190, Math.min(320, tableY - 140));
+    beakers[0].setGeo(W / 2, tableY - h, w, h);
+  }
+  SX0 = W * 0.14; SX1 = W * 0.86; SY = H - 84;
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function glassPath(b) {
+  ctx.beginPath();
+  ctx.moveTo(b.left, b.top);
+  ctx.lineTo(b.left, b.bottom - 18);
+  ctx.quadraticCurveTo(b.left, b.bottom, b.left + 18, b.bottom);
+  ctx.lineTo(b.right - 18, b.bottom);
+  ctx.quadraticCurveTo(b.right, b.bottom, b.right, b.bottom - 18);
+  ctx.lineTo(b.right, b.top);
+}
+
+function drawGlass(b) {
+  ctx.save();
+  glassPath(b);
+  ctx.fillStyle = "rgba(190,225,255,0.14)"; ctx.fill();
+  glassPath(b);
+  ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = WALL; ctx.stroke();
+  glassPath(b);
+  ctx.strokeStyle = "rgba(90,140,190,0.5)"; ctx.lineWidth = 1.5; ctx.stroke();
+  // 杯口沿
+  ctx.beginPath();
+  ctx.moveTo(b.left - 9, b.top); ctx.lineTo(b.left, b.top);
+  ctx.moveTo(b.right, b.top); ctx.lineTo(b.right + 9, b.top);
+  ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = WALL; ctx.stroke();
+  ctx.restore();
+}
+
+function drawWater(b) {
+  if (b.st !== "liquid") return;
+  const surfY = b.bottom - b.waterH();
+  const amp = 2 + ((b.t - T_MELT) / (T_BOIL - T_MELT)) * 4;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(b.left + 3, b.top, b.w - 6, b.bottom - b.top);
+  ctx.clip();
+  ctx.beginPath();
+  ctx.moveTo(b.left, b.bottom);
+  ctx.lineTo(b.left, surfY);
+  for (let x = b.left; x <= b.right; x += 8)
+    ctx.lineTo(x, surfY + Math.sin(x * 0.08 + waveT * 3) * amp);
+  ctx.lineTo(b.right, b.bottom);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(70,150,240,0.30)"; ctx.fill();
+  ctx.restore();
+}
+
+function drawMols(b) {
+  const color = STATE_INFO[b.st].mol;
+  for (const m of b.mols) {
+    ctx.beginPath(); ctx.arc(m.x, m.y, MOL_R, 0, 7);
+    ctx.fillStyle = color; ctx.fill();
+    ctx.strokeStyle = "rgba(30,70,120,0.35)"; ctx.lineWidth = 1.5; ctx.stroke();
+    // 高光
+    ctx.beginPath(); ctx.arc(m.x - MOL_R * 0.3, m.y - MOL_R * 0.35, MOL_R * 0.28, 0, 7);
+    ctx.fillStyle = "rgba(255,255,255,0.8)"; ctx.fill();
+  }
+}
+
+function drawLabel(b) {
+  const text = cmpMode
+    ? (b === beakers[0] ? "🧊 冰 · 冷" : b.cmpLabel)
+    : STATE_INFO[b.st].label;
+  ctx.save();
+  ctx.font = "bold 24px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+  ctx.fillStyle = cmpMode ? (b === beakers[0] ? "#155e9e" : "#c2452a") : STATE_INFO[b.st].color;
+  ctx.fillText(text, b.cx, b.top - 14);
+  ctx.restore();
+}
+
+function drawSlider() {
+  const y = SY, x0 = SX0, x1 = SX1;
+  ctx.save();
+  // 面板底
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  roundRect(x0 - 62, y - 48, (x1 - x0) + 124, 96, 24, true);
+  // 轨道（冷→热渐变）
+  const g = ctx.createLinearGradient(x0, 0, x1, 0);
+  g.addColorStop(0, "#4aa8f0"); g.addColorStop(0.33, "#bfe3ff");
+  g.addColorStop(0.67, "#ffd9a0"); g.addColorStop(1, "#f0653a");
+  ctx.fillStyle = cmpMode ? "rgba(160,160,160,0.5)" : g;
+  roundRect(x0, y - 11, x1 - x0, 22, 11, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.15)"; ctx.lineWidth = 2;
+  roundRect(x0, y - 11, x1 - x0, 22, 11, false); ctx.stroke();
+  // 临界刻度
+  ctx.fillStyle = "rgba(0,0,0,0.3)";
+  for (const c of [T_MELT, T_BOIL]) {
+    const cx = x0 + c * (x1 - x0);
+    ctx.fillRect(cx - 1.5, y - 18, 3, 36);
+  }
+  // 端点 emoji
+  ctx.font = "34px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("❄️", x0 - 36, y);
+  ctx.fillText("🔥", x1 + 36, y);
+  if (cmpMode) {
+    ctx.font = "16px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.fillStyle = "rgba(60,80,110,0.8)";
+    ctx.fillText("对比模式中，滑杆休息啦", (x0 + x1) / 2, y + 40);
+  } else {
+    // 旋钮：画当前状态的 emoji
+    const kx = x0 + mainBeaker.t * (x1 - x0);
+    ctx.beginPath(); ctx.arc(kx, y, 27, 0, 7);
+    ctx.fillStyle = "#ffffff"; ctx.fill();
+    ctx.strokeStyle = "rgba(40,80,130,0.5)"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.font = "24px sans-serif";
+    ctx.fillText(mainBeaker.st === "solid" ? "🧊" : mainBeaker.st === "liquid" ? "💧" : "💨", kx, y + 1);
+  }
+  ctx.restore();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 背景：房间
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#e8f4fd"); g.addColorStop(1, "#cfe7fa");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 桌面
+  ctx.fillStyle = "#c69a6b"; ctx.fillRect(0, tableY, W, H - tableY);
+  ctx.fillStyle = "rgba(0,0,0,0.08)"; ctx.fillRect(0, tableY, W, 4);
+  // 对比模式标题
+  if (cmpMode) {
+    ctx.font = "bold 22px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    ctx.fillStyle = "#1a4f8a";
+    ctx.fillText("比比看：热的分子跑得快，冷的分子动得慢！", W / 2, 16);
+  }
+  for (const b of activeBeakers()) { drawWater(b); drawMols(b); drawGlass(b); drawLabel(b); }
+  drawSlider();
+}
+
+/* ================= 交互 ================= */
+let sliderDrag = false;
+
+function tempFromX(px) {
+  mainBeaker.setTemp((px - SX0) / (SX1 - SX0));
+}
+
+// 戳一戳分子：给附近分子一个冲量，即时反馈
+function poke(px, py) {
+  for (const b of activeBeakers()) {
+    if (px < b.left - 20 || px > b.right + 20 || py < b.top - 20 || py > b.bottom + 20) continue;
+    for (const m of b.mols) {
+      const dx = m.x - px, dy = m.y - py, d = Math.hypot(dx, dy);
+      if (d < 60 && d > 0.1) {
+        const f = b.st === "solid" ? 60 : 220;
+        m.vx += dx / d * f; m.vy += dy / d * f;
+      }
+    }
+    pop(500 + Math.random() * 300);
+    return;
+  }
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const px = e.clientX, py = e.clientY;
+  if (!cmpMode && Math.abs(py - SY) < 48 && px > SX0 - 50 && px < SX1 + 50) {
+    sliderDrag = true;
+    tempFromX(px);
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(660);
+    return;
+  }
+  poke(px, py);
+});
+canvas.addEventListener("pointermove", e => {
+  if (sliderDrag) tempFromX(e.clientX);
+});
+window.addEventListener("pointerup", () => { sliderDrag = false; });
+window.addEventListener("pointercancel", () => { sliderDrag = false; });
+
+cmpBtn.addEventListener("click", () => {
+  cmpMode = !cmpMode;
+  cmpBtn.textContent = cmpMode ? "🔬 返回实验" : "🆚 对比看看";
+  layout();   // 先摆好杯子位置，再设置温度（分子归位要用到几何）
+  if (cmpMode) {
+    beakers[0].setTemp(0.12, true);   // 一杯冰
+    beakers[1].setTemp(0.55, true);   // 一杯热水
+    showHint("比比看：哪一杯的分子动得快？");
+  } else {
+    showHint("拖动滑杆，继续实验！");
+  }
+  pop(660);
+});
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  waveT += dt;
+  for (const b of activeBeakers()) b.step(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+resize();
+mainBeaker.setTemp(0.12, true);
+if (!window.__noLoop) requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function stateJingle(up) {
+  const notes = up ? [523, 659, 784] : [784, 659, 523];
+  notes.forEach((f, i) => setTimeout(() => pop(f), i * 110));
+}
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+
+// 测试钩子（无头验证用，不影响正常游戏）
+window.__test = {
+  beakers, mainBeaker,
+  setTemp: t => mainBeaker.setTemp(t),
+  step: (dt, n) => { for (let i = 0; i < (n || 1); i++) for (const b of activeBeakers()) b.step(dt); },
+  draw,
+  get state() { return mainBeaker.st; },
+  get compare() { return cmpMode; }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

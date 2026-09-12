@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>圆与切线</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#f4f1ea; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(255,255,255,0.92); color:#3a5a8c; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; box-shadow:0 2px 10px rgba(60,60,40,0.18);
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(50,60,80,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  #resetBtn {
+    position:absolute; top:12px; right:12px; z-index:10;
+    font-size:15px; font-weight:bold; padding:9px 18px;
+    border-radius:22px; border:none; background:#3a5a8c; color:#fff;
+    cursor:pointer; box-shadow:0 2px 8px rgba(60,60,40,0.25);
+  }
+  #resetBtn:active { transform:scale(1.06); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(255,255,255,0.72);
+  }
+  #winPanel .msg {
+    font-size:32px; font-weight:bold; color:#b57a00;
+    text-shadow:0 2px 6px rgba(255,255,255,0.8); text-align:center; line-height:1.6;
+  }
+  #winPanel .msg small { font-size:19px; color:#5a6a80; font-weight:normal; }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffb300; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.25);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">任务① 找到切线位置</div>
+<button id="resetBtn">重新开始</button>
+<div id="hint">拖动直线：中间圆点平移，两端把手旋转，让它与圆恰好有 1 个交点！</div>
+<div id="winPanel">
+  <div class="msg">🎉 全部完成！<br><small>从圆外一点 P 引圆的两条切线，切线长相等<br>PT₁ = PT₂ = 4</small></div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 圆心 O、半径 R（=3 个单位）；圆外点 P 满足 OP = 5 个单位
+// 于是切线长 PT = √(OP² − r²) = √(25 − 9) = 4（经典的 3-4-5 直角三角形）
+const O = { x: 0, y: 0 };
+const P = { x: 0, y: 0 };
+let R = 150, UNIT = 50;
+const TOL = 7;          // 显示“相切”的容差（像素）
+const SNAP = 16;        // 靠近相切位置时的磁吸范围（像素）
+const SNAP_P = 28;      // 任务②中“过 P 且相切”的磁吸范围（像素）
+
+function layout() {
+  O.x = W / 2; O.y = H / 2 + 24;
+  R = Math.min(W, H) * 0.22;
+  UNIT = R / 3;
+  const L = 5 * UNIT, a = Math.PI * 5 / 6;   // P 在圆的左下方
+  P.x = O.x + L * Math.cos(a);
+  P.y = O.y + L * Math.sin(a);
+}
+
+// 直线：中点 (mx,my) + 方向角 ang（无向直线，ang 与 ang+π 等价）
+function makeLine(mx, my, ang) {
+  return { mx, my, ang, locked: false, tanIdx: -1 };
+}
+let line1 = null, line2 = null;
+let phase = 1;              // 1：找到切线位置  2：过点 P 作两条切线
+let tangentHold = 0;        // 任务①相切状态的持续时间
+let done2 = false;
+
+function resetGame() {
+  line1 = makeLine(O.x, O.y - R * 1.8, 0);
+  line2 = null;
+  phase = 1; tangentHold = 0; done2 = false;
+  winPanel.style.display = "none";
+  updateScorebar();
+  showHint("拖动直线：中间圆点平移，两端把手旋转，让它与圆恰好有 1 个交点！");
+}
+
+function currentLine() {    // 当前可拖动的线
+  if (line2) return line2.locked ? null : line2;
+  return line1.locked ? null : line1;
+}
+
+/* ================= 几何计算 ================= */
+function dirOf(l) { return [Math.cos(l.ang), Math.sin(l.ang)]; }
+function normalOf(l) { return [-Math.sin(l.ang), Math.cos(l.ang)]; }
+// 圆心到直线的有向距离（沿法向）
+function signedDist(l) {
+  const n = normalOf(l);
+  return n[0] * (O.x - l.mx) + n[1] * (O.y - l.my);
+}
+function distToLine(l) { return Math.abs(signedDist(l)); }
+// 圆心到直线的垂足（相切时即切点）
+function footPoint(l) {
+  const n = normalOf(l), s = signedDist(l);
+  return [O.x - s * n[0], O.y - s * n[1]];
+}
+function distPtLine(l, px, py) {
+  const n = normalOf(l);
+  return Math.abs(n[0] * (px - l.mx) + n[1] * (py - l.my));
+}
+// 0=相离 1=相切 2=相交
+function relation(l) {
+  const d = distToLine(l);
+  if (Math.abs(d - R) <= TOL) return 1;
+  return d > R ? 0 : 2;
+}
+function angDiffPi(a, b) {   // 直线角度差（按 mod π 计）
+  let d = (a - b) % Math.PI;
+  if (d > Math.PI / 2) d -= Math.PI;
+  if (d < -Math.PI / 2) d += Math.PI;
+  return d;
+}
+// 过圆外点 P 的两条切线（精确解）：返回 [{T:[x,y], ang}, ...]
+function tangentsThroughP() {
+  const dx = P.x - O.x, dy = P.y - O.y;
+  const L = Math.hypot(dx, dy);
+  const phi = Math.atan2(dy, dx);
+  const alpha = Math.acos(R / L);    // △OTP 在 T 处直角，cos∠TOP = r/OP
+  return [phi + alpha, phi - alpha].map(a => {
+    const T = [O.x + R * Math.cos(a), O.y + R * Math.sin(a)];
+    return { T, ang: Math.atan2(P.y - T[1], P.x - T[0]) };
+  });
+}
+function tangentLenUnits() {
+  const L = Math.hypot(P.x - O.x, P.y - O.y) / UNIT;
+  return Math.sqrt(L * L - 9);       // r = 3 单位
+}
+// 切线长显示文本（消除浮点尾差，3.999... → 4）
+function lenTxt() {
+  return String(Math.round(tangentLenUnits() * 100) / 100);
+}
+
+/* ================= 磁吸辅助 ================= */
+// 任务①：靠近相切位置时吸附到 d = R
+function trySnapTangent(l) {
+  const n = normalOf(l), s = signedDist(l), d = Math.abs(s);
+  if (d > 0.01 && Math.abs(d - R) < SNAP) {
+    const target = Math.sign(s) * R;
+    l.mx += n[0] * (s - target);
+    l.my += n[1] * (s - target);
+    return true;
+  }
+  return false;
+}
+// 任务②：靠近“过 P 且与圆相切”时吸附到精确切线，返回切线索引（-1 表示未吸附）
+function trySnapThroughP(l, excludeIdx) {
+  if (distPtLine(l, P.x, P.y) > SNAP_P) return -1;
+  if (Math.abs(distToLine(l) - R) > SNAP_P) return -1;
+  const ts = tangentsThroughP();
+  let best = -1, bd = 1e9;
+  ts.forEach((t, i) => {
+    if (i === excludeIdx) return;
+    const score = Math.abs(angDiffPi(l.ang, t.ang)) * 300
+                + Math.hypot(l.mx - t.T[0], l.my - t.T[1]) * 0.2;
+    if (score < bd) { bd = score; best = i; }
+  });
+  if (best < 0) return -1;
+  l.ang = ts[best].ang;
+  l.mx = ts[best].T[0]; l.my = ts[best].T[1];
+  return best;
+}
+
+/* ================= 交互 ================= */
+let drag = null;   // {line, mode:'move'|'rot', id, lastX, lastY, snapped}
+const HANDLE_R = 34;
+
+function handlePts(l) {
+  const u = dirOf(l), hl = R * 2.0;
+  return {
+    a: [l.mx - u[0] * hl, l.my - u[1] * hl],
+    b: [l.mx + u[0] * hl, l.my + u[1] * hl],
+    c: [l.mx, l.my]
+  };
+}
+const near = (x1, y1, x2, y2, r) => Math.hypot(x1 - x2, y1 - y2) <= r;
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const l = currentLine();
+  if (!l) return;
+  const x = e.clientX, y = e.clientY;
+  const h = handlePts(l);
+  let mode = null;
+  if (near(x, y, h.a[0], h.a[1], HANDLE_R) || near(x, y, h.b[0], h.b[1], HANDLE_R)) mode = "rot";
+  else if (near(x, y, h.c[0], h.c[1], HANDLE_R)) mode = "move";
+  else if (distPtLine(l, x, y) <= 20) mode = "move";   // 抓住线身也可平移
+  if (!mode) return;
+  drag = { line: l, mode, id: e.pointerId, lastX: x, lastY: y, snapped: false };
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const l = drag.line, x = e.clientX, y = e.clientY;
+  if (drag.mode === "rot") {
+    l.ang = Math.atan2(y - l.my, x - l.mx);
+  } else {
+    l.mx += x - drag.lastX;
+    l.my += y - drag.lastY;
+    drag.lastX = x; drag.lastY = y;
+  }
+  // 磁吸 + 吸附音效
+  let snapped = false;
+  if (phase === 1) snapped = trySnapTangent(l);
+  else snapped = trySnapThroughP(l, l === line2 ? line1.tanIdx : -1) >= 0;
+  if (snapped && !drag.snapped) snapSound();
+  drag.snapped = snapped;
+  updateScorebar();
+});
+
+window.addEventListener("pointerup", e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const l = drag.line;
+  drag = null;
+  if (phase === 2) tryLock(l);
+  updateScorebar();
+});
+
+// 任务②：松手时若精确“过 P 且相切”，锁定为一条金色切线
+function tryLock(l) {
+  if (!l || l.locked) return;
+  if (distPtLine(l, P.x, P.y) > 2.5 || Math.abs(distToLine(l) - R) > 2.5) return;
+  const ts = tangentsThroughP();
+  l.tanIdx = ts.findIndex(t => Math.hypot(l.mx - t.T[0], l.my - t.T[1]) < 3);
+  l.locked = true;
+  fanfareShort();
+  if (l === line1) {
+    showHint("第一条切线完成！过点 P 还有另一条切线，把它也找出来");
+    line2 = makeLine(O.x + R * 1.4, O.y + R * 2.2, 0);
+  } else {
+    done2 = true;
+    showHint(`PT₁ = PT₂ = ${lenTxt()}，从圆外一点引的两条切线等长！`);
+    fanfare();
+    setTimeout(showWin, 1000);
+  }
+  updateScorebar();
+}
+
+function showWin() {
+  winPanel.querySelector(".msg").innerHTML =
+    `🎉 全部完成！<br><small>从圆外一点 P 引圆的两条切线，切线长相等<br>PT₁ = PT₂ = ${lenTxt()}</small>`;
+  winPanel.style.display = "flex";
+}
+
+/* ================= 状态栏 ================= */
+const REL_TXT = ["相离（0 个交点）", "相切（1 个交点）✨", "相交（2 个交点）"];
+function updateScorebar() {
+  if (phase === 1) {
+    const n = relation(line1);
+    scorebar.textContent = `任务① 找到切线位置 ｜ 当前：${REL_TXT[n]}`;
+    scorebar.style.color = n === 1 ? "#b57a00" : "#3a5a8c";
+  } else if (done2) {
+    scorebar.textContent = `🎉 任务完成！PT₁ = PT₂ = ${lenTxt()}`;
+    scorebar.style.color = "#b57a00";
+  } else {
+    const l = currentLine();
+    if (!l) return;
+    const n = relation(l);
+    const through = distPtLine(l, P.x, P.y) <= 8;
+    const which = line1.locked ? "任务② 过 P 作另一条切线" : "任务② 过点 P 作切线";
+    scorebar.textContent = `${which} ｜ ${through ? "✓ 经过 P" : "✗ 未经过 P"} ｜ ${REL_TXT[n]}`;
+    scorebar.style.color = (through && n === 1) ? "#b57a00" : "#3a5a8c";
+  }
+}
+
+/* ================= 绘制 ================= */
+function dot(x, y, r, color) {
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 2; ctx.stroke();
+}
+function label(text, x, y, color, size) {
+  ctx.font = `bold ${size || 16}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = color || "#444";
+  ctx.fillText(text, x, y);
+}
+
+function drawScene() {
+  // 背景网格点
+  ctx.fillStyle = "rgba(90,110,140,0.10)";
+  const g = 44;
+  for (let x = g / 2; x < W; x += g)
+    for (let y = g / 2; y < H; y += g)
+      ctx.fillRect(x - 1, y - 1, 2, 2);
+  // 大圆
+  ctx.beginPath(); ctx.arc(O.x, O.y, R, 0, 7);
+  ctx.fillStyle = "rgba(120,170,255,0.14)"; ctx.fill();
+  ctx.strokeStyle = "#2f5fa8"; ctx.lineWidth = 3.5; ctx.stroke();
+  // 圆心 O
+  dot(O.x, O.y, 5, "#2f5fa8");
+  label("圆心 O", O.x, O.y - 18, "#2f5fa8");
+  // 参考半径（虚线）与 r = 3
+  const ra = -Math.PI / 3;
+  const rx = O.x + R * Math.cos(ra), ry = O.y + R * Math.sin(ra);
+  ctx.setLineDash([6, 6]);
+  ctx.strokeStyle = "rgba(47,95,168,0.55)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(O.x, O.y); ctx.lineTo(rx, ry); ctx.stroke();
+  ctx.setLineDash([]);
+  label("r = 3", (O.x + rx) / 2 + 22, (O.y + ry) / 2, "rgba(47,95,168,0.8)", 14);
+  // 点 P 与虚线 OP（任务②）
+  if (phase === 2) {
+    ctx.setLineDash([7, 7]);
+    ctx.strokeStyle = "rgba(130,80,180,0.6)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(O.x, O.y); ctx.lineTo(P.x, P.y); ctx.stroke();
+    ctx.setLineDash([]);
+    label("OP = 5", (O.x + P.x) / 2 - 6, (O.y + P.y) / 2 - 16, "rgba(130,80,180,0.9)", 14);
+    dot(P.x, P.y, 8, "#8e44ad");
+    label("P", P.x, P.y + 26, "#8e44ad", 18);
+  }
+}
+
+function drawRightAngle(T, u) {
+  const r = [(O.x - T[0]) / R, (O.y - T[1]) / R];   // 指向圆心
+  const k = 15;
+  ctx.strokeStyle = "#b57a00"; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(T[0] + r[0] * k, T[1] + r[1] * k);
+  ctx.lineTo(T[0] + r[0] * k + u[0] * k, T[1] + r[1] * k + u[1] * k);
+  ctx.lineTo(T[0] + u[0] * k, T[1] + u[1] * k);
+  ctx.stroke();
+  label("90°", T[0] + r[0] * 42 + u[0] * 22, T[1] + r[1] * 42 + u[1] * 22, "#b57a00", 14);
+}
+
+function drawLineObj(l, name) {
+  const u = dirOf(l), D = W + H;
+  const n = relation(l);
+  const isTan = l.locked || n === 1;
+  // 直线本体
+  ctx.save();
+  if (isTan) { ctx.shadowColor = "rgba(255,180,0,0.6)"; ctx.shadowBlur = 16; }
+  ctx.strokeStyle = isTan ? "#e8a812" : "#33527a";
+  ctx.lineWidth = isTan ? 5 : 4;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(l.mx - u[0] * D, l.my - u[1] * D);
+  ctx.lineTo(l.mx + u[0] * D, l.my + u[1] * D);
+  ctx.stroke();
+  ctx.restore();
+  // 相交：标出 2 个交点
+  if (n === 2 && !l.locked) {
+    const d = distToLine(l), F = footPoint(l);
+    const half = Math.sqrt(Math.max(0, R * R - d * d));
+    for (const s of [-1, 1])
+      dot(F[0] + u[0] * half * s, F[1] + u[1] * half * s, 6, "#d3382c");
+  }
+  // 相切：切点 + 半径 + 垂直标记
+  if (isTan) {
+    const T = footPoint(l);
+    ctx.strokeStyle = "#e8a812"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(O.x, O.y); ctx.lineTo(T[0], T[1]); ctx.stroke();
+    drawRightAngle(T, u);
+    dot(T[0], T[1], 6.5, "#e8a812");
+    const out = [(T[0] - O.x) / R, (T[1] - O.y) / R];   // 朝圆外
+    label("切点 T", T[0] + out[0] * 30, T[1] + out[1] * 30, "#b57a00", 15);
+  }
+  // 活动线的拖拽把手
+  if (!l.locked && currentLine() === l) {
+    const h = handlePts(l);
+    for (const p of [h.a, h.b]) {   // 端点：旋转把手
+      ctx.beginPath(); ctx.arc(p[0], p[1], 15, 0, 7);
+      ctx.fillStyle = "rgba(51,82,122,0.9)"; ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+      label("↻", p[0], p[1] + 1, "#fff", 16);
+    }
+    // 中点：平移把手
+    ctx.save();
+    ctx.translate(h.c[0], h.c[1]); ctx.rotate(Math.PI / 4);
+    ctx.fillStyle = "rgba(51,82,122,0.9)";
+    ctx.fillRect(-11, -11, 22, 22);
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.strokeRect(-11, -11, 22, 22);
+    ctx.restore();
+    label("✥", h.c[0], h.c[1] + 1, "#fff", 15);
+  }
+}
+
+// 任务②完成后：高亮两条切线长并标注数值
+function drawTangentLengths() {
+  if (!done2) return;
+  const len = lenTxt();
+  [line1, line2].forEach((l, i) => {
+    if (!l) return;
+    const T = footPoint(l);
+    ctx.strokeStyle = "#e07000"; ctx.lineWidth = 6; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(P.x, P.y); ctx.lineTo(T[0], T[1]); ctx.stroke();
+    const mx = (P.x + T[0]) / 2, my = (P.y + T[1]) / 2;
+    const off = i === 0 ? -20 : 20;
+    label(`PT${i === 0 ? "₁" : "₂"} = ${len}`, mx, my + off, "#c05a00", 18);
+  });
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#f4f1ea";
+  ctx.fillRect(0, 0, W, H);
+  drawScene();
+  if (line2) drawLineObj(line2);
+  drawLineObj(line1);
+  drawTangentLengths();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  // 任务①：相切状态保持 0.5 秒（且未在拖动）即完成
+  if (phase === 1) {
+    if (!drag && relation(line1) === 1) {
+      tangentHold += dt;
+      if (tangentHold >= 0.5) {
+        phase = 2;
+        fanfare();
+        showHint("任务①完成！进阶：把线拖到经过圆外的点 P，并且仍与圆相切");
+        updateScorebar();
+      }
+    } else tangentHold = 0;
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const snapSound = () => tone(880, 0.08, 0.1, "triangle");
+function fanfareShort() { [659, 784].forEach((f, i) => setTimeout(() => pop(f), i * 120)); }
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2800);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+document.getElementById("resetBtn").addEventListener("click", () => { resetGame(); pop(660); });
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+resize();
+resetGame();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

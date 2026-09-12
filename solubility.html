@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>溶解度曲线实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#e8f2f9; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,80,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,50,80,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:18px;
+    background:rgba(0,20,40,0.45);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel .sub {
+    font-size:20px; color:#fff; text-shadow:0 2px 6px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#4a3300;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button.ghost { background:rgba(255,255,255,0.92); color:#234; }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🎯 任务：让 60 g KNO₃ 全部溶解</div>
+<div id="hint">把左下角盒子里的盐拖进水里（点一下盒子也行），拖动温度滑杆改变水温！</div>
+<div id="winPanel">
+  <div class="msg">🎉 60 g KNO₃ 全部溶解了！</div>
+  <div class="sub">你发现了吗：温度越高，100 g 水能溶解的 KNO₃ 越多！</div>
+  <div style="display:flex; gap:18px;">
+    <button id="continueBtn" class="ghost">继续探索</button>
+    <button id="replayBtn">再玩一次</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 科学数据 ================= */
+// KNO₃ 溶解度（g / 100 g 水），教材标准数据
+const SOL = [[0,13.3],[10,20.9],[20,31.6],[30,45.8],[40,63.9],[50,85.5],[60,110.0],[70,138.0],[80,169.0]];
+function solubility(t) {
+  t = Math.max(0, Math.min(80, t));
+  for (let i = 0; i < SOL.length - 1; i++) {
+    const [t0, s0] = SOL[i], [t1, s1] = SOL[i + 1];
+    if (t <= t1) return s0 + (s1 - s0) * (t - t0) / (t1 - t0);
+  }
+  return SOL[SOL.length - 1][1];
+}
+const TASK_G = 60;      // 任务：溶解 60 g
+const ADD_G = 10;       // 每次加 10 g
+const MAX_ADD = 200;    // 盐盒上限
+
+/* ================= 布局 ================= */
+const L = {};   // 所有可点击区域与图形位置，随窗口重算
+function computeLayout() {
+  // 右侧图表面板
+  const gw = Math.min(W * 0.38, 460);
+  L.graph = { x: W - gw - 22, y: 84, w: gw, h: Math.min(H * 0.55, 430) };
+  const g = L.graph;
+  L.plot = { x0: g.x + 56, y0: g.y + 66, x1: g.x + g.w - 20, y1: g.y + g.h - 66 };
+  // 左侧实验区宽度
+  const leftW = L.graph.x - 20;
+  // 烧杯
+  const bw = Math.min(300, leftW * 0.44), bh = Math.min(400, H * 0.56);
+  L.beaker = { x: leftW * 0.60 - bw / 2, y: H * 0.52 - bh / 2 + 40, w: bw, h: bh };
+  const b = L.beaker;
+  L.inner = { x: b.x + 16, y: b.y + 62, w: b.w - 32, h: b.h - 62 - 20 };  // 水面区域
+  // 温度滑杆（竖直）
+  L.slider = { x: Math.max(70, leftW * 0.15), y1: H * 0.20, y2: H * 0.58, knobR: 26 };
+  // 盐盒
+  L.box = { x: 26, y: H - 168, w: 190, h: 122 };
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  computeLayout();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+let temp = 20;            // 水温 °C
+let totalAdded = 0;       // 一共加入的盐（g）
+let dissolvedCur = 0;     // 当前已溶解（g，逻辑值；升温时平滑追赶目标值）
+let granules = [];        // 下落中的盐粒 {x,y,vx,vy,mode:'fade'|'pile',tx,ty,rot}
+let pileGranules = [];    // 沉底堆积的盐粒 {x,y,rot}
+let ions = [];            // 水中已溶解的离子点 {x,y,ph,sp,c}
+let bubbles = [];         // 溶解气泡 {x,y,r,vy,life}
+let steams = [];          // 水面热气 {x,y,r,vy,life}
+let heatAcc = 0, crysAcc = 0;   // 每 2 g 对应一粒沉底盐粒的累积器
+let saltDrag = null;      // 从盐盒拖出的一把盐 {x,y,moved}
+let sliding = false;
+let won = false, sedHinted = false, heatHinted = false;
+
+function resetGame() {
+  temp = 20; totalAdded = 0; dissolvedCur = 0;
+  granules = []; pileGranules = []; ions = []; bubbles = []; steams = [];
+  heatAcc = 0; crysAcc = 0; saltDrag = null; sliding = false;
+  won = false; sedHinted = false; heatHinted = false;
+  winPanel.style.display = "none";
+  updateScore();
+}
+function updateScore() {
+  scorebar.textContent = `🎯 任务：让 ${TASK_G} g KNO₃ 全部溶解 · 已加入 ${totalAdded} g · 已溶解 ${Math.round(dissolvedCur)} g`;
+}
+
+/* ================= 加盐 / 溶解 ================= */
+function addSalt(g, px) {
+  if (totalAdded >= MAX_ADD) { showHint("杯子里的盐已经够多啦，先看看能溶解多少！"); return; }
+  totalAdded += g;
+  // 当前温度下还能溶解多少
+  const canDiss = Math.max(0, solubility(temp) - dissolvedCur);
+  const gDiss = Math.min(g, canDiss), gSed = g - gDiss;
+  dissolvedCur += gDiss;
+  // 6 粒盐动画：溶解的下落中消失，多余的落到杯底
+  const nD = Math.round(6 * gDiss / g), nS = 6 - nD;
+  const ix = Math.max(L.inner.x + 20, Math.min(L.inner.x + L.inner.w - 20, px || L.inner.x + L.inner.w / 2));
+  for (let i = 0; i < 6; i++) {
+    const toPile = i >= nD;
+    let tx = 0, ty = 0;
+    if (toPile) {
+      const idx = pileGranules.length + granules.filter(q => q.mode === "pile").length;
+      [tx, ty] = pilePos(idx);
+    }
+    granules.push({
+      x: ix + (Math.random() - 0.5) * 50, y: L.inner.y - 30 - Math.random() * 24,
+      vx: (Math.random() - 0.5) * 30, vy: 40 + Math.random() * 40,
+      mode: toPile ? "pile" : "fade", tx, ty,
+      rot: Math.random() * Math.PI, life: 1
+    });
+  }
+  pop(660);
+  if (gSed > 0.5 && !sedHinted) {
+    sedHinted = true;
+    showHint("水“吃饱”了，多余的盐沉到杯底啦！看右边的红点——试试把温度调高？");
+  }
+  updateScore();
+}
+
+// 沉底盐粒的堆积位置（小山堆形状，确定性伪随机抖动）
+function pilePos(i) {
+  const per = 8;
+  const row = Math.floor(i / per), col = i % per;
+  const cx = L.inner.x + L.inner.w / 2;
+  const width = Math.max(30, L.inner.w * 0.68 - row * 13);
+  const fx = (col + 0.5) / per - 0.5;
+  const j1 = Math.sin(i * 12.9898) * 43758.5453 % 1;
+  const j2 = Math.sin(i * 78.233) * 12543.1234 % 1;
+  return [cx + fx * width + j1 * 7, L.inner.y + L.inner.h - 9 - row * 8 + j2 * 3];
+}
+
+function spawnBubble(x, y) {
+  bubbles.push({ x, y, r: 2.5 + Math.random() * 3.5, vy: -50 - Math.random() * 60, life: 1 });
+  blip();
+}
+function spawnSteam() {
+  steams.push({
+    x: L.inner.x + 20 + Math.random() * (L.inner.w - 40), y: L.inner.y - 4,
+    r: 5 + Math.random() * 6, vy: -26 - Math.random() * 22, life: 1
+  });
+}
+
+/* ================= 物理 / 状态推进 ================= */
+let lastBlip = 0;
+function blip() {
+  const now = performance.now();
+  if (now - lastBlip > 130) { lastBlip = now; tone(900 + Math.random() * 500, 0.06, 0.05, "sine"); }
+}
+function update(dt) {
+  // 1) 温度变化 → 目标溶解量变化（平滑追赶，配动画）
+  const target = Math.min(totalAdded, solubility(temp));
+  if (target > dissolvedCur + 0.01) {
+    // 升温：沉底的盐继续溶解（吸热溶解，冒气泡）
+    const old = dissolvedCur;
+    dissolvedCur = Math.min(target, dissolvedCur + 30 * dt);
+    heatAcc += dissolvedCur - old;
+    while (heatAcc >= 2 && pileGranules.length > 0) {
+      const p = pileGranules.pop();
+      spawnBubble(p.x, p.y);
+      heatAcc -= 2;
+    }
+    if (pileGranules.length > 0 && !heatHinted && sedHinted) {
+      heatHinted = true;
+      showHint("看到了吗？温度升高，沉底的盐又开始溶解了！");
+    }
+    updateScore();
+  } else if (target < dissolvedCur - 0.01) {
+    // 降温：溶不下的盐重新结晶析出
+    const old = dissolvedCur;
+    dissolvedCur = Math.max(target, dissolvedCur - 25 * dt);
+    crysAcc += old - dissolvedCur;
+    while (crysAcc >= 2) {
+      const idx = pileGranules.length + granules.filter(q => q.mode === "pile").length;
+      const [tx, ty] = pilePos(idx);
+      granules.push({
+        x: L.inner.x + 24 + Math.random() * (L.inner.w - 48),
+        y: L.inner.y + 20 + Math.random() * L.inner.h * 0.4,
+        vx: 0, vy: 30, mode: "pile", tx, ty, rot: Math.random() * Math.PI, life: 1
+      });
+      crysAcc -= 2;
+    }
+    updateScore();
+  }
+  // 逻辑沉淀已清零时，残余的颗粒（取整误差）化作气泡消失
+  if (totalAdded > 0 && totalAdded - dissolvedCur < 0.5 && pileGranules.length > 0) {
+    while (pileGranules.length > 0) {
+      const p = pileGranules.pop();
+      spawnBubble(p.x, p.y);
+    }
+    heatAcc = 0;
+  }
+  // 2) 下落的盐粒
+  for (let i = granules.length - 1; i >= 0; i--) {
+    const q = granules[i];
+    q.vy += 900 * dt;
+    q.x += q.vx * dt; q.y += q.vy * dt;
+    q.rot += dt * 2;
+    if (q.mode === "fade") {
+      // 溶解：落到水中后缩小消失，冒出小气泡
+      if (q.y > L.inner.y + L.inner.h * 0.45) {
+        q.life -= dt * 3.5;
+        if (Math.random() < 0.1) spawnBubble(q.x, q.y);
+        if (q.life <= 0) granules.splice(i, 1);
+      }
+    } else {
+      // 沉底：落到堆积位置
+      if (q.y >= q.ty) { pileGranules.push({ x: q.tx, y: q.ty, rot: q.rot }); granules.splice(i, 1); }
+    }
+  }
+  // 3) 水中离子点：数量 ∝ 已溶解克数，把“溶解了多少”画出来
+  const wantIons = Math.min(130, Math.round(dissolvedCur));
+  while (ions.length < wantIons)
+    ions.push({
+      x: L.inner.x + 14 + Math.random() * (L.inner.w - 28),
+      y: L.inner.y + 12 + Math.random() * (L.inner.h - 40),
+      ph: Math.random() * 7, sp: 0.6 + Math.random() * 1.2,
+      c: ions.length % 2 ? "#8f7bff" : "#4aa8e8"
+    });
+  while (ions.length > wantIons) ions.pop();
+  // 4) 气泡上升
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.y += b.vy * dt; b.x += Math.sin(b.y * 0.05) * 0.4;
+    if (b.y < L.inner.y + 6) bubbles.splice(i, 1);
+  }
+  // 5) 热气（温度越高越多）
+  if (temp >= 45 && Math.random() < (temp - 45) / 35 * 0.25) spawnSteam();
+  for (let i = steams.length - 1; i >= 0; i--) {
+    const s = steams[i];
+    s.y += s.vy * dt; s.r += 14 * dt; s.life -= dt * 0.7;
+    if (s.life <= 0) steams.splice(i, 1);
+  }
+  // 6) 胜利判定
+  if (!won && totalAdded >= TASK_G && totalAdded - dissolvedCur < 0.5 && dissolvedCur >= TASK_G - 0.5) {
+    won = true;
+    fanfare();
+    setTimeout(() => { winPanel.style.display = "flex"; }, 800);
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawSlider() {
+  const s = L.slider;
+  const knobY = s.y2 - (temp / 80) * (s.y2 - s.y1);
+  // 标题
+  ctx.fillStyle = "#23405e"; ctx.font = "bold 17px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("水温", s.x, s.y1 - 46);
+  // 滑杆槽（蓝→红渐变）
+  const g = ctx.createLinearGradient(0, s.y2, 0, s.y1);
+  g.addColorStop(0, "#4aa8e8"); g.addColorStop(0.5, "#7bc47f"); g.addColorStop(1, "#e85454");
+  ctx.fillStyle = "rgba(255,255,255,0.8)";
+  roundRect(s.x - 11, s.y1 - 6, 22, s.y2 - s.y1 + 12, 11, true);
+  ctx.fillStyle = g;
+  roundRect(s.x - 7, s.y1, 14, s.y2 - s.y1, 7, true);
+  // 刻度
+  ctx.fillStyle = "#5a7a99"; ctx.font = "12px sans-serif"; ctx.textAlign = "left";
+  for (let t = 0; t <= 80; t += 20) {
+    const y = s.y2 - (t / 80) * (s.y2 - s.y1);
+    ctx.fillRect(s.x + 12, y - 1, 8, 2);
+    ctx.fillText(t + "°", s.x + 24, y + 4);
+  }
+  //  knob（大圆形，易拖拽）
+  ctx.beginPath(); ctx.arc(s.x, knobY, s.knobR, 0, 7);
+  ctx.fillStyle = "#ffffff"; ctx.fill();
+  ctx.lineWidth = 4; ctx.strokeStyle = temp >= 55 ? "#e85454" : temp <= 10 ? "#4aa8e8" : "#7bc47f"; ctx.stroke();
+  ctx.fillStyle = "#23405e"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(Math.round(temp) + "°", s.x, knobY + 5);
+}
+
+function drawFlameAndIce() {
+  const b = L.beaker;
+  const cx = b.x + b.w / 2, baseY = b.y + b.h + 6;
+  if (temp > 25) {
+    // 加热火焰，大小随温度
+    const f = (temp - 25) / 55;
+    const fh = 12 + f * 42, fw = 22 + f * 26;
+    ctx.save();
+    ctx.globalAlpha = 0.5 + f * 0.5;
+    for (const [sc, col] of [[1, "#ff8c2f"], [0.55, "#ffd23f"]]) {
+      ctx.beginPath();
+      ctx.moveTo(cx - fw * sc, baseY + 18);
+      ctx.quadraticCurveTo(cx - fw * 0.7 * sc, baseY + 18 - fh * 0.55 * sc, cx, baseY + 18 - fh * sc);
+      ctx.quadraticCurveTo(cx + fw * 0.7 * sc, baseY + 18 - fh * 0.55 * sc, cx + fw * sc, baseY + 18);
+      ctx.closePath();
+      ctx.fillStyle = col; ctx.fill();
+    }
+    ctx.restore();
+    // 炉灶
+    ctx.fillStyle = "#54687d";
+    ctx.fillRect(cx - 40, baseY + 18, 80, 10);
+  } else if (temp <= 10) {
+    // 结冰：杯底周围画冰块
+    const a = (10 - temp) / 10;
+    ctx.save();
+    ctx.globalAlpha = 0.35 + a * 0.5;
+    ctx.fillStyle = "#bfe4f7"; ctx.strokeStyle = "#7cc4ee"; ctx.lineWidth = 2;
+    for (const [dx, sz] of [[-70, 30], [58, 26], [-38, 20], [86, 20]]) {
+      ctx.save();
+      ctx.translate(cx + dx, baseY + 16); ctx.rotate(dx * 0.02);
+      ctx.fillRect(-sz / 2, -sz / 2, sz, sz); ctx.strokeRect(-sz / 2, -sz / 2, sz, sz);
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+}
+
+function drawBeaker() {
+  const b = L.beaker, n = L.inner;
+  // 水面以上玻璃后壁
+  ctx.fillStyle = "rgba(200,225,245,0.35)";
+  ctx.fillRect(b.x, b.y, b.w, b.h);
+  // 水
+  const wg = ctx.createLinearGradient(0, n.y, 0, n.y + n.h);
+  wg.addColorStop(0, "rgba(140,200,240,0.75)"); wg.addColorStop(1, "rgba(90,160,220,0.85)");
+  ctx.fillStyle = wg;
+  ctx.fillRect(n.x, n.y, n.w, n.h);
+  // 水面线
+  ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(n.x, n.y); ctx.lineTo(n.x + n.w, n.y); ctx.stroke();
+  // 结冰时水面冰层
+  if (temp <= 10) {
+    ctx.save();
+    ctx.globalAlpha = (10 - temp) / 10 * 0.8;
+    ctx.fillStyle = "#dff1fb";
+    ctx.fillRect(n.x, n.y, n.w, 8);
+    ctx.restore();
+  }
+  // 离子点（溶解的盐）
+  for (const io of ions) {
+    const wx = Math.sin(performance.now() / 1000 * io.sp + io.ph) * 5;
+    const wy = Math.cos(performance.now() / 1300 * io.sp + io.ph) * 5;
+    ctx.beginPath(); ctx.arc(io.x + wx, io.y + wy, 2.6, 0, 7);
+    ctx.fillStyle = io.c; ctx.globalAlpha = 0.75; ctx.fill(); ctx.globalAlpha = 1;
+  }
+  // 沉底盐堆（先画底层“山”，再画颗粒）
+  if (pileGranules.length > 0) {
+    const rows = Math.ceil(pileGranules.length / 8);
+    ctx.fillStyle = "rgba(245,245,250,0.85)";
+    ctx.beginPath();
+    ctx.ellipse(n.x + n.w / 2, n.y + n.h - 4, Math.max(30, n.w * 0.36 - rows * 3), 6 + rows * 5, 0, Math.PI, 0);
+    ctx.fill();
+  }
+  for (const p of pileGranules) drawGranule(p.x, p.y, p.rot, 1);
+  for (const q of granules) drawGranule(q.x, q.y, q.rot, Math.max(0.15, q.life));
+  // 气泡
+  ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 1.5;
+  for (const bb of bubbles) {
+    ctx.beginPath(); ctx.arc(bb.x, bb.y, bb.r, 0, 7); ctx.stroke();
+  }
+  // 玻璃壁（前）
+  ctx.strokeStyle = "rgba(120,160,190,0.95)"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(b.x, b.y - 4);
+  ctx.lineTo(b.x, b.y + b.h - 16);
+  ctx.quadraticCurveTo(b.x, b.y + b.h, b.x + 16, b.y + b.h);
+  ctx.lineTo(b.x + b.w - 16, b.y + b.h);
+  ctx.quadraticCurveTo(b.x + b.w, b.y + b.h, b.x + b.w, b.y + b.h - 16);
+  ctx.lineTo(b.x + b.w, b.y - 4);
+  ctx.stroke();
+  // 标签
+  ctx.fillStyle = "#23405e"; ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("100 g 水", b.x + b.w / 2, n.y - 14);
+  // 当前溶解度说明
+  const s = solubility(temp);
+  ctx.font = "15px sans-serif"; ctx.fillStyle = "#3a5a7d";
+  ctx.fillText(`${Math.round(temp)}°C 时，100 g 水最多能溶解 ${s.toFixed(1)} g KNO₃`, b.x + b.w / 2, b.y + b.h + 52);
+  const sed = totalAdded - dissolvedCur;
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillStyle = sed > 0.5 ? "#c2442f" : "#2f8f4e";
+  ctx.fillText(sed > 0.5 ? `杯底沉淀：${sed.toFixed(0)} g（还没溶解）` : totalAdded > 0 ? "杯底没有沉淀，全部溶解啦" : "", b.x + b.w / 2, b.y + b.h + 76);
+  // 热气
+  for (const s2 of steams) {
+    ctx.save();
+    ctx.globalAlpha = s2.life * 0.45;
+    ctx.beginPath(); ctx.arc(s2.x, s2.y, s2.r, 0, 7);
+    ctx.fillStyle = "#ffffff"; ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawGranule(x, y, rot, alpha) {
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(rot); ctx.globalAlpha = alpha;
+  ctx.fillStyle = "#f6f6fa"; ctx.strokeStyle = "rgba(120,130,150,0.7)"; ctx.lineWidth = 1;
+  ctx.fillRect(-4.5, -4.5, 9, 9); ctx.strokeRect(-4.5, -4.5, 9, 9);
+  ctx.restore();
+}
+
+function drawBox() {
+  const bx = L.box;
+  // 盒子
+  ctx.fillStyle = "#c98f4e";
+  roundRect(bx.x, bx.y + 24, bx.w, bx.h - 24, 10, true);
+  ctx.fillStyle = "#a8743a";
+  roundRect(bx.x, bx.y + 24, bx.w, 14, 7, true);
+  // 盒内晶体堆
+  ctx.fillStyle = "#f6f6fa";
+  ctx.beginPath();
+  ctx.ellipse(bx.x + bx.w / 2, bx.y + 34, bx.w * 0.36, 18, 0, Math.PI, 0);
+  ctx.fill();
+  for (let i = 0; i < 14; i++) {
+    const a = i * 2.4;
+    drawGranule(bx.x + bx.w / 2 + Math.cos(a) * bx.w * 0.3 * ((i % 5) / 5 + 0.2), bx.y + 26 + Math.sin(a * 3) * 8, a, 1);
+  }
+  // 标签
+  ctx.fillStyle = "#ffffff"; ctx.font = "bold 18px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("KNO₃ 晶体", bx.x + bx.w / 2, bx.y + 72);
+  ctx.font = "14px sans-serif"; ctx.fillStyle = "#ffe9c4";
+  ctx.fillText("拖进水里 / 点一下：+" + ADD_G + " g", bx.x + bx.w / 2, bx.y + 96);
+  // 拖拽中的一把盐
+  if (saltDrag) {
+    for (let i = 0; i < 5; i++)
+      drawGranule(saltDrag.x + Math.cos(i * 1.26) * 12, saltDrag.y + Math.sin(i * 1.26) * 10, i, 1);
+    ctx.fillStyle = "#23405e"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("+" + ADD_G + " g", saltDrag.x, saltDrag.y - 24);
+  }
+}
+
+/* ---- 右侧溶解度曲线图 ---- */
+function gx(t) { return L.plot.x0 + (t / 80) * (L.plot.x1 - L.plot.x0); }
+function gy(s) { return L.plot.y1 - (s / 180) * (L.plot.y1 - L.plot.y0); }
+function drawGraph() {
+  const g = L.graph, p = L.plot;
+  // 面板
+  ctx.fillStyle = "rgba(255,255,255,0.94)";
+  roundRect(g.x, g.y, g.w, g.h, 14, true);
+  ctx.strokeStyle = "rgba(60,90,120,0.3)"; ctx.lineWidth = 2;
+  roundRect(g.x, g.y, g.w, g.h, 14, false); ctx.stroke();
+  // 标题
+  ctx.fillStyle = "#23405e"; ctx.font = "bold 19px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("KNO₃ 溶解度曲线", g.x + g.w / 2, g.y + 30);
+  // 网格 + 坐标轴
+  ctx.strokeStyle = "#23405e"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(p.x0, p.y0); ctx.lineTo(p.x0, p.y1); ctx.lineTo(p.x1, p.y1); ctx.stroke();
+  ctx.font = "12px sans-serif"; ctx.fillStyle = "#5a7a99";
+  ctx.textAlign = "center";
+  for (let t = 0; t <= 80; t += 20) {
+    ctx.strokeStyle = "rgba(90,122,153,0.18)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(gx(t), p.y0); ctx.lineTo(gx(t), p.y1); ctx.stroke();
+    ctx.fillText(t + "", gx(t), p.y1 + 18);
+  }
+  ctx.textAlign = "right";
+  for (let s = 0; s <= 180; s += 30) {
+    ctx.strokeStyle = "rgba(90,122,153,0.18)";
+    ctx.beginPath(); ctx.moveTo(p.x0, gy(s)); ctx.lineTo(p.x1, gy(s)); ctx.stroke();
+    ctx.fillText(s + "", p.x0 - 6, gy(s) + 4);
+  }
+  ctx.textAlign = "center";
+  ctx.fillText("温度 (°C)", (p.x0 + p.x1) / 2, p.y1 + 38);
+  ctx.save();
+  ctx.translate(p.x0 - 38, (p.y0 + p.y1) / 2); ctx.rotate(-Math.PI / 2);
+  ctx.fillText("溶解度 (g)", 0, 0);
+  ctx.restore();
+  // 任务线：60 g
+  ctx.setLineDash([6, 6]);
+  ctx.strokeStyle = "rgba(47,143,78,0.7)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(p.x0, gy(TASK_G)); ctx.lineTo(p.x1, gy(TASK_G)); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#2f8f4e"; ctx.textAlign = "left"; ctx.font = "bold 13px sans-serif";
+  ctx.fillText("任务 " + TASK_G + " g", p.x0 + 6, gy(TASK_G) - 6);
+  // 溶解度曲线（平滑连接数据点）
+  ctx.strokeStyle = "#2f7fe9"; ctx.lineWidth = 3.5;
+  ctx.beginPath();
+  SOL.forEach(([t, s], i) => { i ? ctx.lineTo(gx(t), gy(s)) : ctx.moveTo(gx(t), gy(s)); });
+  ctx.stroke();
+  ctx.fillStyle = "#2f7fe9";
+  for (const [t, s] of SOL) { ctx.beginPath(); ctx.arc(gx(t), gy(s), 3.5, 0, 7); ctx.fill(); }
+  // 当前状态红点
+  const dx = gx(temp), dy = gy(Math.min(totalAdded, 180));
+  // 到坐标轴的虚线
+  ctx.setLineDash([4, 5]);
+  ctx.strokeStyle = "rgba(230,60,60,0.55)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(dx, dy); ctx.lineTo(dx, p.y1); ctx.moveTo(dx, dy); ctx.lineTo(p.x0, dy); ctx.stroke();
+  ctx.setLineDash([]);
+  const pulse = 8 + Math.sin(performance.now() / 300) * 1.6;
+  ctx.beginPath(); ctx.arc(dx, dy, pulse, 0, 7);
+  ctx.fillStyle = "#e63c3c"; ctx.fill();
+  ctx.lineWidth = 2.5; ctx.strokeStyle = "#ffffff"; ctx.stroke();
+  // 状态判定文字
+  const s = solubility(temp), sed = totalAdded - dissolvedCur;
+  let msg, col;
+  if (totalAdded === 0) { msg = "还没加盐，红点在横轴上"; col = "#5a7a99"; }
+  else if (sed > 0.5) { msg = `过饱和：${sed.toFixed(0)} g 溶不下，沉底了`; col = "#c2442f"; }
+  else if (Math.abs(totalAdded - s) < 2.5) { msg = "红点正好在曲线上：恰好饱和！"; col = "#e8940f"; }
+  else { msg = "红点在曲线下方：不饱和，还能再溶解"; col = "#2f8f4e"; }
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center"; ctx.fillStyle = col;
+  ctx.fillText(msg, g.x + g.w / 2, g.y + g.h - 12);
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 背景
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#eef6fc"); bg.addColorStop(1, "#d8e9f5");
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  // 实验桌面
+  ctx.fillStyle = "#c4d8e8";
+  ctx.fillRect(0, L.beaker.y + L.beaker.h + 30, L.graph.x - 8, H);
+  drawFlameAndIce();
+  drawBeaker();
+  drawSlider();
+  drawBox();
+  drawGraph();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 交互 ================= */
+function inBox(x, y) {
+  const b = L.box;
+  return x >= b.x - 10 && x <= b.x + b.w + 10 && y >= b.y - 10 && y <= b.y + b.h + 10;
+}
+function overWater(x, y) {
+  const n = L.inner;
+  return x >= n.x - 20 && x <= n.x + n.w + 20 && y >= n.y - 60 && y <= n.y + n.h + 20;
+}
+function nearSlider(x, y) {
+  const s = L.slider;
+  return Math.abs(x - s.x) < 40 && y >= s.y1 - 40 && y <= s.y2 + 40;
+}
+function setTempFromY(y) {
+  const s = L.slider;
+  const t = (s.y2 - y) / (s.y2 - s.y1) * 80;
+  temp = Math.max(0, Math.min(80, t));
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const x = e.clientX, y = e.clientY;
+  if (nearSlider(x, y)) {
+    sliding = true;
+    setTempFromY(y);
+    pop(440);
+  } else if (inBox(x, y)) {
+    saltDrag = { x, y, moved: false };
+  } else {
+    return;
+  }
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+});
+canvas.addEventListener("pointermove", e => {
+  if (sliding) setTempFromY(e.clientY);
+  if (saltDrag) {
+    saltDrag.x = e.clientX; saltDrag.y = e.clientY;
+    if (Math.abs(e.movementX) + Math.abs(e.movementY) > 2) saltDrag.moved = true;
+  }
+});
+canvas.addEventListener("pointerup", e => {
+  if (sliding) { sliding = false; pop(550); }
+  if (saltDrag) {
+    // 拖到水面上松手，或者只是点了一下盒子，都算加 10 g
+    if (overWater(e.clientX, e.clientY) || !saltDrag.moved) addSalt(ADD_G, e.clientX);
+    saltDrag = null;
+  }
+});
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+document.getElementById("continueBtn").addEventListener("click", () => { winPanel.style.display = "none"; pop(660); });
+resetGame();
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

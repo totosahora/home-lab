@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>保龄球小将</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#2a1f16; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(30,20,10,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(30,20,10,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">第 1 / 5 轮 · ⭐ 总分：0</div>
+<div id="hint">点住球道上想打的位置：对准方向，按得越久力气越大，松手投球！</div>
+<div id="winPanel">
+  <div class="msg">🎳 比赛结束！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 球道与视图 ================= */
+// 世界坐标：球道宽 360，沟宽 40；球从 y=140 出发，瓶区 y≈980-1120
+const LANE_HALF = 180, GUTTER_HALF = 220;
+const BALL_R = 20, PIN_R = 15;
+const WORLD_W = 560, WORLD_H = 1300;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / WORLD_W, H / WORLD_H);
+  view.ox = W / 2;                       // 球道中线对准屏幕中央
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, WORLD_H - (sy - view.oy) / view.s]; }
+// 世界 y 指向球瓶方向；渲染时垂直翻转，让球瓶在屏幕上方
+function applyWorldTransform() {
+  ctx.translate(view.ox, view.oy + WORLD_H * view.s);
+  ctx.scale(view.s, -view.s);
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+const ROUNDS = 5;
+let pins = [];        // {ox, oy, x, y, vx, vy, fallen, fallA}
+let ball = null;      // {x, y, vx, vy, gutter, gone}
+let state = "aim";    // aim | rolling | settle
+let settleT = 0;
+let roundIdx = 0, throwNum = 1;
+let roundScores = []; // [[t1, t2], ...]
+let knockedBefore = 0;
+let totalScore = 0;
+let gutterWarned = false;
+
+function rackPins() {
+  pins = [];
+  for (let r = 0; r < 4; r++)
+    for (let i = 0; i <= r; i++)
+      pins.push({
+        ox: (i - r / 2) * 46, oy: 985 + r * 42,
+        x: (i - r / 2) * 46, y: 985 + r * 42,
+        vx: 0, vy: 0, fallen: false, fallA: 0
+      });
+}
+function newBall() {
+  ball = { x:0, y:140, vx:0, vy:0, gutter:false, gone:false };
+  gutterWarned = false;
+}
+function resetGame() {
+  rackPins(); newBall();
+  state = "aim"; roundIdx = 0; throwNum = 1;
+  roundScores = []; totalScore = 0;
+  winPanel.style.display = "none";
+  updateScore();
+}
+function updateScore() {
+  scorebar.textContent = `第 ${Math.min(roundIdx + 1, ROUNDS)} / ${ROUNDS} 轮 · ⭐ 总分：${totalScore}`;
+}
+resetGame();
+
+/* ================= 物理 ================= */
+const BALL_DECEL = 150, PIN_DECEL = 520;
+let rolling = false;
+
+function physics(dt) {
+  rolling = false;
+  // 球
+  if (ball && !ball.gone) {
+    const sp = Math.hypot(ball.vx, ball.vy);
+    if (sp > 0) {
+      rolling = true;
+      const ns = Math.max(0, sp - BALL_DECEL * dt);
+      ball.vx *= ns / sp; ball.vy *= ns / sp;
+      if (ns < 5) { ball.vx = 0; ball.vy = 0; }
+      ball.x += ball.vx * dt; ball.y += ball.vy * dt;
+      // 洗沟判定
+      if (!ball.gutter && Math.abs(ball.x) > LANE_HALF - 4 && ball.y < 960) {
+        ball.gutter = true;
+        if (!gutterWarned) { gutterWarned = true; showHint("洗沟啦 😅 球碰不到瓶子了"); pop(200); }
+      }
+      if (ball.gutter) {
+        ball.x = Math.sign(ball.x) * (LANE_HALF + 40);
+        ball.vx = 0;
+      }
+      // 球出界
+      if (ball.y > 1240 || sp < 5 && ns === 0) {
+        ball.gone = true;
+      }
+    }
+  }
+  // 瓶
+  for (const p of pins) {
+    const sp = Math.hypot(p.vx, p.vy);
+    if (sp > 0) {
+      rolling = true;
+      const ns = Math.max(0, sp - PIN_DECEL * dt);
+      p.vx *= ns / sp; p.vy *= ns / sp;
+      if (ns < 8) { p.vx = 0; p.vy = 0; }
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      // 瓶区挡板
+      if (Math.abs(p.x) > GUTTER_HALF + 20) { p.x = Math.sign(p.x) * (GUTTER_HALF + 20); p.vx *= -0.4; }
+      if (p.y > 1180) { p.y = 1180; p.vy *= -0.4; }
+      if (p.y < 900) { p.y = 900; p.vy *= -0.4; }
+    }
+    // 倒瓶判定：离原位足够远
+    if (!p.fallen && Math.hypot(p.x - p.ox, p.y - p.oy) > 26) {
+      p.fallen = true;
+      p.fallA = Math.atan2(p.y - p.oy, p.x - p.ox);
+      clack(0.7);
+    }
+  }
+  // 球-瓶碰撞（球重 = 5 瓶重）
+  if (ball && !ball.gone && !ball.gutter && ball.y > 880) {
+    for (const p of pins) {
+      if (collide(ball, BALL_R, 5, p, PIN_R, 1)) clack(0.5);
+    }
+  }
+  // 瓶-瓶碰撞
+  for (let i = 0; i < pins.length; i++)
+    for (let j = i + 1; j < pins.length; j++)
+      collide(pins[i], PIN_R, 1, pins[j], PIN_R, 1);
+}
+
+function collide(a, ra, ma, b, rb, mb) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const d = Math.hypot(dx, dy), rs = ra + rb;
+  if (d > 0 && d < rs) {
+    const nx = dx / d, ny = dy / d, ov = (rs - d) / 2;
+    a.x -= nx * ov; a.y -= ny * ov;
+    b.x += nx * ov; b.y += ny * ov;
+    const va = a.vx * nx + a.vy * ny, vb = b.vx * nx + b.vy * ny;
+    if (va - vb > 0) {
+      const va2 = (va * (ma - mb) + 2 * mb * vb) / (ma + mb);
+      const vb2 = (vb * (mb - ma) + 2 * ma * va) / (ma + mb);
+      a.vx += (va2 - va) * nx; a.vy += (va2 - va) * ny;
+      b.vx += (vb2 - vb) * nx; b.vy += (vb2 - vb) * ny;
+      return true;
+    }
+  }
+  return false;
+}
+
+/* ================= 瞄准与投球 ================= */
+let aiming = null;   // {dir, startT}
+const CHARGE_MS = 1500;
+const MAX_ANGLE = 0.62;   // 最多偏离正前方 35°
+
+function aimPower(now) { return Math.min(1, (now - aiming.startT) / CHARGE_MS); }
+
+canvas.addEventListener("pointerdown", e => {
+  if (state !== "aim" || winPanel.style.display === "flex") return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  startAim(wx, wy);
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+});
+canvas.addEventListener("pointermove", e => {
+  if (!aiming) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  updateAim(wx, wy);
+});
+window.addEventListener("pointerup", e => {
+  if (!aiming) return;
+  const pow = aimPower(performance.now());
+  if (pow > 0.06) {
+    const sp = 350 + pow * 1250;
+    ball.vx = aiming.dir[0] * sp;
+    ball.vy = aiming.dir[1] * sp;
+    knockedBefore = pins.filter(p => p.fallen).length;
+    state = "rolling";
+    whoosh(pow);
+  }
+  aiming = null;
+});
+
+function startAim(wx, wy) { aiming = { dir:calcDir(wx, wy), startT:performance.now() }; }
+function updateAim(wx, wy) { aiming.dir = calcDir(wx, wy); }
+function calcDir(wx, wy) {
+  let a = Math.atan2(wy - ball.y, wx - ball.x);   // 目标方向
+  const up = Math.PI / 2;                          // 世界 +y = 指向球瓶
+  let dev = a - up;
+  while (dev > Math.PI) dev -= 2 * Math.PI;
+  while (dev < -Math.PI) dev += 2 * Math.PI;
+  dev = Math.max(-MAX_ANGLE, Math.min(MAX_ANGLE, dev));
+  a = up + dev;
+  return [Math.cos(a), Math.sin(a)];
+}
+
+/* ================= 回合流程 ================= */
+function finishThrow() {
+  const knocked = pins.filter(p => p.fallen).length - knockedBefore;
+  totalScore += knocked;
+  const rs = roundScores[roundIdx] = roundScores[roundIdx] || [0, 0];
+  rs[throwNum - 1] += knocked;
+  updateScore();
+  const allDown = pins.every(p => p.fallen);
+  if (throwNum === 1 && allDown) {
+    showHint("🎳 全中！太厉害了！");
+    fanfare();
+    nextRound();
+  } else if (throwNum === 1) {
+    showHint(`击倒 ${knocked} 个！还有一次机会`);
+    throwNum = 2;
+    newBall();
+    state = "aim";
+  } else {
+    if (allDown) { showHint("⭐ 补中！漂亮！"); fanfare(); }
+    else showHint(`本轮击倒 ${rs[0] + rs[1]} 个`);
+    nextRound();
+  }
+}
+function nextRound() {
+  state = "wait";   // 等待摆瓶期间不再触发 finishThrow
+  roundIdx++;
+  if (roundIdx >= ROUNDS) {
+    setTimeout(() => {
+      winPanel.querySelector(".msg").innerHTML = `🎳 比赛结束！<br>总分：${totalScore} 分`;
+      winPanel.style.display = "flex";
+      fanfare();
+    }, 900);
+    return;
+  }
+  throwNum = 1;
+  setTimeout(() => { rackPins(); newBall(); state = "aim"; updateScore(); }, 900);
+}
+
+/* ================= 绘制 ================= */
+function drawLane() {
+  ctx.save();
+  applyWorldTransform();
+  // 两侧球沟
+  ctx.fillStyle = "#4a3626";
+  ctx.fillRect(-GUTTER_HALF - 20, -20, (GUTTER_HALF + 20) * 2, WORLD_H + 40);
+  // 球道木板
+  const g = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+  g.addColorStop(0, "#e8b96f"); g.addColorStop(1, "#d9a355");
+  ctx.fillStyle = g;
+  ctx.fillRect(-LANE_HALF, -20, LANE_HALF * 2, WORLD_H + 40);
+  // 木板缝
+  ctx.strokeStyle = "rgba(120,80,30,0.25)"; ctx.lineWidth = 2;
+  for (let x = -LANE_HALF + 24; x < LANE_HALF; x += 24) {
+    ctx.beginPath(); ctx.moveTo(x, -20); ctx.lineTo(x, WORLD_H + 20); ctx.stroke();
+  }
+  // 球沟（深色凹槽）
+  ctx.fillStyle = "#33241a";
+  ctx.fillRect(-GUTTER_HALF, -20, GUTTER_HALF - LANE_HALF, WORLD_H + 40);
+  ctx.fillRect(LANE_HALF, -20, GUTTER_HALF - LANE_HALF, WORLD_H + 40);
+  // 犯规线
+  ctx.fillStyle = "rgba(200,40,40,0.6)";
+  ctx.fillRect(-LANE_HALF, 205, LANE_HALF * 2, 6);
+  // 球道箭头标记
+  ctx.fillStyle = "rgba(120,80,30,0.5)";
+  for (const [ax, ay] of [[-90,420],[-45,430],[0,440],[45,430],[90,420]]) {
+    ctx.beginPath();
+    ctx.moveTo(ax, ay); ctx.lineTo(ax - 9, ay + 26); ctx.lineTo(ax + 9, ay + 26);
+    ctx.closePath(); ctx.fill();
+  }
+  // 瓶区稍深色
+  ctx.fillStyle = "rgba(120,80,30,0.15)";
+  ctx.fillRect(-LANE_HALF, 900, LANE_HALF * 2, 340);
+  ctx.restore();
+}
+
+function drawPin(p) {
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  if (p.fallen) {
+    // 倒下的瓶子：横躺、变淡
+    ctx.rotate(p.fallA);
+    ctx.globalAlpha = 0.45;
+    ctx.beginPath(); ctx.ellipse(0, 0, PIN_R * 1.25, PIN_R * 0.6, 0, 0, 7);
+    ctx.fillStyle = "#d8d0c8"; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2; ctx.stroke();
+  } else {
+    ctx.beginPath(); ctx.arc(0, 0, PIN_R, 0, 7);
+    ctx.fillStyle = "#ffffff"; ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2; ctx.stroke();
+    // 红环条纹
+    ctx.beginPath(); ctx.arc(0, 0, PIN_R * 0.55, 0, 7);
+    ctx.strokeStyle = "#e93b3b"; ctx.lineWidth = 4; ctx.stroke();
+    // 高光
+    ctx.beginPath(); ctx.arc(-PIN_R * 0.3, -PIN_R * 0.35, PIN_R * 0.28, 0, 7);
+    ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawBall() {
+  if (!ball || ball.gone) return;
+  ctx.beginPath(); ctx.arc(ball.x, ball.y, BALL_R, 0, 7);
+  const g = ctx.createRadialGradient(ball.x - 7, ball.y - 8, 2, ball.x, ball.y, BALL_R);
+  g.addColorStop(0, "#7fb2ff"); g.addColorStop(1, "#1a4fc0");
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2; ctx.stroke();
+  // 指孔
+  ctx.fillStyle = "rgba(0,0,30,0.5)";
+  ctx.beginPath(); ctx.arc(ball.x + 5, ball.y - 5, 2.6, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(ball.x + 10, ball.y + 1, 2.6, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(ball.x + 3, ball.y + 4, 2.6, 0, 7); ctx.fill();
+}
+
+function drawAim() {
+  if (!aiming || state !== "aim") return;
+  const pow = aimPower(performance.now());
+  const d = aiming.dir;
+  // 瞄准虚线到球道顶端
+  const tEnd = (940 - ball.y) / d[1];
+  const ex = ball.x + d[0] * tEnd, ey = ball.y + d[1] * tEnd;
+  ctx.save();
+  ctx.setLineDash([14, 12]);
+  ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(ball.x, ball.y); ctx.lineTo(ex, ey); ctx.stroke();
+  ctx.setLineDash([]);
+  // 力度条
+  const barW = 200, bx0 = ball.x - barW / 2, by0 = ball.y + 48;
+  ctx.fillStyle = "rgba(0,0,0,0.4)";
+  roundRect(bx0, by0, barW, 16, 8, true);
+  ctx.fillStyle = pow > 0.7 ? "#ff5252" : pow > 0.4 ? "#ffb800" : "#2fbf4a";
+  if (pow > 0.02) roundRect(bx0 + 2, by0 + 2, (barW - 4) * pow, 12, 6, true);
+  ctx.restore();
+}
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#2a1f16";
+  ctx.fillRect(0, 0, W, H);
+  drawLane();
+  ctx.save();
+  applyWorldTransform();
+  for (const p of pins) drawPin(p);
+  drawBall();
+  drawAim();
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+let lastT2 = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT2) / 1000);
+  lastT2 = now;
+  const steps = 4;   // 子步进防穿模
+  for (let i = 0; i < steps; i++) physics(dt / steps);
+  if (state === "rolling" && !rolling) {
+    state = "settle";
+    settleT = now + 800;
+  }
+  if (state === "settle" && now >= settleT) {
+    finishThrow();
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const clack = v => tone(1200 + Math.random() * 500, 0.05, 0.04 + 0.15 * v, "square");
+const whoosh = p => tone(280 + 380 * p, 0.14, 0.09, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 1800);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

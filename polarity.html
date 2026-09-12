@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>水流小磁铁 · 分子极性</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#bfe3f5; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #tabs {
+    position:absolute; top:12px; left:12px; z-index:10; display:flex; gap:8px;
+  }
+  #tabs button {
+    font-size:17px; font-weight:bold; padding:10px 18px;
+    border-radius:22px; border:3px solid rgba(30,80,120,0.35);
+    background:rgba(255,255,255,0.85); color:#1a4a6e; cursor:pointer;
+  }
+  #tabs button.on { background:#2f8fd0; color:#fff; border-color:#2f8fd0; }
+  #tabs button:active { transform:scale(1.06); }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(15,50,80,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(15,50,80,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="tabs">
+  <button id="tab1" class="on">① 水流偏转</button>
+  <button id="tab2">② 分子排队</button>
+</div>
+<div id="scorebar">🔍 发现 0 / 3</div>
+<div id="hint">拖动黄色的带电尺子，慢慢靠近细细的水流看看！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+let scene = 1;                 // 1=水流偏转 2=分子排队
+const found = [false, false, false];   // 三个发现：水流弯曲 / 木筷无反应 / 水分子排队
+
+// --- 实验1：水流 ---
+let spout = { x: 0, y: 0 };    // 水龙头出水口
+let basinY = 0;                // 水槽水面高度
+let drops = [];                // 水流粒子 {x,y,vx,vy}
+let splashes = [];             // 水花粒子 {x,y,vx,vy,life}
+let spawnAcc = 0;
+let chopNearT = 0;             // 木筷靠近水流的累计时间
+
+// 工具（可拖拽）：带电尺子 / 木筷 / 带电棒
+const ruler     = { kind:"ruler", x:0, y:0, homeX:0, homeY:0, ang:-0.12, len:230, wid:44, charged:true,  touched:false, label:"带电尺子" };
+const chopstick = { kind:"chop",  x:0, y:0, homeX:0, homeY:0, ang: 0.35, len:210, wid:20, charged:false, touched:false, label:"木筷" };
+const rod       = { kind:"rod",   x:0, y:0, homeX:0, homeY:0, ang: 0.0,  len:250, wid:36, charged:true,  touched:false, label:"带电棒" };
+
+// --- 实验2：分子群 ---
+// type "h2o": O 端 δ-（红），H 端 δ+（蓝），ang 指向 H 一侧（正端方向）
+// type "co2": 直线对称分子，两头一样，没有正端负端
+let mols = [];   // {type, x, y, ang, baseAng, phase}
+const ROD_RANGE = 260;
+
+function layout() {
+  // 实验1 布局
+  spout.x = W * 0.38; spout.y = Math.max(96, H * 0.15);
+  basinY = H * 0.72;
+  // 工具默认位置：尽量放到水流影响范围之外（窄屏放不下时接受初始就靠近）
+  ruler.homeX = Math.min(W - 60, Math.max(W * 0.8, spout.x + 250 + ruler.len / 2));
+  ruler.homeY = H * 0.32;
+  chopstick.homeX = Math.min(W - 60, Math.max(W * 0.82, spout.x + 210 + chopstick.len / 2));
+  chopstick.homeY = H * 0.5;
+  for (const t of [ruler, chopstick]) {
+    if (!t.touched) { t.x = t.homeX; t.y = t.homeY; }
+  }
+  // 实验2 布局
+  rod.homeX = W * 0.5; rod.homeY = H * 0.85;
+  if (!rod.touched) { rod.x = rod.homeX; rod.y = rod.homeY; }
+  const cx1 = W * 0.28, cy1 = H * 0.44;   // 水分子群中心
+  const cx2 = W * 0.72, cy2 = H * 0.44;   // CO2 分子群中心
+  mols = [];
+  const sp = Math.min(150, W * 0.13);
+  for (let i = 0; i < 6; i++) {
+    const a = Math.random() * Math.PI * 2;
+    mols.push({ type:"h2o",
+      x: cx1 + (i % 3 - 1) * sp, y: cy1 + (Math.floor(i / 3) - 0.5) * sp,
+      ang: a, baseAng: a, phase: Math.random() * 7 });
+  }
+  for (let i = 0; i < 4; i++) {
+    const a = Math.random() * Math.PI * 2;
+    mols.push({ type:"co2",
+      x: cx2 + (i % 2 - 0.5) * sp, y: cy2 + (Math.floor(i / 2) - 0.5) * sp,
+      ang: a, baseAng: a, phase: Math.random() * 7 });
+  }
+}
+
+/* ================= 物理 ================= */
+const GRAV = 1500;
+// 点到工具线段（工具以中心+角度表示）最近点
+function nearestOnTool(t, px, py) {
+  const c = Math.cos(t.ang), s = Math.sin(t.ang);
+  const dx = px - t.x, dy = py - t.y;
+  let u = dx * c + dy * s;                    // 沿工具方向的投影
+  u = Math.max(-t.len / 2, Math.min(t.len / 2, u));
+  return [t.x + c * u, t.y + s * u];
+}
+function distToTool(t, px, py) {
+  const [nx, ny] = nearestOnTool(t, px, py);
+  return [Math.hypot(px - nx, py - ny), nx, ny];
+}
+// 工具是否靠近水流（水流是一条从出水口到水槽的竖线）
+function toolNearStream(t) {
+  const [nx] = nearestOnTool(t, spout.x, (spout.y + basinY) / 2);
+  const d1 = Math.hypot(spout.x - t.x, spout.y + 60 - t.y);
+  // 采样水流竖线上的若干点，取最小距离
+  let best = 1e9;
+  for (let y = spout.y + 10; y <= basinY; y += 40) {
+    const [d] = distToTool(t, spout.x, y);
+    if (d < best) best = d;
+  }
+  return best < 230 ? best : 1e9;
+}
+
+let streamBending = false;
+
+function stepStream(dt) {
+  // 生成水粒子
+  spawnAcc += dt;
+  while (spawnAcc > 0.012) {
+    spawnAcc -= 0.012;
+    drops.push({ x: spout.x + (Math.random() - 0.5) * 3, y: spout.y + 4,
+                 vx: 0, vy: 50 + Math.random() * 20 });
+  }
+  if (drops.length > 260) drops.splice(0, drops.length - 260);
+
+  const rulerD = toolNearStream(ruler);
+  streamBending = rulerD < 230;
+
+  for (const p of drops) {
+    p.vy += GRAV * dt;
+    // 带电尺子的吸引力：越近越强，把水流拉弯
+    if (streamBending) {
+      const [d, nx, ny] = distToTool(ruler, p.x, p.y);
+      if (d < 260 && d > 6) {
+        const f = 3800 * (1 - d / 260) + 800;
+        p.vx += (nx - p.x) / d * f * dt;
+        p.vy += (ny - p.y) / d * f * dt * 0.3;
+      }
+    }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    // 落进水槽
+    if (p.y > basinY + 6) {
+      for (let i = 0; i < 2; i++)
+        splashes.push({ x: p.x, y: basinY + 4, vx: (Math.random() - 0.5) * 160,
+                        vy: -Math.random() * 130, life: 0.45 });
+      p.dead = true;
+    }
+  }
+  drops = drops.filter(p => !p.dead);
+  for (const s of splashes) {
+    s.vy += GRAV * 0.6 * dt; s.x += s.vx * dt; s.y += s.vy * dt; s.life -= dt;
+  }
+  splashes = splashes.filter(s => s.life > 0);
+
+  // 发现1：水流被带电尺子拉弯
+  if (streamBending) markFound(0,
+    "水流弯向尺子啦！水分子像小磁铁：一头带正电、一头带负电 🧲");
+  // 发现2：木筷靠近水流足够久，水流纹丝不动
+  if (!streamBending && toolNearStream(chopstick) < 200) {
+    chopNearT += dt;
+    if (chopNearT > 1.2) markFound(1, "木筷不带电，水流理都不理它～ 只有带电的东西才能拉动水！");
+  } else chopNearT = 0;
+}
+
+function angleDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
+}
+
+function stepMolecules(dt, t) {
+  let aligned = 0, nearCnt = 0;
+  for (const m of mols) {
+    // 无电场时的轻微热运动（慢慢晃）
+    let target = m.baseAng + Math.sin(t * 1.3 + m.phase) * 0.35;
+    let rate = 1.2;
+    if (m.type === "h2o") {
+      const [d, nx, ny] = distToTool(rod, m.x, m.y);
+      if (d < ROD_RANGE) {
+        // 负电棒吸引蓝色正端：正端（ang 方向）转向带电棒
+        nearCnt++;
+        const want = Math.atan2(ny - m.y, nx - m.x);
+        target = want;
+        rate = 6 * (1 - d / ROD_RANGE) + 1.5;
+        if (Math.abs(angleDiff(m.ang, want)) < 0.4) aligned++;
+      }
+    }
+    // CO2 两头对称，电场拉不动它（不转向）
+    m.ang += angleDiff(target, m.ang) * Math.min(1, rate * dt);
+  }
+  // 发现3：水分子大半转向排队
+  if (nearCnt >= 4 && aligned >= 4) markFound(2,
+    "水分子排队啦！蓝色正端都朝向负电棒。CO₂ 两头对称，所以不排队！");
+}
+
+/* ================= 发现与得分 ================= */
+let confetti = [];
+function markFound(i, msg) {
+  if (found[i]) return;
+  found[i] = true;
+  scorebar.textContent = `🔍 发现 ${found.filter(Boolean).length} / 3`;
+  showHint(msg, 4200);
+  sparkle();
+  if (found.every(Boolean)) {
+    setTimeout(() => { fanfare(); showHint("🎉 三个发现全部完成！你搞懂了水分子的秘密！", 5000); }, 600);
+    for (let k = 0; k < 80; k++)
+      confetti.push({ x: Math.random() * W, y: -20 - Math.random() * 200,
+        vx: (Math.random() - 0.5) * 60, vy: 120 + Math.random() * 160,
+        c: ["#ff5252","#ffd54a","#4fc3f7","#81c784","#ba68c8"][k % 5],
+        rot: Math.random() * 7, life: 4 });
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawTool(t) {
+  ctx.save();
+  ctx.translate(t.x, t.y);
+  ctx.rotate(t.ang);
+  const L = t.len, Wd = t.wid;
+  if (t.kind === "ruler") {
+    // 黄色塑料尺
+    roundRect(-L/2, -Wd/2, L, Wd, 8);
+    ctx.fillStyle = "#ffd54a"; ctx.fill();
+    ctx.strokeStyle = "rgba(120,80,0,0.5)"; ctx.lineWidth = 2.5; ctx.stroke();
+    // 刻度
+    ctx.strokeStyle = "rgba(120,80,0,0.45)"; ctx.lineWidth = 1.5;
+    for (let x = -L/2 + 16; x < L/2 - 8; x += 14) {
+      ctx.beginPath(); ctx.moveTo(x, -Wd/2); ctx.lineTo(x, -Wd/2 + 9); ctx.stroke();
+    }
+    // 负电荷标记 − − −
+    ctx.fillStyle = "#c62828"; ctx.font = "bold 20px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (let x = -L/2 + 30; x <= L/2 - 20; x += 36) ctx.fillText("−", x, 6);
+  } else if (t.kind === "rod") {
+    // 橙红色带电棒
+    roundRect(-L/2, -Wd/2, L, Wd, Wd/2);
+    const g = ctx.createLinearGradient(0, -Wd/2, 0, Wd/2);
+    g.addColorStop(0, "#ff8a65"); g.addColorStop(1, "#e64a19");
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = "rgba(120,20,0,0.5)"; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.fillStyle = "#fff"; ctx.font = "bold 20px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (let x = -L/2 + 26; x <= L/2 - 16; x += 34) ctx.fillText("−", x, 0);
+  } else {
+    // 木筷（棕色、一头略尖）
+    ctx.beginPath();
+    ctx.moveTo(-L/2, -Wd/2); ctx.lineTo(L/2 - 12, -Wd/2 * 0.45);
+    ctx.lineTo(L/2, 0); ctx.lineTo(L/2 - 12, Wd/2 * 0.45);
+    ctx.lineTo(-L/2, Wd/2); ctx.closePath();
+    const g = ctx.createLinearGradient(0, -Wd/2, 0, Wd/2);
+    g.addColorStop(0, "#c89a6b"); g.addColorStop(1, "#9a6b3d");
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = "rgba(80,50,20,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+  }
+  ctx.restore();
+  // 名称标签
+  ctx.fillStyle = "rgba(20,60,90,0.75)"; ctx.font = "bold 14px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  ctx.fillText(t.label, t.x, t.y + t.wid / 2 + 10);
+  // 带电工具的静电火花
+  if (t.charged) {
+    const tt = performance.now() / 1000;
+    ctx.strokeStyle = "rgba(255,235,120,0.9)"; ctx.lineWidth = 2;
+    for (let i = 0; i < 3; i++) {
+      const a = tt * 2.2 + i * 2.1, r = t.len / 2 + 10 + Math.sin(tt * 5 + i) * 4;
+      const sx = t.x + Math.cos(a) * r * 0.55, sy = t.y + Math.sin(a) * r * 0.3;
+      ctx.beginPath();
+      ctx.moveTo(sx - 5, sy); ctx.lineTo(sx, sy - 6); ctx.lineTo(sx + 5, sy); ctx.lineTo(sx, sy + 6);
+      ctx.closePath(); ctx.stroke();
+    }
+  }
+}
+
+function drawScene1() {
+  // 背景墙
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#dff1fb"); g.addColorStop(1, "#aedcf2");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 瓷砖缝
+  ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 2;
+  for (let x = 0; x < W; x += 90) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, basinY); ctx.stroke(); }
+  for (let y = 0; y < basinY; y += 90) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+  // 台面与水槽
+  ctx.fillStyle = "#e8e0d0"; ctx.fillRect(0, basinY + 30, W, H - basinY - 30);
+  ctx.strokeStyle = "rgba(0,0,0,0.15)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, basinY + 30); ctx.lineTo(W, basinY + 30); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(spout.x, basinY + 34, 190, 30, 0, 0, 7);
+  ctx.fillStyle = "#9aa7ad"; ctx.fill();
+  ctx.beginPath(); ctx.ellipse(spout.x, basinY + 30, 178, 24, 0, 0, 7);
+  ctx.fillStyle = "#6f7d84"; ctx.fill();
+  ctx.beginPath(); ctx.ellipse(spout.x, basinY + 28, 170, 21, 0, 0, 7);
+  ctx.fillStyle = "#58aede"; ctx.fill();   // 槽里的积水
+
+  // 水龙头：横管 + 弯下来的出水口
+  ctx.fillStyle = "#b9c4ca";
+  roundRect(spout.x - W * 0.38, spout.y - 46, W * 0.38, 22, 8); ctx.fill();
+  roundRect(spout.x - 11, spout.y - 46, 22, 48, 8); ctx.fill();
+  ctx.fillStyle = "#8d989e";
+  roundRect(spout.x - 13, spout.y - 6, 26, 10, 4); ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.2)"; ctx.lineWidth = 2;
+  roundRect(spout.x - W * 0.38, spout.y - 46, W * 0.38, 22, 8); ctx.stroke();
+  roundRect(spout.x - 11, spout.y - 46, 22, 48, 8); ctx.stroke();
+  // 开关把手
+  ctx.fillStyle = "#d32f2f";
+  ctx.beginPath(); ctx.arc(spout.x - 60, spout.y - 52, 12, 0, 7); ctx.fill();
+
+  // 电场提示线（把看不见的电画出来）：尺子靠近水流时的虚线
+  if (streamBending) {
+    ctx.save();
+    ctx.setLineDash([8, 8]);
+    ctx.strokeStyle = "rgba(255,180,40,0.75)"; ctx.lineWidth = 3;
+    const [nx1] = nearestOnTool(ruler, spout.x, spout.y + (basinY - spout.y) * 0.25);
+    const [nx2] = nearestOnTool(ruler, spout.x, spout.y + (basinY - spout.y) * 0.5);
+    const [nx3] = nearestOnTool(ruler, spout.x, spout.y + (basinY - spout.y) * 0.75);
+    const pts = [[nx1, spout.y + (basinY - spout.y) * 0.25],
+                 [nx2, spout.y + (basinY - spout.y) * 0.5],
+                 [nx3, spout.y + (basinY - spout.y) * 0.75]];
+    for (const [px, py] of pts) {
+      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(spout.x, py); ctx.stroke();
+    }
+    ctx.restore();
+    ctx.fillStyle = "rgba(200,60,20,0.9)"; ctx.font = "bold 16px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.fillText("电在拉水！", (ruler.x + spout.x) / 2, Math.min(ruler.y, spout.y + 120) - 14);
+  }
+
+  // 水流粒子
+  ctx.fillStyle = "#2f8fd0";
+  for (const p of drops) {
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // 水花
+  for (const s of splashes) {
+    ctx.globalAlpha = Math.max(0, s.life / 0.45) * 0.8;
+    ctx.beginPath(); ctx.arc(s.x, s.y, 2.5, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // 工具
+  drawTool(chopstick);
+  drawTool(ruler);
+
+  // 说明文字
+  ctx.fillStyle = "rgba(20,60,90,0.8)"; ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillText("细细的水流 = 好多好多水分子 💧", 16, H - 56);
+}
+
+function drawH2O(m) {
+  ctx.save();
+  ctx.translate(m.x, m.y);
+  const a = m.ang;   // 指向蓝色 H 一侧（正端）
+  const rOH = 42;
+  const h1 = [Math.cos(a + 1.0) * rOH, Math.sin(a + 1.0) * rOH];
+  const h2 = [Math.cos(a - 1.0) * rOH, Math.sin(a - 1.0) * rOH];
+  // 化学键
+  ctx.strokeStyle = "#b9c4ca"; ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(h1[0], h1[1]); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(h2[0], h2[1]); ctx.stroke();
+  // 两个 H（蓝，δ+）
+  for (const [hx, hy] of [h1, h2]) {
+    ctx.beginPath(); ctx.arc(hx, hy, 14, 0, 7);
+    ctx.fillStyle = "#42a5f5"; ctx.fill();
+    ctx.strokeStyle = "rgba(13,60,110,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = "#fff"; ctx.font = "bold 12px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("δ+", hx, hy);
+  }
+  // O（红，δ-）
+  ctx.beginPath(); ctx.arc(0, 0, 21, 0, 7);
+  const g = ctx.createRadialGradient(-6, -7, 3, 0, 0, 21);
+  g.addColorStop(0, "#ff8a80"); g.addColorStop(1, "#d32f2f");
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(100,10,10,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 13px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("δ−", 0, 0);
+  ctx.restore();
+}
+
+function drawCO2(m) {
+  ctx.save();
+  ctx.translate(m.x, m.y);
+  ctx.rotate(m.ang);
+  const r = 46;
+  ctx.strokeStyle = "#b9c4ca"; ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-r, 0); ctx.lineTo(r, 0); ctx.stroke();
+  // 两个 O（红，都是 δ-，两头对称）
+  for (const ox of [-r, r]) {
+    ctx.beginPath(); ctx.arc(ox, 0, 17, 0, 7);
+    ctx.fillStyle = "#e53935"; ctx.fill();
+    ctx.strokeStyle = "rgba(100,10,10,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = "#fff"; ctx.font = "bold 11px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("δ−", ox, 0);
+  }
+  // C（灰，δ+，但在正中间）
+  ctx.beginPath(); ctx.arc(0, 0, 15, 0, 7);
+  ctx.fillStyle = "#616161"; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 11px sans-serif";
+  ctx.fillText("δ+", 0, 0);
+  ctx.restore();
+}
+
+function drawScene2() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#eaf6ff"); g.addColorStop(1, "#cfeaf9");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  // 两个区域的标题
+  ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+  ctx.fillStyle = "rgba(20,60,90,0.85)"; ctx.font = "bold 20px sans-serif";
+  ctx.fillText("水分子 H₂O", W * 0.28, H * 0.44 - Math.min(150, W * 0.13) / 2 - 70);
+  ctx.fillText("二氧化碳 CO₂", W * 0.72, H * 0.44 - Math.min(150, W * 0.13) / 2 - 70);
+  ctx.font = "15px sans-serif"; ctx.fillStyle = "rgba(20,60,90,0.6)";
+  ctx.fillText("一头红（δ−）一头蓝（δ+）", W * 0.28, H * 0.44 - Math.min(150, W * 0.13) / 2 - 46);
+  ctx.fillText("两头一样，对称", W * 0.72, H * 0.44 - Math.min(150, W * 0.13) / 2 - 46);
+
+  // 带电棒的影响圈（拖动时显示，把看不见的电场画出来）
+  if (dragTool === rod) {
+    ctx.save();
+    ctx.setLineDash([10, 10]);
+    ctx.strokeStyle = "rgba(230,74,25,0.35)"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(rod.x, rod.y, ROD_RANGE, 0, 7); ctx.stroke();
+    ctx.restore();
+  }
+
+  for (const m of mols) if (m.type === "co2") drawCO2(m);
+  for (const m of mols) if (m.type === "h2o") drawH2O(m);
+  drawTool(rod);
+
+  ctx.fillStyle = "rgba(20,60,90,0.8)"; ctx.font = "bold 17px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillText("拖动带电棒靠近分子，看看谁会转身？", 16, H - 56);
+}
+
+function drawConfetti(dt) {
+  for (const c of confetti) {
+    c.vy += 60 * dt; c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += 3 * dt; c.life -= dt;
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.c; ctx.fillRect(-6, -4, 12, 8);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+  confetti = confetti.filter(c => c.life > 0 && c.y < H + 30);
+}
+
+function draw(dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (scene === 1) drawScene1(); else drawScene2();
+  drawConfetti(dt);
+}
+
+/* ================= 交互 ================= */
+let dragTool = null, dragDX = 0, dragDY = 0, dragId = null;
+
+function hitTool(t, px, py) {
+  const c = Math.cos(-t.ang), s = Math.sin(-t.ang);
+  const dx = px - t.x, dy = py - t.y;
+  const lx = dx * c - dy * s, ly = dx * s + dy * c;
+  return Math.abs(lx) < t.len / 2 + 24 && Math.abs(ly) < t.wid / 2 + 24;   // 大拖拽区域
+}
+
+canvas.addEventListener("pointerdown", e => {
+  hintEl.style.opacity = "0";
+  const tools = scene === 1 ? [ruler, chopstick] : [rod];
+  // 后画的在上层，倒序检测
+  for (let i = tools.length - 1; i >= 0; i--) {
+    const t = tools[i];
+    if (hitTool(t, e.clientX, e.clientY)) {
+      dragTool = t; dragId = e.pointerId;
+      dragDX = e.clientX - t.x; dragDY = e.clientY - t.y;
+      t.touched = true;
+      canvas.setPointerCapture(e.pointerId);
+      pop(500);
+      break;
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragTool || e.pointerId !== dragId) return;
+  dragTool.x = Math.max(40, Math.min(W - 40, e.clientX - dragDX));
+  dragTool.y = Math.max(60, Math.min(H - 40, e.clientY - dragDY));
+});
+function endDrag(e) {
+  if (dragTool && e.pointerId === dragId) { dragTool = null; dragId = null; }
+}
+window.addEventListener("pointerup", endDrag);
+window.addEventListener("pointercancel", endDrag);
+
+// 场景切换
+const tab1 = document.getElementById("tab1");
+const tab2 = document.getElementById("tab2");
+function setScene(n) {
+  if (scene === n) return;
+  scene = n;
+  tab1.classList.toggle("on", n === 1);
+  tab2.classList.toggle("on", n === 2);
+  pop(700);
+  showHint(n === 1
+    ? "拖动黄色的带电尺子，慢慢靠近细细的水流看看！"
+    : "把带电棒拖近水分子，再拖近 CO₂，比比看有什么不一样？", 3600);
+}
+tab1.addEventListener("click", () => setScene(1));
+tab2.addEventListener("click", () => setScene(2));
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+function sparkle() { [880, 1175, 1568].forEach((f, i) => setTimeout(() => tone(f, 0.18, 0.1, "triangle"), i * 90)); }
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+let simT = 0;
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now; simT += dt;
+  if (scene === 1) stepStream(dt); else stepMolecules(dt, simT);
+  draw(dt);
+  requestAnimationFrame(loop);
+}
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 3000);
+}
+
+resize();
+showHint("拖动黄色的带电尺子，慢慢靠近细细的水流看看！", 5000);
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

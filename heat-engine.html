@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>蒸汽机小能手</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#263238; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,28,32,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,28,32,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; cursor:pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🌀 转速 0 转/分 · 💡 亮度 0%</div>
+<div id="hint">把煤块拖进炉膛烧开水，再向上拖红色气门把手放蒸汽！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+// 固定世界坐标 1280×760，等比缩放居中
+const WORLD_W = 1280, WORLD_H = 760;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / WORLD_W, H / WORLD_H);
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 场景数据 ================= */
+// 锅炉与炉膛
+const BOILER = { x:70, y:210, w:220, h:310 };      // 锅筒
+const FIRE = { x:180, y:590, r:48 };               // 炉膛投煤口
+// 气门（蒸汽阀门）：把手在管道上方竖直拖动
+const VALVE = { x:400, pipeY:150, knobMin:73, knobMax:128 };
+// 气缸与活塞
+const CYL = { x:460, y:190, w:220, h:80 };         // 气缸体
+const PISTON_W = 20;
+// 飞轮曲柄机构
+const FW = { x:950, y:230, R:110, crank:70, rod:200 };
+// 发电机与灯泡
+const GEN = { x:890, y:540, w:120, h:62, px:950, py:535, pr:26 };
+const BULB = { x:1145, y:125, r:40 };
+// 煤堆
+const PILE = [ [95,722],[150,730],[205,720],[255,728],[125,700],[230,700] ];
+
+// 游戏状态
+let coals = [];          // 煤堆里的煤块 {x, y, hx, hy, state}
+let burning = [];        // 炉膛里燃烧的煤 {age, life}
+let temp = 20;           // 锅炉水温 °C
+let pressure = 0;        // 蒸汽压力 0..1
+let valveOpen = 0;       // 气门开度 0..1
+let theta = 0.6;         // 曲柄角
+let omega = 0;           // 飞轮角速度 rad/s
+let pulleyA = 0;         // 发电机皮带轮角
+let particles = [];      // 蒸汽/烟雾粒子 {x,y,vx,vy,r,life,maxLife,color}
+let dragCoal = null;     // 正在拖的煤块
+let dragValve = false;   // 正在拖气门
+let saidBoil = false, saidSteam = false, saidLight = false, saidFull = false, saidCoalOut = false;
+let everBurned = false;
+let flash = 0;           // 庆祝闪光
+
+const OMEGA_MAX = 11;    // 约 105 转/分
+const HEAT_PER_COAL = 1.4;
+
+function resetPile() {
+  coals = PILE.map(([x, y]) => ({ x, y, hx:x, hy:y, state:"pile" }));
+}
+resetPile();
+
+function addCoalToFurnace() {
+  burning.push({ age:0, life:24 + Math.random() * 8 });
+  everBurned = true;
+  saidCoalOut = false;
+  clank();
+  showHint("煤烧起来了！盯着温度计，烧到 100°C 水就开");
+}
+
+// 曲柄连杆：由曲柄角算十字头（活塞杆端）x 坐标
+function crossheadX(th) {
+  const s = FW.crank * Math.sin(th);
+  return FW.x - FW.crank * Math.cos(th) - Math.sqrt(FW.rod * FW.rod - s * s);
+}
+function pistonX() { return crossheadX(theta) - 180; }
+function knobY() { return VALVE.knobMax - valveOpen * (VALVE.knobMax - VALVE.knobMin); }
+function rpm() { return omega * 60 / (2 * Math.PI); }
+function brightness() { const b = (omega / 8.5) * (omega / 8.5); return Math.max(0, Math.min(1, b)); }
+
+/* ================= 物理 ================= */
+function coalHeat(c) {
+  const ramp = Math.min(1, c.age / 2);                 // 点燃渐入
+  const tail = Math.max(0, Math.min(1, (c.life - c.age) / 4)); // 烧尽渐弱
+  return ramp * tail * HEAT_PER_COAL;
+}
+
+function physics(dt) {
+  // 煤燃烧
+  let heatIn = 0;
+  for (const c of burning) { c.age += dt; heatIn += coalHeat(c); }
+  burning = burning.filter(c => c.age < c.life);
+
+  // 水温：加热 - 散热 - 蒸汽带走的热量
+  const steamLoss = valveOpen * pressure * 8;
+  temp += (heatIn * 14 - (temp - 20) * 0.10 - steamLoss) * dt;
+  temp = Math.max(20, Math.min(150, temp));
+
+  // 汽压：100°C 以上产生蒸汽，气门放出蒸汽
+  const gen = temp > 100 ? Math.min(1, (temp - 100) / 30) * 0.6 : 0;
+  pressure += (gen - (valveOpen * 1.8 + 0.05) * pressure) * dt;
+  pressure = Math.max(0, Math.min(1, pressure));
+
+  // 飞轮：蒸汽推力（随气门开度和汽压增大）vs 摩擦阻力
+  omega += (valveOpen * Math.pow(pressure, 0.6) * 16 - 0.8 * omega) * dt;
+  omega = Math.max(0, Math.min(OMEGA_MAX, omega));
+  const prevTh = theta;
+  theta += omega * dt;
+  pulleyA += omega * (FW.R / GEN.pr) * dt;
+  if (theta > Math.PI * 2) theta -= Math.PI * 2;
+
+  // 每转一圈排一次汽（有蒸汽时）
+  if (prevTh > theta && valveOpen > 0.1 && pressure > 0.05) {
+    for (let i = 0; i < 4; i++)
+      particles.push({ x:650 + Math.random()*10, y:186, vx:(Math.random()-0.5)*30, vy:-70-Math.random()*50,
+        r:10+Math.random()*8, life:0, maxLife:1.1, color:"rgba(240,240,245," });
+    chuff(valveOpen * pressure);
+  }
+  // 烟囱冒烟
+  if (heatIn > 0.2 && Math.random() < dt * 6)
+    particles.push({ x:115 + Math.random()*10, y:128, vx:(Math.random()-0.5)*15, vy:-40-Math.random()*25,
+      r:8+Math.random()*7, life:0, maxLife:1.8, color:"rgba(120,120,125," });
+  // 粒子更新
+  for (const p of particles) {
+    p.life += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.r += 14 * dt;
+  }
+  particles = particles.filter(p => p.life < p.maxLife);
+
+  if (flash > 0) flash -= dt;
+
+  // 教学提示触发
+  if (!saidBoil && temp >= 100) {
+    saidBoil = true;
+    showHint("水开了！向上拖红色气门把手，放蒸汽推活塞");
+    pop(880);
+  }
+  if (!saidSteam && omega > 1) {
+    saidSteam = true;
+    showHint("蒸汽推动活塞，飞轮转起来了！");
+    pop(990);
+  }
+  if (!saidLight && brightness() > 0.08) {
+    saidLight = true;
+    showHint("发电机发电了，灯泡亮起来啦！");
+    pop(1100);
+  }
+  if (!saidFull && brightness() > 0.85) {
+    saidFull = true;
+    flash = 1;
+    showHint("🎉 灯泡全亮！化学能→热能→机械能→电能，大功告成！");
+    fanfare();
+  }
+  if (everBurned && !saidCoalOut && burning.length === 0 && temp > 60) {
+    saidCoalOut = true;
+    showHint("煤烧完啦，火要灭了——再拖几块煤进炉膛！");
+    pop(300);
+  }
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBoiler(t) {
+  // 烟囱
+  ctx.fillStyle = "#4e342e";
+  ctx.fillRect(100, 130, 30, 84);
+  ctx.fillStyle = "#3e2723";
+  ctx.fillRect(94, 122, 42, 12);
+  // 锅筒
+  const g = ctx.createLinearGradient(BOILER.x, 0, BOILER.x + BOILER.w, 0);
+  g.addColorStop(0, "#8d5524"); g.addColorStop(0.5, "#b87333"); g.addColorStop(1, "#7a4a1e");
+  ctx.fillStyle = g;
+  roundRect(BOILER.x, BOILER.y, BOILER.w, BOILER.h, 40, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 3;
+  roundRect(BOILER.x, BOILER.y, BOILER.w, BOILER.h, 40, false); ctx.stroke();
+  // 铆钉带
+  ctx.fillStyle = "rgba(0,0,0,0.25)";
+  ctx.fillRect(BOILER.x, 330, BOILER.w, 8);
+  ctx.fillRect(BOILER.x, 440, BOILER.w, 8);
+  // 水（水位窗）
+  const wg = ctx.createLinearGradient(0, 350, 0, 505);
+  wg.addColorStop(0, "#4fc3f7"); wg.addColorStop(1, "#0277bd");
+  ctx.fillStyle = wg;
+  roundRect(BOILER.x + 14, 350, BOILER.w - 28, 155, 22, true);
+  // 沸腾气泡
+  if (temp >= 100) {
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    for (let i = 0; i < 7; i++) {
+      const bx = BOILER.x + 30 + ((i * 53 + t * 40) % (BOILER.w - 60));
+      const by = 495 - ((t * (50 + i * 13) + i * 37) % 130);
+      ctx.beginPath(); ctx.arc(bx, by, 3 + (i % 3), 0, 7); ctx.fill();
+    }
+  }
+  // 水面上方的蒸汽雾
+  if (pressure > 0.1) {
+    ctx.fillStyle = `rgba(255,255,255,${0.25 * pressure})`;
+    roundRect(BOILER.x + 14, BOILER.y + 14, BOILER.w - 28, 340 - BOILER.y, 22, true);
+  }
+  ctx.fillStyle = "#fff"; ctx.font = "bold 17px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("锅炉", BOILER.x + BOILER.w / 2, 300);
+}
+
+function drawThermometer() {
+  const x = 322, yTop = 240, yBot = 490;
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  roundRect(x - 8, yTop, 16, yBot - yTop, 8, true);
+  ctx.beginPath(); ctx.arc(x, yBot + 8, 16, 0, 7); ctx.fill();
+  // 液柱
+  const frac = (temp - 20) / 130;
+  const h = frac * (yBot - yTop - 10);
+  ctx.fillStyle = temp >= 100 ? "#e53935" : "#fb8c00";
+  if (h > 2) roundRect(x - 4, yBot - 4 - h, 8, h, 4, true);
+  ctx.beginPath(); ctx.arc(x, yBot + 8, 11, 0, 7); ctx.fill();
+  // 100°C 刻度线
+  const y100 = yBot - 4 - (100 - 20) / 130 * (yBot - yTop - 10);
+  ctx.strokeStyle = "#e53935"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x + 10, y100); ctx.lineTo(x + 24, y100); ctx.stroke();
+  ctx.fillStyle = "#ffb300"; ctx.font = "bold 13px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("100°", x + 26, y100 + 4);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(Math.round(temp) + "°C", x, yBot + 40);
+}
+
+function drawGauge() {
+  const x = 252, y = 274, r = 30;
+  ctx.fillStyle = "#eceff1";
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#37474f"; ctx.lineWidth = 3; ctx.stroke();
+  for (let i = 0; i <= 4; i++) {
+    const a = -Math.PI * 0.75 + i * (Math.PI * 1.5 / 4);
+    ctx.beginPath();
+    ctx.moveTo(x + Math.cos(a) * (r - 8), y + Math.sin(a) * (r - 8));
+    ctx.lineTo(x + Math.cos(a) * (r - 3), y + Math.sin(a) * (r - 3));
+    ctx.stroke();
+  }
+  const a = -Math.PI * 0.75 + pressure * Math.PI * 1.5;
+  ctx.strokeStyle = "#d32f2f"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(x, y);
+  ctx.lineTo(x + Math.cos(a) * (r - 10), y + Math.sin(a) * (r - 10)); ctx.stroke();
+  ctx.fillStyle = "#37474f"; ctx.font = "bold 12px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("气压", x, y + r + 16);
+}
+
+function drawPipeAndValve() {
+  // 锅炉到气缸的蒸汽管道
+  ctx.lineCap = "round";
+  ctx.strokeStyle = "#78909c"; ctx.lineWidth = 26;
+  ctx.beginPath();
+  ctx.moveTo(180, 210); ctx.lineTo(180, 150); ctx.lineTo(505, 150); ctx.lineTo(505, 190);
+  ctx.stroke();
+  ctx.strokeStyle = "#b0bec5"; ctx.lineWidth = 16;
+  ctx.beginPath();
+  ctx.moveTo(180, 210); ctx.lineTo(180, 150); ctx.lineTo(505, 150); ctx.lineTo(505, 190);
+  ctx.stroke();
+  // 管道内蒸汽流动（亮点顺流移动）
+  if (valveOpen > 0.05 && pressure > 0.05) {
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    const sp = performance.now() / 1000 * (120 + 260 * valveOpen * pressure);
+    for (let i = 0; i < 5; i++) {
+      const px = VALVE.x + ((sp + i * 70) % 105);
+      ctx.beginPath(); ctx.arc(px, 150, 4, 0, 7); ctx.fill();
+    }
+  }
+  // 阀体
+  ctx.fillStyle = "#546e7a";
+  roundRect(VALVE.x - 20, VALVE.pipeY - 24, 40, 48, 8, true);
+  ctx.strokeStyle = "#37474f"; ctx.lineWidth = 2;
+  roundRect(VALVE.x - 20, VALVE.pipeY - 24, 40, 48, 8, false); ctx.stroke();
+  // 阀杆 + 红色大手轮（拖动它）
+  const ky = knobY();
+  ctx.strokeStyle = "#90a4ae"; ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.moveTo(VALVE.x, VALVE.pipeY - 20); ctx.lineTo(VALVE.x, ky); ctx.stroke();
+  const kg = ctx.createRadialGradient(VALVE.x - 6, ky - 6, 3, VALVE.x, ky, 24);
+  kg.addColorStop(0, "#ef5350"); kg.addColorStop(1, "#b71c1c");
+  ctx.fillStyle = kg;
+  ctx.beginPath(); ctx.arc(VALVE.x, ky, 24, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#7f0000"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(VALVE.x - 14, ky); ctx.lineTo(VALVE.x + 14, ky); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(VALVE.x, ky - 14); ctx.lineTo(VALVE.x, ky + 14); ctx.stroke();
+  // 标签
+  ctx.fillStyle = "#fff"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("气门 " + Math.round(valveOpen * 100) + "%", VALVE.x, ky - 34);
+}
+
+function drawFirebox(t) {
+  // 炉膛体
+  ctx.fillStyle = "#37474f";
+  roundRect(70, 520, 220, 140, 14, true);
+  ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = 3;
+  roundRect(70, 520, 220, 140, 14, false); ctx.stroke();
+  // 投煤口（炉门）
+  ctx.fillStyle = "#180f08";
+  ctx.beginPath(); ctx.arc(FIRE.x, FIRE.y, FIRE.r, 0, 7); ctx.fill();
+  // 炉内燃烧的煤
+  for (let i = 0; i < burning.length && i < 6; i++) {
+    const c = burning[i];
+    const glow = coalHeat(c) / HEAT_PER_COAL;
+    const bx = FIRE.x - 28 + (i % 3) * 28, by = FIRE.y + 22 - Math.floor(i / 3) * 16;
+    ctx.fillStyle = `rgb(${60 + 195 * glow},${30 + 90 * glow},20)`;
+    ctx.beginPath(); ctx.arc(bx, by, 12, 0, 7); ctx.fill();
+  }
+  // 火焰
+  const heat = burning.reduce((s, c) => s + coalHeat(c), 0);
+  if (heat > 0.05) {
+    const n = Math.min(5, 1 + Math.floor(heat * 1.6));
+    for (let i = 0; i < n; i++) {
+      const fx = FIRE.x - 26 + i * 13 + Math.sin(t * 9 + i * 2.4) * 4;
+      const fh = (18 + heat * 12) * (0.8 + 0.3 * Math.sin(t * 12 + i * 1.7));
+      const fg = ctx.createLinearGradient(0, FIRE.y + 10, 0, FIRE.y + 10 - fh);
+      fg.addColorStop(0, "rgba(255,87,34,0.95)");
+      fg.addColorStop(0.6, "rgba(255,193,7,0.85)");
+      fg.addColorStop(1, "rgba(255,255,180,0)");
+      ctx.fillStyle = fg;
+      ctx.beginPath();
+      ctx.moveTo(fx - 8, FIRE.y + 10);
+      ctx.quadraticCurveTo(fx, FIRE.y + 10 - fh, fx + 8, FIRE.y + 10);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+  // 炉门格栅
+  ctx.strokeStyle = "rgba(120,120,120,0.55)"; ctx.lineWidth = 5;
+  for (let i = -1; i <= 1; i++) {
+    ctx.beginPath(); ctx.moveTo(FIRE.x - FIRE.r + 6, FIRE.y + i * 18);
+    ctx.lineTo(FIRE.x + FIRE.r - 6, FIRE.y + i * 18); ctx.stroke();
+  }
+  ctx.strokeStyle = "#212121"; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.arc(FIRE.x, FIRE.y, FIRE.r, 0, 7); ctx.stroke();
+  ctx.fillStyle = "#cfd8dc"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("炉膛（拖煤到这里）", FIRE.x, FIRE.y + FIRE.r + 24);
+}
+
+function drawCoalPile() {
+  // 煤堆底座
+  ctx.fillStyle = "#3e2723";
+  roundRect(60, 706, 240, 46, 12, true);
+  ctx.fillStyle = "#d7ccc8"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("煤堆", 180, 766 - 10);
+  for (const c of coals) drawCoalLump(c.x, c.y, 21);
+}
+function drawCoalLump(x, y, r) {
+  const g = ctx.createRadialGradient(x - 6, y - 7, 2, x, y, r);
+  g.addColorStop(0, "#616161"); g.addColorStop(1, "#101010");
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.25)";
+  ctx.beginPath(); ctx.arc(x - 6, y - 7, 4, 0, 7); ctx.fill();
+}
+
+function drawCylinder() {
+  // 排气立管
+  ctx.strokeStyle = "#78909c"; ctx.lineWidth = 16;
+  ctx.beginPath(); ctx.moveTo(650, 190); ctx.lineTo(650, 160); ctx.stroke();
+  // 气缸体
+  const g = ctx.createLinearGradient(0, CYL.y, 0, CYL.y + CYL.h);
+  g.addColorStop(0, "#90a4ae"); g.addColorStop(0.5, "#cfd8dc"); g.addColorStop(1, "#78909c");
+  ctx.fillStyle = g;
+  roundRect(CYL.x, CYL.y, CYL.w, CYL.h, 12, true);
+  ctx.strokeStyle = "#37474f"; ctx.lineWidth = 3;
+  roundRect(CYL.x, CYL.y, CYL.w, CYL.h, 12, false); ctx.stroke();
+  // 活塞左侧的蒸汽（越浓越白）
+  const px = pistonX();
+  const sa = valveOpen * pressure;
+  if (sa > 0.02 && px > CYL.x + 4) {
+    ctx.fillStyle = `rgba(255,255,255,${Math.min(0.75, sa)})`;
+    ctx.fillRect(CYL.x + 4, CYL.y + 5, px - CYL.x - 4, CYL.h - 10);
+  }
+  // 活塞
+  ctx.fillStyle = "#5d4037";
+  ctx.fillRect(px, CYL.y + 5, PISTON_W, CYL.h - 10);
+  ctx.fillStyle = "#8d6e63";
+  ctx.fillRect(px + 4, CYL.y + 5, 4, CYL.h - 10);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("气缸·活塞", CYL.x + CYL.w / 2, CYL.y - 10);
+  // 十字头导轨
+  const chx = crossheadX(theta);
+  ctx.strokeStyle = "#546e7a"; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(660, 222); ctx.lineTo(852, 222); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(660, 238); ctx.lineTo(852, 238); ctx.stroke();
+  // 活塞杆
+  ctx.strokeStyle = "#b0bec5"; ctx.lineWidth = 9;
+  ctx.beginPath(); ctx.moveTo(px + PISTON_W, 230); ctx.lineTo(chx, 230); ctx.stroke();
+  // 十字头滑块
+  ctx.fillStyle = "#795548";
+  roundRect(chx - 11, 218, 22, 24, 4, true);
+  ctx.strokeStyle = "#3e2723"; ctx.lineWidth = 2;
+  roundRect(chx - 11, 218, 22, 24, 4, false); ctx.stroke();
+  return chx;
+}
+
+function drawFlywheel(chx) {
+  const { x, y, R, crank } = FW;
+  // 皮带（画在飞轮后面）
+  ctx.strokeStyle = "#4e342e"; ctx.lineWidth = 12;
+  ctx.beginPath(); ctx.moveTo(x - R + 2, y); ctx.lineTo(GEN.px - GEN.pr + 2, GEN.py); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x + R - 2, y); ctx.lineTo(GEN.px + GEN.pr - 2, GEN.py); ctx.stroke();
+  // 轮缘
+  ctx.strokeStyle = "#455a64"; ctx.lineWidth = 18;
+  ctx.beginPath(); ctx.arc(x, y, R - 9, 0, 7); ctx.stroke();
+  ctx.strokeStyle = "#607d8b"; ctx.lineWidth = 12;
+  ctx.beginPath(); ctx.arc(x, y, R - 9, 0, 7); ctx.stroke();
+  // 轮辐
+  ctx.strokeStyle = "#78909c"; ctx.lineWidth = 10;
+  for (let i = 0; i < 5; i++) {
+    const a = theta + i * Math.PI * 2 / 5;
+    ctx.beginPath(); ctx.moveTo(x, y);
+    ctx.lineTo(x + Math.cos(a) * (R - 14), y + Math.sin(a) * (R - 14)); ctx.stroke();
+  }
+  // 轮毂
+  ctx.fillStyle = "#37474f";
+  ctx.beginPath(); ctx.arc(x, y, 16, 0, 7); ctx.fill();
+  // 曲柄销与连杆
+  const pinX = x - Math.cos(theta) * crank, pinY = y + Math.sin(theta) * crank;
+  ctx.strokeStyle = "#ffb300"; ctx.lineWidth = 12; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(chx, 230); ctx.lineTo(pinX, pinY); ctx.stroke();
+  ctx.fillStyle = "#ff8f00";
+  ctx.beginPath(); ctx.arc(pinX, pinY, 9, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#e65100"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("飞轮", x, y + R + 22);
+}
+
+function drawGeneratorAndBulb() {
+  // 发电机皮带轮
+  ctx.fillStyle = "#6d4c41";
+  ctx.beginPath(); ctx.arc(GEN.px, GEN.py, GEN.pr, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#3e2723"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.strokeStyle = "#d7ccc8"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(GEN.px, GEN.py);
+  ctx.lineTo(GEN.px + Math.cos(pulleyA) * GEN.pr, GEN.py + Math.sin(pulleyA) * GEN.pr); ctx.stroke();
+  // 发电机箱体
+  const gg = ctx.createLinearGradient(0, GEN.y, 0, GEN.y + GEN.h);
+  gg.addColorStop(0, "#00897b"); gg.addColorStop(1, "#004d40");
+  ctx.fillStyle = gg;
+  roundRect(GEN.x, GEN.y, GEN.w, GEN.h, 10, true);
+  ctx.strokeStyle = "#00251a"; ctx.lineWidth = 3;
+  roundRect(GEN.x, GEN.y, GEN.w, GEN.h, 10, false); ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("发电机", GEN.x + GEN.w / 2, GEN.y + GEN.h / 2 + 6);
+  // 电线：发电机 → 灯泡
+  const b = brightness();
+  ctx.strokeStyle = b > 0.02 ? "#ffd54a" : "#8d6e63"; ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(GEN.x + GEN.w, GEN.y + 20);
+  ctx.lineTo(1205, GEN.y + 20); ctx.lineTo(1205, 100); ctx.lineTo(BULB.x + 10, 100);
+  ctx.stroke();
+  // 电流亮点
+  if (b > 0.02) {
+    ctx.fillStyle = "#fff59d";
+    const sp = performance.now() / 1000 * (80 + 300 * b);
+    for (let i = 0; i < 6; i++) {
+      const d = (sp + i * 85) % 510;
+      let cx2, cy2;
+      if (d < 195) { cx2 = GEN.x + GEN.w + d; cy2 = GEN.y + 20; }
+      else if (d < 195 + 460) { cx2 = 1205; cy2 = GEN.y + 20 - (d - 195); }
+      else { cx2 = 1205 - (d - 655); cy2 = 100; }
+      ctx.beginPath(); ctx.arc(cx2, cy2, 4, 0, 7); ctx.fill();
+    }
+  }
+  // 灯泡底座
+  ctx.fillStyle = "#9e9e9e";
+  ctx.fillRect(BULB.x - 14, 148, 28, 22);
+  ctx.fillStyle = "#757575";
+  ctx.fillRect(BULB.x - 14, 154, 28, 4);
+  ctx.fillRect(BULB.x - 14, 162, 28, 4);
+  // 玻璃泡 + 发光
+  if (b > 0.01) {
+    const glow = ctx.createRadialGradient(BULB.x, BULB.y, 5, BULB.x, BULB.y, 40 + 90 * b);
+    glow.addColorStop(0, `rgba(255,236,140,${0.9 * b})`);
+    glow.addColorStop(1, "rgba(255,236,140,0)");
+    ctx.fillStyle = glow;
+    ctx.beginPath(); ctx.arc(BULB.x, BULB.y, 40 + 90 * b, 0, 7); ctx.fill();
+  }
+  ctx.fillStyle = b > 0.01 ? `rgba(255,244,190,${0.35 + 0.65 * b})` : "rgba(255,255,255,0.16)";
+  ctx.beginPath(); ctx.arc(BULB.x, BULB.y, BULB.r, 0, 7); ctx.fill();
+  ctx.strokeStyle = "rgba(200,200,200,0.8)"; ctx.lineWidth = 3; ctx.stroke();
+  // 灯丝
+  ctx.strokeStyle = b > 0.01 ? `rgb(255,${180 + 60 * b},60)` : "#9e9e9e"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(BULB.x - 12, 148);
+  ctx.lineTo(BULB.x - 8, BULB.y + 6);
+  for (let i = 0; i < 4; i++)
+    ctx.lineTo(BULB.x - 8 + i * 5 + 2.5, BULB.y + (i % 2 ? -4 : 6));
+  ctx.lineTo(BULB.x + 8, BULB.y + 6); ctx.lineTo(BULB.x + 12, 148);
+  ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("灯泡", BULB.x, 185);
+}
+
+/* ---------- 能量转化链面板 ---------- */
+const CHAIN = [
+  { label:"化学能", sub:"煤", color:"#8d6e63", val:() => Math.min(1, burning.reduce((s,c)=>s+coalHeat(c),0) / 2.8) },
+  { label:"热能",   sub:"蒸汽", color:"#e53935", val:() => Math.max(0,(temp-20)/130) },
+  { label:"机械能", sub:"飞轮", color:"#1e88e5", val:() => Math.min(1, omega / OMEGA_MAX) },
+  { label:"电能",   sub:"灯泡", color:"#fdd835", val:() => brightness() },
+];
+function drawEnergyChain(t) {
+  ctx.fillStyle = "rgba(10,16,20,0.72)";
+  roundRect(355, 660, 890, 92, 16, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.15)"; ctx.lineWidth = 2;
+  roundRect(355, 660, 890, 92, 16, false); ctx.stroke();
+  ctx.fillStyle = "#b0bec5"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("能量转化链", 372, 682);
+  const bw = 140, bh = 46, by = 694;
+  for (let i = 0; i < 4; i++) {
+    const bx = 390 + i * 210, v = CHAIN[i].val();
+    // 格子底
+    ctx.fillStyle = "rgba(255,255,255,0.10)";
+    roundRect(bx, by, bw, bh, 10, true);
+    // 能量条（从底部涨起）
+    if (v > 0.02) {
+      ctx.globalAlpha = 0.55 + 0.45 * v;
+      ctx.fillStyle = CHAIN[i].color;
+      roundRect(bx + 3, by + 3 + (bh - 6) * (1 - v), bw - 6, (bh - 6) * v, 8, true);
+      ctx.globalAlpha = 1;
+    }
+    ctx.strokeStyle = v > 0.5 ? CHAIN[i].color : "rgba(255,255,255,0.35)";
+    ctx.lineWidth = 2;
+    roundRect(bx, by, bw, bh, 10, false); ctx.stroke();
+    ctx.fillStyle = "#fff"; ctx.font = "bold 17px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(CHAIN[i].label, bx + bw / 2, by + 22);
+    ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.font = "12px sans-serif";
+    ctx.fillText(CHAIN[i].sub, bx + bw / 2, by + 39);
+    // 格子间流动箭头
+    if (i < 3) {
+      const ax = bx + bw + 6, aw = 58, ay = by + bh / 2;
+      const flow = CHAIN[i].val();
+      ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(ax + aw, ay); ctx.stroke();
+      // 流动小箭头（速度随能量大小）
+      const n = 2;
+      for (let k = 0; k < n; k++) {
+        const d = ((t * (20 + 130 * flow) + k * aw / n) % aw);
+        ctx.fillStyle = flow > 0.03 ? CHAIN[i + 1].color : "rgba(255,255,255,0.3)";
+        ctx.beginPath();
+        ctx.moveTo(ax + d, ay - 7); ctx.lineTo(ax + d + 10, ay); ctx.lineTo(ax + d, ay + 7);
+        ctx.closePath(); ctx.fill();
+      }
+    }
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const a = 0.55 * (1 - p.life / p.maxLife);
+    ctx.fillStyle = p.color + a + ")";
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  }
+}
+
+function draw(t) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 背景
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#37474f"); bg.addColorStop(1, "#263238");
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy); ctx.scale(view.s, view.s);
+
+  // 地面
+  ctx.fillStyle = "#4e342e";
+  ctx.fillRect(0, 660, 345, 100);
+  ctx.fillStyle = "#5d4037";
+  ctx.fillRect(0, 660, 345, 8);
+
+  drawBoiler(t);
+  drawThermometer();
+  drawGauge();
+  drawPipeAndValve();
+  drawFirebox(t);
+  drawCoalPile();
+  const chx = drawCylinder();
+  drawFlywheel(chx);
+  drawGeneratorAndBulb();
+  drawParticles();
+  drawEnergyChain(t);
+
+  // 拖着的煤画在最上层
+  if (dragCoal) {
+    // 炉口高亮提示圈
+    ctx.strokeStyle = "rgba(255,213,74,0.9)"; ctx.lineWidth = 4;
+    ctx.setLineDash([10, 8]);
+    ctx.beginPath(); ctx.arc(FIRE.x, FIRE.y, FIRE.r + 12, 0, 7); ctx.stroke();
+    ctx.setLineDash([]);
+    drawCoalLump(dragCoal.x, dragCoal.y, 24);
+  }
+  // 庆祝闪光
+  if (flash > 0) {
+    ctx.fillStyle = `rgba(255,240,150,${0.25 * flash})`;
+    ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+  }
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+let simT = 0;
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  simT += dt;
+  physics(dt);
+  scorebar.textContent = `🌀 转速 ${Math.round(rpm())} 转/分 · 💡 亮度 ${Math.round(brightness() * 100)}%`;
+  draw(simT);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 交互 ================= */
+function hitCoal(wx, wy) {
+  for (let i = coals.length - 1; i >= 0; i--) {
+    const c = coals[i];
+    if (Math.hypot(wx - c.x, wy - c.y) < 30) return c;
+  }
+  return null;
+}
+canvas.addEventListener("pointerdown", e => {
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  // 拖煤块
+  const c = hitCoal(wx, wy);
+  if (c) {
+    dragCoal = c;
+    coals.splice(coals.indexOf(c), 1);
+    c.x = wx; c.y = wy;
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(500);
+    return;
+  }
+  // 拖气门手轮（大范围判定，方便孩子操作）
+  if (Math.hypot(wx - VALVE.x, wy - knobY()) < 44 ||
+      (Math.abs(wx - VALVE.x) < 34 && wy > VALVE.knobMin - 30 && wy < VALVE.pipeY + 10)) {
+    dragValve = true;
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+    pop(650);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  if (dragCoal) { dragCoal.x = wx; dragCoal.y = wy; }
+  if (dragValve) {
+    const ky = Math.max(VALVE.knobMin, Math.min(VALVE.knobMax, wy));
+    valveOpen = (VALVE.knobMax - ky) / (VALVE.knobMax - VALVE.knobMin);
+  }
+});
+window.addEventListener("pointerup", () => {
+  if (dragCoal) {
+    if (Math.hypot(dragCoal.x - FIRE.x, dragCoal.y - FIRE.y) < FIRE.r + 26) {
+      addCoalToFurnace();   // 投进炉膛
+    } else {
+      dragCoal.x = dragCoal.hx; dragCoal.y = dragCoal.hy;
+      coals.push(dragCoal);
+      pop(350);
+    }
+    dragCoal = null;
+  }
+  dragValve = false;
+});
+// 煤堆自动补货
+setInterval(() => {
+  if (coals.length + (dragCoal ? 1 : 0) < PILE.length) {
+    const used = new Set(coals.map(c => c.hx + "," + c.hy));
+    const slot = PILE.find(([x, y]) => !used.has(x + "," + y));
+    if (slot) coals.push({ x:slot[0], y:slot[1], hx:slot[0], hy:slot[1], state:"pile" });
+  }
+}, 600);
+
+/* ================= 音效 ================= */
+let actx = null;
+function ac() {
+  actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+  return actx;
+}
+function tone(freq, dur, vol, type) {
+  try {
+    const a = ac();
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(); o.stop(a.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+function noiseBurst(dur, vol, freq, type) {
+  try {
+    const a = ac();
+    const n = Math.floor(a.sampleRate * dur);
+    const buf = a.createBuffer(1, n, a.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const src = a.createBufferSource(); src.buffer = buf;
+    const f = a.createBiquadFilter(); f.type = type || "highpass"; f.frequency.value = freq;
+    const g = a.createGain(); g.gain.value = vol;
+    src.connect(f); f.connect(g); g.connect(a.destination);
+    src.start();
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+const clank = () => { tone(180, 0.18, 0.2, "square"); noiseBurst(0.08, 0.15, 3000); };
+const chuff = v => noiseBurst(0.16, 0.05 + 0.18 * v, 900, "bandpass");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 提示条 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

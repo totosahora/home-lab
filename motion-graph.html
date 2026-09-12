@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>匀速运动图像</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#dfeeff; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,70,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; max-width:96vw;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,40,70,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:96vw;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:36px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar"></div>
+<div id="hint">拖动小车上的红色箭头（或滑杆）设定速度，然后点「出发」！</div>
+<div id="winPanel">
+  <div class="msg">🎉 三个挑战全部完成！<br>你读懂了 s-t 图和 v-t 图！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 物理设定：小车匀速行驶 T 秒，直道全长 TRACK_M 米，速度 0 ~ VMAX m/s
+const T = 5, TRACK_M = 40, VMAX = 8, VSTEP = 0.5;
+const RUN_COLORS = ["#1e88e5", "#fb8c00"];   // 第1次蓝、第2次橙
+
+let v = 3;              // 当前设定的速度 (m/s)
+let t = 0;              // 本次行驶已进行的时间 (s)
+let state = "set";      // set | run | done
+let runs = [];          // 已完成的记录 {v, s, color}
+let runCounter = 0;     // 总共跑过几次（决定颜色）
+let lastTickSec = -1;
+
+// 布局（随窗口计算）
+const L = {};
+function layout() {
+  // 左侧：直道
+  L.roadX0 = W * 0.07; L.roadX1 = W * 0.42; L.roadY = H * 0.40;
+  L.m2px = (L.roadX1 - L.roadX0) / TRACK_M;
+  // 速度滑杆
+  L.slX0 = W * 0.07; L.slX1 = W * 0.42; L.slY = H * 0.64; L.knobR = 17;
+  // 大按钮
+  L.btn = { x: W * 0.245 - Math.min(220, W * 0.20) / 2, y: H * 0.76, w: Math.min(220, W * 0.20), h: 62 };
+  // 右侧两张图卡片
+  const cx0 = W * 0.47, cx1 = W * 0.965;
+  L.cardST = { x: cx0, y: H * 0.065, w: cx1 - cx0, h: H * 0.415 };
+  L.cardVT = { x: cx0, y: H * 0.535, w: cx1 - cx0, h: H * 0.40 };
+}
+function plotOf(card) {
+  return { x0: card.x + 52, y0: card.y + 50, x1: card.x + card.w - 18, y1: card.y + card.h - 30 };
+}
+resize();
+
+/* ================= 任务卡 ================= */
+const TASKS = [
+  { short: "跑两次，让第 2 次的 s-t 图更陡", hint: "第 2 次要更快哦！把速度调大一点再出发", done: "s-t 图越陡，速度越快！" },
+  { short: "让 v-t 图的阴影面积正好等于 20 m", hint: "阴影面积 = v × 5 s，试试 v = 4 m/s", done: "v-t 图面积就是路程！" },
+  { short: "让小车 5 秒正好跑完 40 m 到达终点", hint: "40 m ÷ 5 s = ？把速度调到 8 m/s", done: "v = s ÷ t = 8 m/s，完美！" }
+];
+let taskIdx = 0;
+
+function updateScore() {
+  scorebar.textContent = taskIdx < TASKS.length
+    ? `挑战 ${taskIdx + 1} / ${TASKS.length} · ${TASKS[taskIdx].short}`
+    : "🎉 全部挑战完成！";
+}
+function currentTaskDone() {
+  if (taskIdx === 0) return runs.length >= 2 && runs[runs.length - 1].v > runs[runs.length - 2].v;
+  if (taskIdx === 1) return runs.some(r => Math.abs(r.s - 20) < 0.01);
+  if (taskIdx === 2) return runs.some(r => Math.abs(r.s - TRACK_M) < 0.01);
+  return false;
+}
+function checkTask() {
+  if (taskIdx >= TASKS.length) return;
+  if (currentTaskDone()) {
+    const doneMsg = TASKS[taskIdx].done;
+    taskIdx++;
+    updateScore();
+    fanfare();
+    if (taskIdx >= TASKS.length) {
+      setTimeout(() => { winPanel.style.display = "flex"; fanfare(); }, 900);
+    } else {
+      showHint(`✅ ${doneMsg} 下一个挑战来了！`);
+    }
+  } else {
+    showHint("💡 " + TASKS[taskIdx].hint);
+  }
+}
+
+/* ================= 物理（匀速直线运动） ================= */
+function carS() { return Math.min(TRACK_M, v * t); }   // 当前路程 s = v·t
+
+function step(dt) {
+  if (state !== "run") return;
+  t += dt;
+  if (Math.floor(t) !== lastTickSec && t < T) { lastTickSec = Math.floor(t); pop(660); }
+  if (t >= T) { t = T; finishRun(); }
+}
+
+function startRun() {
+  if (state !== "set") return;
+  state = "run"; t = 0; lastTickSec = -1;
+  whoosh();
+}
+function finishRun() {
+  runs.push({ v: v, s: v * T, color: RUN_COLORS[runCounter % 2] });
+  runCounter++;
+  if (runs.length > 2) runs.shift();    // 图上最多保留两次记录做对比
+  state = "done";
+  pop(880);
+  checkTask();
+}
+function again() {
+  if (state !== "done") return;
+  state = "set"; t = 0;
+  pop(520);
+}
+function setV(nv) {
+  nv = Math.max(0, Math.min(VMAX, nv));
+  nv = Math.round(nv / VSTEP) * VSTEP;
+  if (nv !== v) { v = nv; tickSoft(); }
+}
+function resetGame() {
+  v = 3; t = 0; state = "set";
+  runs = []; runCounter = 0; taskIdx = 0;
+  winPanel.style.display = "none";
+  updateScore();
+}
+updateScore();
+
+/* ================= 交互（Pointer Events） ================= */
+let dragMode = null;   // "arrow" | "slider"
+
+function arrowGeom() {
+  // 速度箭头：从小车车顶向右，长度 ∝ v
+  const cx = L.roadX0 + carS() * L.m2px;
+  const y = L.roadY - 64;
+  return { x0: cx, y: y, x1: cx + v * 16, hx: cx + v * 16, hy: y };
+}
+function vFromArrowX(px) { return (px - arrowGeom().x0) / 16; }
+function vFromSliderX(px) { return (px - L.slX0) / (L.slX1 - L.slX0) * VMAX; }
+function inBtn(px, py) {
+  return px >= L.btn.x && px <= L.btn.x + L.btn.w && py >= L.btn.y && py <= L.btn.y + L.btn.h;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  hintEl.style.opacity = "0";
+  if (winPanel.style.display === "flex") return;
+  const px = e.clientX, py = e.clientY;
+  // 按钮
+  if (inBtn(px, py)) {
+    if (state === "set") startRun();
+    else if (state === "done") again();
+    return;
+  }
+  if (state !== "set") return;
+  // 速度箭头手柄（大的抓取范围）
+  const g = arrowGeom();
+  if (Math.hypot(px - g.hx, py - g.hy) < 30 || (px > g.x0 - 10 && px < g.x1 + 30 && Math.abs(py - g.y) < 24)) {
+    dragMode = "arrow";
+    setV(vFromArrowX(px));
+  }
+  // 滑杆
+  else if (Math.abs(py - L.slY) < 30 && px > L.slX0 - 24 && px < L.slX1 + 24) {
+    dragMode = "slider";
+    setV(vFromSliderX(px));
+  }
+  if (dragMode) canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragMode || state !== "set") return;
+  if (dragMode === "arrow") setV(vFromArrowX(e.clientX));
+  else setV(vFromSliderX(e.clientX));
+});
+window.addEventListener("pointerup", () => { dragMode = null; });
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#cfe6ff"); g.addColorStop(0.6, "#eaf5ff"); g.addColorStop(1, "#f4fbee");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 草地
+  ctx.fillStyle = "#bfe3a8";
+  ctx.fillRect(0, L.roadY + 60, W * 0.455, H - (L.roadY + 60));
+  // 太阳
+  ctx.beginPath(); ctx.arc(W * 0.055, H * 0.10, 30, 0, 7);
+  ctx.fillStyle = "#ffd54a"; ctx.fill();
+  ctx.strokeStyle = "rgba(255,180,0,0.6)"; ctx.lineWidth = 4; ctx.stroke();
+}
+
+function drawRoad() {
+  const y = L.roadY;
+  // 路面
+  ctx.fillStyle = "#8d9db5";
+  ctx.fillRect(L.roadX0 - 50, y - 28, (L.roadX1 - L.roadX0) + 100, 56);
+  ctx.fillStyle = "#7c8ca3";
+  ctx.fillRect(L.roadX0 - 50, y - 28, (L.roadX1 - L.roadX0) + 100, 5);
+  // 中央虚线
+  ctx.strokeStyle = "rgba(255,255,255,0.75)"; ctx.lineWidth = 3;
+  ctx.setLineDash([18, 14]);
+  ctx.beginPath(); ctx.moveTo(L.roadX0 - 40, y); ctx.lineTo(L.roadX1 + 40, y); ctx.stroke();
+  ctx.setLineDash([]);
+  // 刻度牌：每 10 m
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let m = 0; m <= TRACK_M; m += 10) {
+    const x = L.roadX0 + m * L.m2px;
+    ctx.strokeStyle = "#5a6b82"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x, y + 28); ctx.lineTo(x, y + 40); ctx.stroke();
+    ctx.fillStyle = "#40506a"; ctx.font = "bold 13px sans-serif";
+    ctx.fillText(m + " m", x, y + 44);
+  }
+  // 起点 / 终点旗
+  ctx.font = "bold 13px sans-serif";
+  ctx.fillStyle = "#2e7d32"; ctx.fillText("起点", L.roadX0, y + 62);
+  ctx.fillStyle = "#c62828"; ctx.fillText("终点", L.roadX1, y + 62);
+  // 终点旗杆
+  ctx.strokeStyle = "#795548"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(L.roadX1, y - 28); ctx.lineTo(L.roadX1, y - 62); ctx.stroke();
+  for (let i = 0; i < 4; i++) {
+    ctx.fillStyle = i % 2 ? "#fff" : "#222";
+    ctx.fillRect(L.roadX1 + 2 + (i % 2) * 8, y - 62 + Math.floor(i / 2) * 8, 8, 8);
+  }
+}
+
+function drawCar() {
+  const s = carS();
+  const cx = L.roadX0 + s * L.m2px;
+  const y = L.roadY;
+  const bodyColor = RUN_COLORS[runCounter % 2];
+  // 车轮
+  ctx.fillStyle = "#263238";
+  ctx.beginPath(); ctx.arc(cx - 16, y - 6, 9, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 16, y - 6, 9, 0, 7); ctx.fill();
+  ctx.fillStyle = "#90a4ae";
+  ctx.beginPath(); ctx.arc(cx - 16, y - 6, 4, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 16, y - 6, 4, 0, 7); ctx.fill();
+  // 车身
+  ctx.fillStyle = bodyColor;
+  roundRect(cx - 32, y - 30, 64, 22, 8, true);
+  roundRect(cx - 18, y - 44, 34, 16, 6, true);
+  // 车窗
+  ctx.fillStyle = "#e1f5fe";
+  roundRect(cx - 13, y - 41, 24, 11, 4, true);
+  // 速度箭头（把看不见的速度画出来）
+  const g = arrowGeom();
+  const live = state === "run";
+  ctx.strokeStyle = live ? "#e53935" : "#d81b60"; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(g.x0, g.y); ctx.lineTo(g.x1, g.y); ctx.stroke();
+  if (v > 0) {
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.beginPath();
+    ctx.moveTo(g.x1 + 12, g.y); ctx.lineTo(g.x1, g.y - 8); ctx.lineTo(g.x1, g.y + 8);
+    ctx.closePath(); ctx.fill();
+  }
+  // 拖拽手柄
+  if (state === "set") {
+    ctx.beginPath(); ctx.arc(g.hx + 12, g.hy, 13, 0, 7);
+    ctx.fillStyle = "rgba(216,27,96,0.25)"; ctx.fill();
+    ctx.strokeStyle = "#d81b60"; ctx.lineWidth = 3; ctx.stroke();
+  }
+  // 速度标签
+  ctx.fillStyle = "#b0003a"; ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+  ctx.fillText("v = " + v + " m/s", (g.x0 + g.x1) / 2 + 6, g.y - 10);
+}
+
+function drawSlider() {
+  const y = L.slY;
+  ctx.fillStyle = "#40506a"; ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+  ctx.fillText("速度滑杆（单位：m/s）", L.slX0, y - 34);
+  // 轨道
+  ctx.strokeStyle = "#b0bec5"; ctx.lineWidth = 10; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(L.slX0, y); ctx.lineTo(L.slX1, y); ctx.stroke();
+  // 已选部分
+  const kx = L.slX0 + (v / VMAX) * (L.slX1 - L.slX0);
+  ctx.strokeStyle = "#d81b60";
+  ctx.beginPath(); ctx.moveTo(L.slX0, y); ctx.lineTo(kx, y); ctx.stroke();
+  ctx.lineCap = "butt";
+  // 刻度 0 2 4 6 8
+  ctx.fillStyle = "#607d8b"; ctx.font = "12px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let m = 0; m <= VMAX; m += 2) {
+    const x = L.slX0 + (m / VMAX) * (L.slX1 - L.slX0);
+    ctx.fillText(String(m), x, y + 14);
+  }
+  // 手柄
+  ctx.beginPath(); ctx.arc(kx, y, L.knobR, 0, 7);
+  ctx.fillStyle = state === "set" ? "#d81b60" : "#90a4ae"; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#40506a"; ctx.font = "bold 13px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+}
+
+function drawButton() {
+  const b = L.btn;
+  let label, bg;
+  if (state === "set") { label = "🚗 出发！"; bg = "#43a047"; }
+  else if (state === "run") { label = "行驶中…"; bg = "#9e9e9e"; }
+  else { label = "🔁 再跑一次"; bg = "#1e88e5"; }
+  ctx.fillStyle = "rgba(0,0,0,0.18)";
+  roundRect(b.x, b.y + 4, b.w, b.h, 18, true);
+  ctx.fillStyle = bg;
+  roundRect(b.x, b.y, b.w, b.h, 18, true);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 24px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2);
+}
+
+function drawReadout() {
+  const x = W * 0.07, y = H * 0.14;
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  roundRect(x - 14, y - 26, Math.min(320, W * 0.36), 96, 14, true);
+  ctx.fillStyle = "#40506a"; ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  if (state === "set") {
+    ctx.fillText("准备好啦！", x, y - 12);
+    ctx.fillStyle = "#b0003a"; ctx.font = "bold 20px sans-serif";
+    ctx.fillText("设定速度 v = " + v + " m/s", x, y + 14);
+    ctx.fillStyle = "#607d8b"; ctx.font = "13px sans-serif";
+    ctx.fillText("小车将匀速行驶 " + T + " 秒", x, y + 44);
+  } else {
+    ctx.fillStyle = "#40506a"; ctx.font = "bold 20px sans-serif";
+    ctx.fillText("t = " + t.toFixed(1) + " s", x, y - 12);
+    ctx.fillStyle = "#1e6fb8";
+    ctx.fillText("s = " + carS().toFixed(1) + " m", x, y + 16);
+    ctx.fillStyle = "#607d8b"; ctx.font = "13px sans-serif";
+    ctx.fillText("s = v × t = " + v + " × " + t.toFixed(1), x, y + 44);
+  }
+}
+
+/* ---------- 图表 ---------- */
+function drawCard(card, title) {
+  ctx.fillStyle = "rgba(0,0,0,0.08)";
+  roundRect(card.x, card.y + 3, card.w, card.h, 14, true);
+  ctx.fillStyle = "#ffffff";
+  roundRect(card.x, card.y, card.w, card.h, 14, true);
+  ctx.fillStyle = "#37474f"; ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillText(title, card.x + 14, card.y + 10);
+}
+
+function drawAxes(p, xLabel, yLabel, yMax, yStep, fmt) {
+  // 网格
+  ctx.strokeStyle = "#eceff1"; ctx.lineWidth = 1;
+  ctx.fillStyle = "#90a4ae"; ctx.font = "11px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let tt = 0; tt <= T; tt++) {
+    const x = p.x0 + (tt / T) * (p.x1 - p.x0);
+    ctx.beginPath(); ctx.moveTo(x, p.y0); ctx.lineTo(x, p.y1); ctx.stroke();
+    ctx.fillText(String(tt), x, p.y1 + 5);
+  }
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let yy = 0; yy <= yMax; yy += yStep) {
+    const y = p.y1 - (yy / yMax) * (p.y1 - p.y0);
+    ctx.beginPath(); ctx.moveTo(p.x0, y); ctx.lineTo(p.x1, y); ctx.stroke();
+    ctx.fillText(fmt(yy), p.x0 - 7, y);
+  }
+  // 坐标轴
+  ctx.strokeStyle = "#546e7a"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(p.x0, p.y0); ctx.lineTo(p.x0, p.y1); ctx.lineTo(p.x1, p.y1); ctx.stroke();
+  // 轴名称
+  ctx.fillStyle = "#546e7a"; ctx.font = "bold 12px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText(xLabel, p.x1 + 4, p.y1);
+  ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+  ctx.fillText(yLabel, p.x0, p.y0 - 4);
+}
+
+function mapX(p, tt) { return p.x0 + (tt / T) * (p.x1 - p.x0); }
+
+function drawST() {
+  const card = L.cardST, p = plotOf(card);
+  drawCard(card, "路程-时间图像（s-t 图）· 斜率 = 速度");
+  drawAxes(p, "t/s", "s/m", TRACK_M, 10, String);
+  const mapY = s => p.y1 - (s / TRACK_M) * (p.y1 - p.y0);
+  // 历史记录（完整直线）
+  for (const r of runs) {
+    ctx.strokeStyle = r.color; ctx.lineWidth = 3; ctx.globalAlpha = 0.9;
+    ctx.beginPath(); ctx.moveTo(mapX(p, 0), mapY(0)); ctx.lineTo(mapX(p, T), mapY(r.s)); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  // 本次实时
+  if (state !== "set") {
+    const col = RUN_COLORS[runCounter % 2];
+    ctx.strokeStyle = col; ctx.lineWidth = 3.5;
+    ctx.beginPath(); ctx.moveTo(mapX(p, 0), mapY(0)); ctx.lineTo(mapX(p, t), mapY(carS())); ctx.stroke();
+    const pulse = state === "run" ? 2 * Math.sin(performance.now() / 150) : 0;
+    ctx.beginPath(); ctx.arc(mapX(p, t), mapY(carS()), 6 + pulse, 0, 7);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+  }
+  // 图例
+  ctx.font = "bold 12px sans-serif"; ctx.textAlign = "right"; ctx.textBaseline = "top";
+  let lx = p.x1;
+  for (let i = runs.length - 1; i >= 0; i--) {
+    const r = runs[i];
+    const txt = `v=${r.v} `;
+    ctx.fillStyle = r.color;
+    ctx.fillText(txt, lx, card.y + 12);
+    lx -= ctx.measureText(txt).width;
+    ctx.beginPath(); ctx.arc(lx - 6, card.y + 18, 5, 0, 7); ctx.fill();
+    lx -= 20;
+  }
+}
+
+function drawVT() {
+  const card = L.cardVT, p = plotOf(card);
+  drawCard(card, "速度-时间图像（v-t 图）· 阴影面积 = 路程");
+  drawAxes(p, "t/s", "v/(m/s)", VMAX, 2, String);
+  const mapY = vv => p.y1 - (vv / VMAX) * (p.y1 - p.y0);
+  // 历史记录：水平线 + 阴影
+  for (const r of runs) {
+    ctx.fillStyle = r.color; ctx.globalAlpha = 0.15;
+    ctx.fillRect(mapX(p, 0), mapY(r.v), mapX(p, T) - mapX(p, 0), p.y1 - mapY(r.v));
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = r.color; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(mapX(p, 0), mapY(r.v)); ctx.lineTo(mapX(p, T), mapY(r.v)); ctx.stroke();
+    if (r.v > 0) {
+      ctx.fillStyle = r.color; ctx.font = "bold 12px sans-serif";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("面积 = " + r.s + " m", (mapX(p, 0) + mapX(p, T)) / 2, (mapY(r.v) + p.y1) / 2);
+    }
+  }
+  // 本次实时：阴影随时间增长
+  if (state !== "set") {
+    const col = RUN_COLORS[runCounter % 2];
+    if (v > 0 && t > 0) {
+      ctx.fillStyle = col; ctx.globalAlpha = 0.3;
+      ctx.fillRect(mapX(p, 0), mapY(v), mapX(p, t) - mapX(p, 0), p.y1 - mapY(v));
+      ctx.globalAlpha = 1;
+    }
+    ctx.strokeStyle = col; ctx.lineWidth = 3.5;
+    ctx.beginPath(); ctx.moveTo(mapX(p, 0), mapY(v)); ctx.lineTo(mapX(p, t), mapY(v)); ctx.stroke();
+    const pulse = state === "run" ? 2 * Math.sin(performance.now() / 150) : 0;
+    ctx.beginPath(); ctx.arc(mapX(p, t), mapY(v), 6 + pulse, 0, 7);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+    // 实时面积读数（贴近实时线下方，避免压到历史记录线）
+    if (v > 0 && t > 0.4) {
+      ctx.fillStyle = col; ctx.font = "bold 13px sans-serif";
+      ctx.textAlign = "center"; ctx.textBaseline = "top";
+      ctx.fillText("面积 = 路程 = " + carS().toFixed(1) + " m",
+        (mapX(p, 0) + mapX(p, t)) / 2, mapY(v) + 8);
+    }
+  } else {
+    // 预览：当前设定速度的水平虚线
+    ctx.strokeStyle = "rgba(216,27,96,0.55)"; ctx.lineWidth = 2;
+    ctx.setLineDash([8, 7]);
+    ctx.beginPath(); ctx.moveTo(mapX(p, 0), mapY(v)); ctx.lineTo(mapX(p, T), mapY(v)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(216,27,96,0.8)"; ctx.font = "12px sans-serif";
+    ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+    ctx.fillText("预览：v = " + v + " m/s", mapX(p, 0) + 6, mapY(v) - 4);
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawRoad();
+  drawCar();
+  drawSlider();
+  drawButton();
+  drawReadout();
+  drawST();
+  drawVT();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  step(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const tickSoft = () => tone(900, 0.04, 0.05, "square");
+const whoosh = () => tone(320, 0.2, 0.1, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 4000);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+// 测试钩子（无头浏览器验证用）
+window.MG = {
+  setV: setV,
+  start: startRun,
+  again: again,
+  step: (dt, n) => { for (let i = 0; i < n; i++) step(dt); },
+  draw: draw,
+  runs: runs,
+  get state() { return state; },
+  get taskIdx() { return taskIdx; },
+  get t() { return t; }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

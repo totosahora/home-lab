@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>图表小达人</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#22304a; user-select:none; -webkit-user-select:none; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(15,22,38,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #modeTabs { position:absolute; top:12px; left:14px; z-index:11; display:flex; gap:8px; }
+  #modeTabs button {
+    font-size:16px; font-weight:bold; padding:10px 16px;
+    border-radius:22px; border:none; cursor:pointer;
+    background:rgba(15,22,38,0.75); color:#cfe0ff;
+    box-shadow:0 2px 6px rgba(0,0,0,0.3);
+  }
+  #modeTabs button.on { background:#ffd54a; color:#5a3d00; }
+  #modeTabs button:active { transform:scale(1.06); }
+  #qcard {
+    position:absolute; top:64px; left:50%; transform:translateX(-50%);
+    background:rgba(255,255,255,0.95); color:#22304a; padding:12px 26px;
+    border-radius:20px; font-size:23px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; max-width:94vw;
+    box-shadow:0 4px 12px rgba(0,0,0,0.35);
+  }
+  #choices {
+    position:absolute; bottom:60px; left:50%; transform:translateX(-50%);
+    z-index:11; display:none; gap:18px;
+  }
+  #choices button {
+    font-size:30px; font-weight:bold; min-width:88px; padding:14px 22px;
+    border-radius:20px; border:none; background:#ffffff; color:#22304a;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.35);
+  }
+  #choices button:active { transform:scale(1.08); }
+  #confirmBtn {
+    position:absolute; bottom:60px; left:50%; transform:translateX(-50%);
+    z-index:11; display:none;
+    font-size:24px; font-weight:bold; padding:16px 40px;
+    border-radius:28px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #confirmBtn:active { transform:translateX(-50%) scale(1.06); }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(15,22,38,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.45);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">第 1 / 5 题 · ⭐ 0</div>
+<div id="modeTabs">
+  <button id="tabBar" class="on">📊 销量条形图</button>
+  <button id="tabLine">🌡️ 气温折线图</button>
+</div>
+<div id="qcard"></div>
+<div id="choices"></div>
+<button id="confirmBtn">✔ 就选这一天</button>
+<div id="hint">点一点或用手划过柱子，看看每天卖了多少！</div>
+<div id="winPanel">
+  <div class="msg">🎉 一轮完成！</div>
+  <button id="replayBtn">再玩一轮</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const qcard = document.getElementById("qcard");
+const choicesEl = document.getElementById("choices");
+const confirmBtn = document.getElementById("confirmBtn");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 场景数据 ================= */
+// 小卖部一周销售数据（周一 ~ 周日），保证最多/最少唯一
+const DAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+const PRODS = [
+  { name:"汽水", unit:"瓶", color:"#3a86d8", data:[12,  9, 15, 11, 18, 22, 16] },
+  { name:"薯片", unit:"包", color:"#ff9f1c", data:[ 9, 13, 10, 17, 12, 15, 14] },
+  { name:"糖果", unit:"颗", color:"#e94f8a", data:[20, 16, 22, 18, 25, 21, 24] }
+];
+// 一周气温（°C）：最高 30（周日）唯一；降温最快是周五（-5）唯一
+const TEMPS = [22, 25, 28, 24, 19, 26, 30];
+const D_TEMP = TEMPS.map((t, i) => i === 0 ? 0 : t - TEMPS[i - 1]);
+
+function argmax(a) { let m = 0; for (let i = 1; i < a.length; i++) if (a[i] > a[m]) m = i; return m; }
+function argmin(a) { let m = 0; for (let i = 1; i < a.length; i++) if (a[i] < a[m]) m = i; return m; }
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; [a[i], a[j]] = [a[j], a[i]]; } return a; }
+
+/* ================= 题目 ================= */
+const ROUNDS = 5;
+let mode = "bar";            // bar | line
+let questions = [], qIdx = 0, stars = 0, firstTry = 0;
+let triedThisQ = false, locked = false;
+let selBar = -1;             // 条形图高亮的柱子（-1 = 无）
+let cursorDay = 3;           // 折线图游标所在天
+let lineDeltaOn = false;
+
+// 数值题选项：正确答案 + 两个干扰项
+function makeChoices(ans) {
+  const set = new Set([ans]);
+  let d = 1;
+  while (set.size < 3) {
+    for (const v of [ans + d, ans - d, ans + d + 1]) {
+      if (v >= 0 && !set.has(v) && set.size < 3) set.add(v);
+    }
+    d++;
+  }
+  return shuffle([...set]);
+}
+
+function buildBarPool() {
+  const pool = [];
+  PRODS.forEach((p, pi) => {
+    pool.push({ type:"max", prod:pi, text:`${p.name}哪天卖得最多？点一点那根柱子`, answer:argmax(p.data) });
+    pool.push({ type:"min", prod:pi, text:`${p.name}哪天卖得最少？点一点那根柱子`, answer:argmin(p.data) });
+  });
+  pool.push({ type:"num", prod:0, text:"汽水周三比周一多卖几瓶？", answer:PRODS[0].data[2] - PRODS[0].data[0], mark:[2, 0] });
+  pool.push({ type:"num", prod:1, text:"薯片周四比周三多卖几包？", answer:PRODS[1].data[3] - PRODS[1].data[2], mark:[3, 2] });
+  pool.push({ type:"num", prod:2, text:"糖果周五比周二多卖几颗？", answer:PRODS[2].data[4] - PRODS[2].data[1], mark:[4, 1] });
+  pool.push({ type:"num", prod:0, text:"周六汽水卖了几瓶？", answer:PRODS[0].data[5], mark:[5] });
+  pool.push({ type:"num", prod:2, text:"周日糖果卖了几颗？", answer:PRODS[2].data[6], mark:[6] });
+  return pool;
+}
+
+function buildLinePool() {
+  const dropDay = 1 + argmin(D_TEMP.slice(1));   // 降温最快（与前一天比）
+  const riseDay = 1 + argmax(D_TEMP.slice(1));   // 升温最快
+  return [
+    { type:"day", text:"最高气温出现在哪天？拖动游标找一找", answer:argmax(TEMPS) },
+    { type:"day", text:"最低气温出现在哪天？", answer:argmin(TEMPS) },
+    { type:"day", text:"哪天降温最快？（和前一天比）", answer:dropDay },
+    { type:"day", text:"哪天升温最快？（和前一天比）", answer:riseDay },
+    { type:"num", text:"周三的气温是多少 °C？", answer:TEMPS[2], mark:[2] },
+    { type:"num", text:"周日比周一高几 °C？", answer:TEMPS[6] - TEMPS[0], mark:[6, 0] }
+  ];
+}
+
+function startRound() {
+  const pool = mode === "bar" ? buildBarPool() : buildLinePool();
+  questions = shuffle(pool).slice(0, ROUNDS);
+  qIdx = 0; stars = 0; firstTry = 0;
+  winPanel.style.display = "none";
+  setQuestion();
+}
+
+function curQ() { return questions[qIdx]; }
+
+function setQuestion() {
+  const q = curQ();
+  triedThisQ = false; locked = false;
+  selBar = -1;
+  qcard.textContent = q.text;
+  updateScore();
+  // 数值题显示数字选项，日期题（折线图）显示确认按钮
+  if (q.type === "num") {
+    choicesEl.innerHTML = "";
+    for (const v of makeChoices(q.answer)) {
+      const b = document.createElement("button");
+      b.textContent = v;
+      b.addEventListener("click", () => answerNum(v));
+      choicesEl.appendChild(b);
+    }
+    choicesEl.style.display = "flex";
+    confirmBtn.style.display = "none";
+    showHint("先点柱子/游标读出数值，再选答案！");
+  } else {
+    choicesEl.style.display = "none";
+    confirmBtn.style.display = mode === "line" ? "block" : "none";
+    showHint(mode === "line" ? "拖动游标到你想选的那天，再点确认！" : "点一点柱子作答！");
+  }
+}
+
+function updateScore() {
+  scorebar.textContent = `第 ${Math.min(qIdx + 1, ROUNDS)} / ${ROUNDS} 题 · ⭐ ${stars}`;
+}
+
+/* ================= 答题判定 ================= */
+const PRAISE = ["答对啦！⭐", "真棒！🎉", "看得真准！👍", "太厉害了！🌟", "完全正确！💪"];
+
+function onCorrect() {
+  locked = true;
+  stars++;
+  if (!triedThisQ) firstTry++;
+  updateScore();
+  correctSound();
+  showHint(PRAISE[(Math.random() * PRAISE.length) | 0]);
+  // 星星烟花
+  if (mode === "bar" && selBar >= 0) {
+    const r = barRect(selBar);
+    burst(r.x + r.w / 2, r.y - 10, "#ffd54a");
+  } else if (mode === "line") {
+    burst(lineX(cursorDay), lineY(TEMPS[cursorDay]), "#ffd54a");
+  }
+  setTimeout(nextQuestion, 1300);
+}
+
+function onWrong(msg) {
+  triedThisQ = true;
+  gentleWrong();
+  showHint(msg);
+}
+
+function answerDay(day) {   // 条形图点柱子 / 折线图确认某天
+  if (locked) return;
+  const q = curQ();
+  if (day === q.answer) onCorrect();
+  else if (q.type === "max") onWrong("不是这根哦，找找最高的那根！");
+  else if (q.type === "min") onWrong("不是这根哦，找找最矮的那根！");
+  else onWrong("再仔细看看图，想一想～");
+}
+
+function answerNum(v) {
+  if (locked) return;
+  const q = curQ();
+  if (v === q.answer) onCorrect();
+  else onWrong("再读一次图算算看～");
+}
+
+function nextQuestion() {
+  qIdx++;
+  if (qIdx >= ROUNDS) { endRound(); return; }
+  setQuestion();
+}
+
+function endRound() {
+  const perfect = firstTry === ROUNDS;
+  winPanel.querySelector(".msg").innerHTML =
+    perfect ? `🏆 全部一次答对！<br>⭐ ${stars} / ${ROUNDS} 太棒了！`
+            : `🎉 一轮完成！<br>⭐ ${stars} / ${ROUNDS}`;
+  winPanel.style.display = "flex";
+  choicesEl.style.display = "none";
+  confirmBtn.style.display = "none";
+  fanfare();
+  confetti();
+}
+
+/* ================= 图表布局 ================= */
+function chartBox() { return { L:78, R:W - 40, T:170, B:H - 170 }; }
+function barRect(i) {
+  const { L, R, B } = chartBox();
+  const slot = (R - L) / 7;
+  const bw = Math.min(66, slot * 0.62);
+  const p = PRODS[curQ().prod !== undefined ? curQ().prod : 0];
+  const maxV = yMaxBar(p);
+  const h = (p.data[i] / maxV) * (B - chartBox().T);
+  return { x:L + slot * i + (slot - bw) / 2, y:B - h, w:bw, h };
+}
+function yMaxBar(p) { return Math.ceil(Math.max(...p.data) / 5) * 5; }
+function lineX(i) { const { L, R } = chartBox(); return L + (R - L) / 7 * (i + 0.5); }
+const T_MIN = 15, T_MAX = 35;
+function lineY(t) { const { T, B } = chartBox(); return B - (t - T_MIN) / (T_MAX - T_MIN) * (B - T); }
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawGrid(labels) {   // labels: [[yValue, text], ...]
+  const { L, R, B } = chartBox();
+  ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 1;
+  ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.font = "13px sans-serif";
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (const [y, t] of labels) {
+    ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(R, y); ctx.stroke();
+    ctx.fillText(t, L - 8, y);
+  }
+  // 坐标轴
+  ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(L, chartBox().T - 8); ctx.lineTo(L, B); ctx.lineTo(R, B); ctx.stroke();
+  // 日期标签
+  ctx.fillStyle = "#fff"; ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let i = 0; i < 7; i++) {
+    const x = mode === "bar" ? barRect(i).x + barRect(i).w / 2 : lineX(i);
+    ctx.fillText(DAYS[i], x, B + 10);
+  }
+}
+
+function drawTitle(t) {
+  ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.font = "bold 19px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(t, W / 2, chartBox().T - 26);
+}
+
+function drawBubble(cx, cy, lines) {   // 数值弹出气泡
+  ctx.font = "bold 17px sans-serif";
+  const tw = Math.max(...lines.map(s => ctx.measureText(s).width));
+  const bw = tw + 30, bh = lines.length * 24 + 16;
+  let bx = Math.min(Math.max(cx - bw / 2, 8), W - bw - 8);
+  let by = Math.max(cy - bh - 14, chartBox().T - 44);
+  ctx.fillStyle = "rgba(20,28,48,0.95)";
+  roundRect(bx, by, bw, bh, 12, true);
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 2;
+  roundRect(bx, by, bw, bh, 12, false); ctx.stroke();
+  // 小三角指向目标
+  ctx.fillStyle = "rgba(20,28,48,0.95)";
+  ctx.beginPath();
+  ctx.moveTo(Math.min(Math.max(cx, bx + 14), bx + bw - 14) - 8, by + bh);
+  ctx.lineTo(Math.min(Math.max(cx, bx + 14), bx + bw - 14) + 8, by + bh);
+  ctx.lineTo(Math.min(Math.max(cx, bx + 14), bx + bw - 14), by + bh + 10);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#ffd54a"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  lines.forEach((s, i) => ctx.fillText(s, bx + bw / 2, by + 20 + i * 24));
+}
+
+function drawBarChart() {
+  const q = curQ(), p = PRODS[q.prod];
+  const maxV = yMaxBar(p);
+  const { B } = chartBox();
+  drawTitle(`小卖部一周${p.name}销量（${p.unit}）`);
+  const labels = [];
+  for (let v = 0; v <= maxV; v += 5) labels.push([B - v / maxV * (B - chartBox().T), String(v)]);
+  drawGrid(labels);
+  // 数值题涉及的日子画金色小圆点提示
+  if (q.mark) {
+    ctx.fillStyle = "#ffd54a";
+    for (const d of q.mark) {
+      const r = barRect(d);
+      ctx.beginPath(); ctx.arc(r.x + r.w / 2, B + 34, 5, 0, 7); ctx.fill();
+    }
+  }
+  for (let i = 0; i < 7; i++) {
+    const r = barRect(i);
+    const on = i === selBar;
+    ctx.fillStyle = on ? "#ffd54a" : p.color;
+    roundRect(r.x, r.y, r.w, r.h, 6, true);
+    ctx.strokeStyle = on ? "#fff" : "rgba(0,0,0,0.25)";
+    ctx.lineWidth = on ? 3 : 1.5;
+    roundRect(r.x, r.y, r.w, r.h, 6, false); ctx.stroke();
+  }
+  // 高亮柱子弹出数值
+  if (selBar >= 0) {
+    const r = barRect(selBar);
+    drawBubble(r.x + r.w / 2, r.y, [`${DAYS[selBar]}：${p.data[selBar]} ${p.unit}`]);
+  }
+}
+
+function drawLineChart() {
+  const { T, B } = chartBox();
+  drawTitle("一周气温变化（°C）");
+  const labels = [];
+  for (let t = T_MIN; t <= T_MAX; t += 5) labels.push([lineY(t), String(t)]);
+  drawGrid(labels);
+  // 数值题提示点
+  const q = curQ();
+  if (q.mark) {
+    ctx.fillStyle = "#ffd54a";
+    for (const d of q.mark) { ctx.beginPath(); ctx.arc(lineX(d), B + 34, 5, 0, 7); ctx.fill(); }
+  }
+  // 折线
+  ctx.strokeStyle = "#4fc3f7"; ctx.lineWidth = 4; ctx.lineJoin = "round";
+  ctx.beginPath();
+  for (let i = 0; i < 7; i++) { const x = lineX(i), y = lineY(TEMPS[i]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+  ctx.stroke();
+  // 数据点
+  for (let i = 0; i < 7; i++) {
+    ctx.beginPath(); ctx.arc(lineX(i), lineY(TEMPS[i]), i === cursorDay ? 9 : 6, 0, 7);
+    ctx.fillStyle = i === cursorDay ? "#ffd54a" : "#ffffff"; ctx.fill();
+    ctx.strokeStyle = "#22304a"; ctx.lineWidth = 2; ctx.stroke();
+  }
+  // 游标：竖直虚线，可拖动
+  const cx = lineX(cursorDay);
+  ctx.save();
+  ctx.setLineDash([8, 8]);
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx, T - 6); ctx.lineTo(cx, B); ctx.stroke();
+  ctx.restore();
+  // 游标气泡：气温 + 与前一天差值
+  const t = TEMPS[cursorDay];
+  const lines = [`${DAYS[cursorDay]}：${t} °C`];
+  if (cursorDay > 0) {
+    const d = D_TEMP[cursorDay];
+    lines.push(d === 0 ? "和昨天一样" : d > 0 ? `比昨天高 ${d}°` : `比昨天低 ${-d}°`);
+  }
+  drawBubble(cx, lineY(t), lines);
+}
+
+/* ================= 粒子（答对烟花 / 庆祝彩带） ================= */
+let parts = [];
+function burst(x, y, color) {
+  for (let i = 0; i < 16; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 220;
+    parts.push({ x, y, vx:Math.cos(a) * sp, vy:Math.sin(a) * sp - 80,
+      life:0.9, color: Math.random() < 0.5 ? color : "#ffffff", r:3 + Math.random() * 3 });
+  }
+}
+function confetti() {
+  const colors = ["#ffd54a", "#e94f8a", "#3a86d8", "#2fbf4a", "#ff9f1c"];
+  for (let i = 0; i < 90; i++) {
+    parts.push({ x:Math.random() * W, y:-20 - Math.random() * H * 0.4,
+      vx:(Math.random() - 0.5) * 60, vy:120 + Math.random() * 160,
+      life:3.2, color:colors[i % colors.length], r:3 + Math.random() * 4 });
+  }
+}
+function stepParts(dt) {
+  for (const p of parts) {
+    p.life -= dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vy += 420 * dt;
+  }
+  parts = parts.filter(p => p.life > 0 && p.y < H + 30);
+}
+function drawParts() {
+  for (const p of parts) {
+    ctx.globalAlpha = Math.min(1, p.life * 2);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#2b3d5f"); g.addColorStop(1, "#1c2840");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  if (questions.length) {
+    if (mode === "bar") drawBarChart(); else drawLineChart();
+  }
+  drawParts();
+}
+
+/* ================= 交互 ================= */
+let dragging = false;
+
+function barAt(x, y) {
+  const { T, B } = chartBox();
+  if (y < T - 30 || y > B + 8) return -1;
+  for (let i = 0; i < 7; i++) {
+    const r = barRect(i);
+    if (x >= r.x - 8 && x <= r.x + r.w + 8) return i;
+  }
+  return -1;
+}
+function nearestDay(x) {
+  let best = 0, bd = Infinity;
+  for (let i = 0; i < 7; i++) {
+    const d = Math.abs(x - lineX(i));
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  dragging = true;
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+  if (mode === "bar") {
+    const i = barAt(e.clientX, e.clientY);
+    if (i >= 0 && i !== selBar) { selBar = i; pop(500 + i * 60); }
+  } else {
+    const d = nearestDay(e.clientX);
+    if (d !== cursorDay) { cursorDay = d; tick(); }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging || winPanel.style.display === "flex") return;
+  if (mode === "bar") {
+    const i = barAt(e.clientX, e.clientY);
+    if (i >= 0 && i !== selBar) { selBar = i; pop(500 + i * 60); }   // 划过柱子即时读数
+  } else {
+    const d = nearestDay(e.clientX);
+    if (d !== cursorDay) { cursorDay = d; tick(); }                  // 拖动游标读任意点
+  }
+});
+window.addEventListener("pointerup", e => {
+  if (!dragging) return;
+  dragging = false;
+  if (winPanel.style.display === "flex" || locked) return;
+  // 条形图比较题：松手时落在哪根柱子上就选哪根
+  if (mode === "bar") {
+    const q = curQ();
+    if (q.type !== "num") {
+      const i = barAt(e.clientX, e.clientY);
+      if (i >= 0) answerDay(i);
+    }
+  }
+});
+confirmBtn.addEventListener("click", () => {
+  if (mode !== "line" || locked) return;
+  answerDay(cursorDay);
+});
+
+document.getElementById("tabBar").addEventListener("click", () => setMode("bar"));
+document.getElementById("tabLine").addEventListener("click", () => setMode("line"));
+function setMode(m) {
+  if (mode === m) return;
+  mode = m;
+  document.getElementById("tabBar").classList.toggle("on", m === "bar");
+  document.getElementById("tabLine").classList.toggle("on", m === "line");
+  pop(700);
+  startRound();
+}
+document.getElementById("replayBtn").addEventListener("click", () => { pop(880); startRound(); });
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  stepParts(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+const tick = () => tone(900, 0.04, 0.06, "square");
+const gentleWrong = () => tone(220, 0.25, 0.08);
+function correctSound() { [660, 880].forEach((f, i) => setTimeout(() => pop(f), i * 90)); }
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+
+// 测试钩子（无头验证用，不影响游戏）
+window.__dbg = {
+  q: () => curQ(), mode: () => mode,
+  qIdx: () => qIdx, stars: () => stars, firstTry: () => firstTry,
+  barCenter: i => { const r = barRect(i); return [r.x + r.w / 2, r.y + r.h / 2]; },
+  dayX: i => lineX(i), dayY: i => lineY(TEMPS[i])
+};
+
+startRound();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

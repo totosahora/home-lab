@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>推与拉</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#7ec8e8; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,30,0.8); color:#fff8dc; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,30,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  #groundBar {
+    position:absolute; top:12px; right:12px; z-index:10;
+    display:flex; gap:10px;
+  }
+  #groundBar button {
+    font-size:20px; font-weight:bold; padding:12px 20px;
+    border-radius:26px; border:3px solid rgba(255,255,255,0.7);
+    background:rgba(255,255,255,0.75); color:#335; cursor:pointer;
+    box-shadow:0 3px 8px rgba(0,0,0,0.25);
+  }
+  #groundBar button:active { transform:scale(1.06); }
+  #groundBar button.on {
+    background:#ffd54a; color:#5a3d00; border-color:#fff;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🌿 草地：箱子滑一滑就停下</div>
+<div id="groundBar">
+  <button id="grassBtn" class="on">🌿 草地</button>
+  <button id="iceBtn">❄️ 冰面</button>
+</div>
+<div id="hint">按住小男孩向右推，按住小女孩向左拉绳子。按得越久力气越大，松手箱子就滑出去！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 场景与视图 ================= */
+// 世界坐标：1200 x 650，地面线在 y=520，y 向下
+const WORLD_W = 1200, WORLD_H = 650;
+const GROUND_Y = 520;
+const BOX_W = 130, BOX_H = 105;
+const BOX_MIN_X = 40 + BOX_W / 2, BOX_MAX_X = WORLD_W - 40 - BOX_W / 2;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min(W / (WORLD_W + 20), H / (WORLD_H + 20));
+  view.ox = (W - WORLD_W * view.s) / 2;
+  view.oy = (H - WORLD_H * view.s) / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (sy - view.oy) / view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+// 箱子只在水平方向滑动：{x, vx}
+const box = { x: WORLD_W / 2, vx: 0 };
+let ground = "grass";            // grass | ice
+const FRICTION = { grass: 460, ice: 85 };   // 减速（单位/秒²）
+const GROUND_TEXT = {
+  grass: "🌿 草地：箱子滑一滑就停下",
+  ice:   "❄️ 冰面：滑滑的，箱子滑好远！"
+};
+let particles = [];              // 庆祝彩纸 {x,y,vx,vy,color,life}
+let bounceFlash = 0;             // 撞墙弹跳的小星星闪光计时
+
+// 小人站位（跟着箱子走；靠边没位置时躲到箱子后面探头）
+function boyPos() {
+  const want = box.x - BOX_W / 2 - 105;
+  return { x: Math.max(90, want), behind: want < 90 };
+}
+function girlPos() {
+  const want = box.x + BOX_W / 2 + 105;
+  return { x: Math.min(WORLD_W - 90, want), behind: want > WORLD_W - 90 };
+}
+function boyIdleX()  { return boyPos().x; }
+function girlIdleX() { return girlPos().x; }
+// 推/拉接触位
+function boyPushX()  { return Math.max(60, box.x - BOX_W / 2 - 42); }
+function girlPullX() { return Math.min(WORLD_W - 60, box.x + BOX_W / 2 + 60); }
+
+/* ================= 物理 ================= */
+let moving = false;
+
+function physics(dt) {
+  moving = Math.abs(box.vx) > 0;
+  if (moving) {
+    const dec = FRICTION[ground] * dt;
+    if (Math.abs(box.vx) <= dec) box.vx = 0;
+    else box.vx -= Math.sign(box.vx) * dec;
+    box.x += box.vx * dt;
+    // 边界弹跳
+    if (box.x < BOX_MIN_X) { box.x = BOX_MIN_X; onBounce(1); }
+    if (box.x > BOX_MAX_X) { box.x = BOX_MAX_X; onBounce(-1); }
+  }
+  // 彩纸
+  for (const p of particles) {
+    p.vy += 900 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.life -= dt;
+  }
+  particles = particles.filter(p => p.life > 0 && p.y < WORLD_H + 40);
+  if (bounceFlash > 0) bounceFlash -= dt;
+}
+
+function onBounce(dir) {
+  // dir=1 撞左墙往右弹，dir=-1 撞右墙往左弹
+  if (Math.abs(box.vx) > 60) {
+    box.vx = -box.vx * 0.55;
+    knock();
+    fanfare();
+    bounceFlash = 0.6;
+    burst(dir > 0 ? BOX_MIN_X - BOX_W / 2 + 10 : BOX_MAX_X + BOX_W / 2 - 10, GROUND_Y - BOX_H / 2);
+    showHint("砰！箱子撞到边边弹回来啦 🎉");
+  } else {
+    box.vx = 0;
+  }
+}
+
+function burst(x, y) {
+  const colors = ["#ff5252", "#ffd54a", "#2fbf4a", "#2f7fe9", "#ff7a1a", "#e97ae0"];
+  for (let i = 0; i < 26; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 150 + Math.random() * 350;
+    particles.push({
+      x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 200,
+      color: colors[i % colors.length], life: 0.9 + Math.random() * 0.6
+    });
+  }
+}
+
+/* ================= 推 / 拉 蓄力 ================= */
+// 按住小人蓄力：时间越久力气越大，向箱子方向拖得越多力气也越大
+let charge = null;    // {who:"boy"|"girl", startT, dragPow}
+const CHARGE_MS = 1500;
+const MAX_SPEED = 1150;
+
+function chargePow(now) {
+  if (!charge) return 0;
+  const tPow = Math.min(1, (now - charge.startT) / CHARGE_MS);
+  return Math.max(tPow, charge.dragPow);
+}
+function startCharge(who) {
+  charge = { who, startT: performance.now(), dragPow: 0 };
+  tick();
+}
+function updateDrag(wx) {
+  if (!charge) return;
+  // 向箱子方向拖动的距离也加力气（0~140 世界单位映射到 0~1）
+  if (charge.who === "boy") {
+    const d = wx - boyIdleX();
+    charge.dragPow = Math.max(0, Math.min(1, d / 140));
+  } else {
+    const d = girlIdleX() - wx;
+    charge.dragPow = Math.max(0, Math.min(1, d / 140));
+  }
+}
+function releaseCharge() {
+  if (!charge) return;
+  const pow = chargePow(performance.now());
+  if (pow > 0.05) {
+    const dir = charge.who === "boy" ? 1 : -1;
+    box.vx += dir * (150 + pow * (MAX_SPEED - 150));
+    box.vx = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, box.vx));
+    whoosh(pow);
+    showHint(charge.who === "boy"
+      ? (pow > 0.7 ? "哇，好大的力气！箱子飞出去啦 💨" : "推得不错！箱子滑出去啦")
+      : (pow > 0.7 ? "哇，好大的力气！绳子拉得紧紧的 💨" : "拉得不错！箱子滑过来啦"));
+  }
+  charge = null;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (charge) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  const cy = GROUND_Y - 60;
+  if (Math.hypot(wx - boyIdleX(), wy - cy) < 120) startCharge("boy");
+  else if (Math.hypot(wx - girlIdleX(), wy - cy) < 120) startCharge("girl");
+  else showHint("按住小男孩推箱子，按住小女孩拉绳子哦！");
+  if (charge) {
+    canvas.setPointerCapture(e.pointerId);
+    hintEl.style.opacity = "0";
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!charge) return;
+  const [wx] = toWorld(e.clientX, e.clientY);
+  updateDrag(wx);
+});
+window.addEventListener("pointerup", () => releaseCharge());
+window.addEventListener("pointercancel", () => releaseCharge());
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawScene() {
+  // 天空
+  const sky = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+  sky.addColorStop(0, "#8fd6f2"); sky.addColorStop(1, "#d8f2fc");
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, WORLD_W, GROUND_Y);
+  // 太阳
+  ctx.beginPath(); ctx.arc(105, 95, 46, 0, 7);
+  ctx.fillStyle = "#ffd94a"; ctx.fill();
+  ctx.strokeStyle = "rgba(255,180,40,0.7)"; ctx.lineWidth = 6;
+  for (let i = 0; i < 8; i++) {
+    const a = i / 8 * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(105 + Math.cos(a) * 58, 95 + Math.sin(a) * 58);
+    ctx.lineTo(105 + Math.cos(a) * 76, 95 + Math.sin(a) * 76);
+    ctx.stroke();
+  }
+  // 云
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  for (const [cx, cy, s] of [[350, 90, 1], [760, 60, 1.3], [1050, 120, 0.9]]) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, 26 * s, 0, 7);
+    ctx.arc(cx + 30 * s, cy + 6 * s, 20 * s, 0, 7);
+    ctx.arc(cx - 30 * s, cy + 8 * s, 18 * s, 0, 7);
+    ctx.fill();
+  }
+  // 远山
+  ctx.fillStyle = "#a8d8a0";
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND_Y);
+  ctx.quadraticCurveTo(220, GROUND_Y - 150, 460, GROUND_Y);
+  ctx.quadraticCurveTo(720, GROUND_Y - 110, 950, GROUND_Y);
+  ctx.quadraticCurveTo(1100, GROUND_Y - 70, WORLD_W, GROUND_Y);
+  ctx.closePath(); ctx.fill();
+
+  // 地面
+  if (ground === "grass") {
+    const g = ctx.createLinearGradient(0, GROUND_Y, 0, WORLD_H);
+    g.addColorStop(0, "#5cb85c"); g.addColorStop(1, "#3d8b3d");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, GROUND_Y, WORLD_W, WORLD_H - GROUND_Y);
+    // 小草
+    ctx.strokeStyle = "rgba(30,100,30,0.5)"; ctx.lineWidth = 2;
+    for (let x = 25; x < WORLD_W; x += 55) {
+      const h = 8 + (x * 7 % 10);
+      ctx.beginPath(); ctx.moveTo(x, GROUND_Y + 14 + (x % 3) * 26); ctx.lineTo(x + 4, GROUND_Y + 14 + (x % 3) * 26 - h); ctx.stroke();
+    }
+    // 小花
+    for (let x = 60; x < WORLD_W; x += 170) {
+      const fy = GROUND_Y + 30 + (x * 13 % 70);
+      ctx.fillStyle = "#ff8a80";
+      for (let i = 0; i < 5; i++) {
+        const a = i / 5 * Math.PI * 2;
+        ctx.beginPath(); ctx.arc(x + Math.cos(a) * 6, fy + Math.sin(a) * 6, 4, 0, 7); ctx.fill();
+      }
+      ctx.beginPath(); ctx.arc(x, fy, 3.5, 0, 7); ctx.fillStyle = "#ffd54a"; ctx.fill();
+    }
+  } else {
+    // 冰面
+    const g = ctx.createLinearGradient(0, GROUND_Y, 0, WORLD_H);
+    g.addColorStop(0, "#cfeeff"); g.addColorStop(1, "#9fd4f0");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, GROUND_Y, WORLD_W, WORLD_H - GROUND_Y);
+    // 冰面高光条纹
+    ctx.strokeStyle = "rgba(255,255,255,0.65)"; ctx.lineWidth = 5;
+    for (let x = 80; x < WORLD_W; x += 210) {
+      ctx.beginPath();
+      ctx.moveTo(x, GROUND_Y + 26 + (x % 3) * 30);
+      ctx.lineTo(x + 110, GROUND_Y + 18 + (x % 3) * 30);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = "rgba(120,180,220,0.5)"; ctx.lineWidth = 2;
+    for (let x = 140; x < WORLD_W; x += 260) {
+      ctx.beginPath();
+      ctx.moveTo(x, GROUND_Y + 60); ctx.lineTo(x + 40, GROUND_Y + 78); ctx.lineTo(x + 90, GROUND_Y + 70);
+      ctx.stroke();
+    }
+  }
+  // 地面分界线
+  ctx.fillStyle = ground === "grass" ? "#2e7d32" : "#7fb8dd";
+  ctx.fillRect(0, GROUND_Y - 4, WORLD_W, 6);
+  // 两侧软边界（弹力垫）
+  for (const bx of [20, WORLD_W - 20]) {
+    ctx.fillStyle = "#ff9a3d";
+    roundRect(bx - 16, GROUND_Y - 120, 32, 120, 12, true);
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    for (let i = 0; i < 3; i++) roundRect(bx - 16, GROUND_Y - 104 + i * 36, 32, 12, 6, true);
+  }
+}
+
+function drawBox() {
+  const x = box.x, top = GROUND_Y - BOX_H;
+  ctx.save();
+  // 影子
+  ctx.beginPath();
+  ctx.ellipse(x, GROUND_Y + 8, BOX_W * 0.62, 12, 0, 0, 7);
+  ctx.fillStyle = "rgba(0,0,0,0.22)"; ctx.fill();
+  // 木箱体
+  const g = ctx.createLinearGradient(x - BOX_W / 2, 0, x + BOX_W / 2, 0);
+  g.addColorStop(0, "#b5772e"); g.addColorStop(0.5, "#d89b4a"); g.addColorStop(1, "#a5681f");
+  ctx.fillStyle = g;
+  roundRect(x - BOX_W / 2, top, BOX_W, BOX_H, 10, true);
+  ctx.strokeStyle = "#7a4a15"; ctx.lineWidth = 4;
+  roundRect(x - BOX_W / 2, top, BOX_W, BOX_H, 10, false); ctx.stroke();
+  // 木板缝
+  ctx.strokeStyle = "rgba(110,60,15,0.5)"; ctx.lineWidth = 3;
+  for (let i = 1; i < 3; i++) {
+    ctx.beginPath(); ctx.moveTo(x - BOX_W / 2 + 8, top + i * BOX_H / 3); ctx.lineTo(x + BOX_W / 2 - 8, top + i * BOX_H / 3); ctx.stroke();
+  }
+  // 十字木条
+  ctx.strokeStyle = "#8a5518"; ctx.lineWidth = 9;
+  ctx.beginPath();
+  ctx.moveTo(x - BOX_W / 2 + 8, top + 8); ctx.lineTo(x + BOX_W / 2 - 8, top + BOX_H - 8);
+  ctx.moveTo(x + BOX_W / 2 - 8, top + 8); ctx.lineTo(x - BOX_W / 2 + 8, top + BOX_H - 8);
+  ctx.stroke();
+  // 铆钉
+  ctx.fillStyle = "#5d3a10";
+  for (const [nx, ny] of [[-1,-1],[1,-1],[-1,1],[1,1]]) {
+    ctx.beginPath(); ctx.arc(x + nx * (BOX_W / 2 - 14), top + BOX_H / 2 + ny * (BOX_H / 2 - 14), 4, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// 画一个简单可爱的火柴小人（大头娃娃风）
+// lean: >0 向右倾（推），<0 向左倾（拉）；walk: 0~1 走路相位；girl: 是否女孩
+function drawKid(x, opts) {
+  const { girl, lean, walk } = opts;
+  const baseY = GROUND_Y;
+  const bob = Math.sin(performance.now() / 500 + x) * 2;
+  const swing = Math.sin(walk * Math.PI * 2) * (moving ? 12 : 0);
+  ctx.save();
+  ctx.translate(x, baseY + bob);
+  ctx.rotate(lean * 0.18);
+  const shirt = girl ? "#ff6f91" : "#3d8bff";
+  const skin = "#ffd9b3";
+  // 腿
+  ctx.strokeStyle = "#4a3b2a"; ctx.lineWidth = 9; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-4, -46); ctx.lineTo(-10 - swing * 0.5, 0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(4, -46); ctx.lineTo(10 + swing * 0.5, 0); ctx.stroke();
+  // 身体
+  ctx.fillStyle = shirt;
+  roundRect(-20, -92, 40, 52, 14, true);
+  // 手臂
+  ctx.strokeStyle = shirt; ctx.lineWidth = 9;
+  if (lean > 0.05) {          // 推：双臂向前伸
+    ctx.beginPath(); ctx.moveTo(8, -80); ctx.lineTo(38, -74); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(8, -68); ctx.lineTo(38, -58); ctx.stroke();
+  } else if (lean < -0.05) {  // 拉：双手抓绳
+    ctx.beginPath(); ctx.moveTo(-6, -80); ctx.lineTo(-34, -70); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-6, -68); ctx.lineTo(-32, -60); ctx.stroke();
+  } else {
+    ctx.beginPath(); ctx.moveTo(-14, -80); ctx.lineTo(-26, -52); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(14, -80); ctx.lineTo(26, -52); ctx.stroke();
+  }
+  // 头
+  ctx.beginPath(); ctx.arc(0, -116, 24, 0, 7);
+  ctx.fillStyle = skin; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.15)"; ctx.lineWidth = 2; ctx.stroke();
+  // 头发
+  ctx.fillStyle = "#4a3020";
+  ctx.beginPath(); ctx.arc(0, -122, 22, Math.PI, 0); ctx.fill();
+  if (girl) {
+    // 马尾辫
+    ctx.beginPath(); ctx.arc(-24, -126, 9, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(24, -126, 9, 0, 7); ctx.fill();
+    ctx.fillStyle = "#ffd54a";
+    ctx.beginPath(); ctx.arc(-24, -134, 4, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(24, -134, 4, 0, 7); ctx.fill();
+  }
+  // 眼睛和笑嘴
+  ctx.fillStyle = "#2a2a2a";
+  ctx.beginPath(); ctx.arc(-8, -114, 3, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(8, -114, 3, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#c25050"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(0, -106, 7, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+  // 腮红
+  ctx.fillStyle = "rgba(255,120,120,0.5)";
+  ctx.beginPath(); ctx.arc(-14, -108, 4, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(14, -108, 4, 0, 7); ctx.fill();
+  ctx.restore();
+}
+
+function drawKidChar(who) {
+  const girl = who === "girl";
+  const pos = girl ? girlPos() : boyPos();
+  const charging = charge && charge.who === who;
+  const walk = (performance.now() / 180) % 1;
+  const x = charging ? (girl ? girlPullX() : boyPushX()) : pos.x;
+  const leanMag = charging ? 0.55 + chargePow(performance.now()) * 0.45 : 0;
+  drawKid(x, { girl, lean: girl ? -leanMag : leanMag, walk });
+  if (girl) drawRope(x, charging);
+}
+
+function drawRope(gx, taut) {
+  // 绳子：从箱子右边到小女孩手上
+  const rx0 = box.x + BOX_W / 2 - 4, ry0 = GROUND_Y - BOX_H * 0.45;
+  const hx = gx - 34, hy = GROUND_Y - 66;
+  ctx.strokeStyle = "#8a6a3a"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(rx0, ry0);
+  if (taut) {
+    ctx.lineTo(hx, hy);                    // 拉紧：笔直
+  } else {
+    ctx.quadraticCurveTo((rx0 + hx) / 2, Math.max(ry0, hy) + 34, hx, hy);  // 松垮下垂
+  }
+  ctx.stroke();
+}
+
+function drawBehindKids() {
+  if (boyPos().behind) drawKidChar("boy");
+  if (girlPos().behind) drawKidChar("girl");
+}
+function drawFrontKids() {
+  if (!boyPos().behind) drawKidChar("boy");
+  if (!girlPos().behind) drawKidChar("girl");
+}
+
+// 通用箭头
+function arrow(x0, y0, x1, y1, color, label) {
+  const dx = x1 - x0, dy = y1 - y0, L = Math.hypot(dx, dy);
+  if (L < 12) return;
+  const ux = dx / L, uy = dy / L;
+  ctx.strokeStyle = color; ctx.fillStyle = color;
+  ctx.lineWidth = 8; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1 - ux * 16, y1 - uy * 16); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 - ux * 24 - uy * 12, y1 - uy * 24 + ux * 12);
+  ctx.lineTo(x1 - ux * 24 + uy * 12, y1 - uy * 24 - ux * 12);
+  ctx.closePath(); ctx.fill();
+  if (label) {
+    ctx.font = "bold 24px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.lineWidth = 5; ctx.strokeStyle = "rgba(255,255,255,0.9)";
+    const lx = (x0 + x1) / 2, ly = (y0 + y1) / 2 - 14;
+    ctx.strokeText(label, lx, ly);
+    ctx.fillStyle = color;
+    ctx.fillText(label, lx, ly);
+  }
+}
+
+function drawArrows() {
+  const top = GROUND_Y - BOX_H;
+  // 运动中：速度箭头（顺着运动方向）+ 摩擦力箭头（反方向）
+  if (Math.abs(box.vx) > 20) {
+    const dir = Math.sign(box.vx);
+    const vLen = 40 + Math.abs(box.vx) / MAX_SPEED * 170;
+    arrow(box.x, top - 34, box.x + dir * vLen, top - 34, "#2f7fe9", "速度");
+    const fLen = 26 + FRICTION[ground] / 460 * 70;
+    arrow(box.x, top - 78, box.x - dir * fLen, top - 78, "#ff5252", "摩擦力");
+  }
+  // 蓄力中：推力/拉力箭头，力气越大箭头越长
+  if (charge) {
+    const pow = chargePow(performance.now());
+    if (pow > 0.03) {
+      const dir = charge.who === "boy" ? 1 : -1;
+      const len = 40 + pow * 170;
+      const y = GROUND_Y - BOX_H - 40;
+      arrow(box.x, y, box.x + dir * len, y, "#ff8a00",
+        charge.who === "boy" ? "推力" : "拉力");
+    }
+    drawChargeBar(pow);
+  }
+}
+
+function drawChargeBar(pow) {
+  const cx = charge.who === "boy" ? boyPushX() : girlPullX();
+  const barW = 170, bx0 = cx - barW / 2, by0 = GROUND_Y - 190;
+  ctx.fillStyle = "rgba(0,0,0,0.4)";
+  roundRect(bx0, by0, barW, 18, 9, true);
+  ctx.fillStyle = pow > 0.7 ? "#ff5252" : pow > 0.4 ? "#ffb800" : "#2fbf4a";
+  if (pow > 0.02) roundRect(bx0 + 2, by0 + 2, (barW - 4) * pow, 14, 7, true);
+  ctx.font = "bold 20px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+  ctx.fillStyle = "#fff";
+  ctx.fillText("力气", cx, by0 - 6);
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = Math.min(1, p.life * 1.5);
+    ctx.fillStyle = p.color;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.life * 8);
+    ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+  if (bounceFlash > 0) {
+    ctx.globalAlpha = bounceFlash;
+    ctx.font = "bold 44px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ffd54a";
+    ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 5;
+    const tx = box.x, ty = GROUND_Y - BOX_H - 70;
+    ctx.strokeText("砰！", tx, ty);
+    ctx.fillText("砰！", tx, ty);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#7ec8e8";
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.ox, view.oy);
+  ctx.scale(view.s, view.s);
+  drawScene();
+  drawBehindKids();
+  drawBox();
+  drawFrontKids();
+  drawArrows();
+  drawParticles();
+  ctx.restore();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  const steps = 3;
+  for (let i = 0; i < steps; i++) physics(dt / steps);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const knock = () => tone(180, 0.12, 0.18, "triangle");
+const tick = () => tone(660, 0.05, 0.06, "square");
+const whoosh = p => tone(280 + 420 * p, 0.15, 0.1, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2200);
+}
+function setGround(g) {
+  ground = g;
+  scorebar.textContent = GROUND_TEXT[g];
+  document.getElementById("grassBtn").classList.toggle("on", g === "grass");
+  document.getElementById("iceBtn").classList.toggle("on", g === "ice");
+  pop(g === "grass" ? 520 : 920);
+  showHint(g === "grass" ? "草地糙糙的，摩擦力大，箱子滑不远" : "冰面滑滑的，摩擦力小，箱子滑得老远！");
+}
+document.getElementById("grassBtn").addEventListener("click", () => setGround("grass"));
+document.getElementById("iceBtn").addEventListener("click", () => setGround("ice"));
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

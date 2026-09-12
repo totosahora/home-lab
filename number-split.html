@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>数字拆分 · 分苹果</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#fff6e3; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #nbar {
+    position:absolute; top:10px; left:50%; transform:translateX(-50%);
+    display:flex; align-items:center; gap:16px; z-index:10;
+    background:rgba(255,255,255,0.9); padding:6px 14px; border-radius:40px;
+    box-shadow:0 3px 10px rgba(0,0,0,0.12); user-select:none;
+  }
+  #nbar button {
+    width:56px; height:56px; border-radius:50%; border:none; cursor:pointer;
+    font-size:34px; font-weight:bold; line-height:1; color:#fff;
+    box-shadow:0 3px 6px rgba(0,0,0,0.18);
+  }
+  #nbar button:active { transform:scale(1.1); }
+  #minus { background:#ff8a65; }
+  #plus  { background:#66bb6a; }
+  #nval {
+    min-width:72px; text-align:center; font-size:52px; font-weight:bold;
+    color:#5d4037;
+  }
+  #nlabel { font-size:16px; color:#8d6e63; }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(60,40,20,0.88); color:#fff; padding:9px 22px;
+    border-radius:24px; font-size:16px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="nbar">
+  <button id="minus">－</button>
+  <div><span id="nval">7</span><div id="nlabel">个苹果</div></div>
+  <button id="plus">＋</button>
+</div>
+<div id="hint">把苹果拖进下面两个篮子，看看 7 可以分成几和几！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+const nvalEl = document.getElementById("nval");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layoutAll();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// N：苹果总数；apples：{x, y, tx, ty, basket: null|'L'|'R', selected}
+let N = 7;
+let apples = [];
+let collected = [];        // 已收集的拆分，如 "3+4"（约定小数在前，不含 0）
+let completed = false;     // 是否已全部找齐
+let confetti = [];         // 庆祝彩纸 {x,y,vx,vy,c,rot,vr}
+
+const HEADER_H = 92;       // 顶部 DOM 数字条预留高度
+const WALL_H = 66;         // 收集墙高度
+const APPLE_R = 30;        // 苹果点击半径
+
+function totalSplits(n) { return Math.floor(n / 2); }  // 不含 0、a<=b 的拆法数
+function splitKey(l, r) { return Math.min(l, r) + "+" + Math.max(l, r); }
+
+function buildApples() {
+  apples = [];
+  for (let i = 0; i < N; i++)
+    apples.push({ x: W / 2, y: HEADER_H + WALL_H + 60, tx: 0, ty: 0, basket: null, selected: false });
+  layoutAll();
+}
+function resetGame() {
+  collected = [];
+  completed = false;
+  confetti = [];
+  buildApples();
+}
+
+/* ================= 布局 ================= */
+// 各区域几何（屏幕坐标）
+function wallRect()  { return { x: 14, y: HEADER_H, w: W - 28, h: WALL_H }; }
+function eqY()       { return HEADER_H + WALL_H + 58; }
+function basketGeom() {
+  const bw = Math.min(W * 0.4, 360), bh = Math.min(H * 0.3, 230);
+  const y = H - bh - 16;
+  const gap = Math.max(24, W * 0.06);
+  return {
+    bw, bh, y,
+    L: { x: W / 2 - gap / 2 - bw, y, w: bw, h: bh },
+    R: { x: W / 2 + gap / 2,      y, w: bw, h: bh }
+  };
+}
+function layoutAll() {
+  const bg = basketGeom();
+  // 家里（未分配）的苹果：居中排一行或两行
+  const home = apples.filter(a => !a.basket);
+  const areaTop = eqY() + 36, areaBot = bg.y - 20;
+  const perRow = Math.max(3, Math.floor(Math.min(W - 60, 640) / 66));
+  home.forEach((a, i) => {
+    const rows = Math.ceil(home.length / perRow);
+    const r = Math.floor(i / perRow), c = i % perRow;
+    const inRow = Math.min(perRow, home.length - r * perRow);
+    const y0 = (areaTop + areaBot) / 2 - (rows - 1) * 34;
+    a.tx = W / 2 + (c - (inRow - 1) / 2) * 66;
+    a.ty = y0 + r * 68;
+  });
+  // 篮子里的苹果：篮内网格
+  for (const key of ["L", "R"]) {
+    const b = bg[key];
+    const inB = apples.filter(a => a.basket === key);
+    inB.forEach((a, i) => {
+      const cols = 3, r = Math.floor(i / cols), c = i % cols;
+      const inRow = Math.min(cols, inB.length - r * cols);
+      a.tx = b.x + b.w / 2 + (c - (inRow - 1) / 2) * 62;
+      a.ty = b.y + 86 + r * 62;
+    });
+  }
+}
+
+/* ================= 拆分判定 ================= */
+function leftCount()  { return apples.filter(a => a.basket === "L").length; }
+function rightCount() { return apples.filter(a => a.basket === "R").length; }
+
+function checkSplit() {
+  const l = leftCount(), r = rightCount();
+  if (l + r < N) { showHint(`还剩 ${N - l - r} 个苹果没分哦`); return; }
+  if (l === 0 || r === 0) { showHint("两个篮子都要有苹果才算一种分法哦"); return; }
+  const key = splitKey(l, r);
+  if (collected.includes(key)) {
+    showHint(`${key} 已经收集过啦，换个分法试试！`);
+    tone(330, 0.15, 0.12, "triangle");
+    return;
+  }
+  collected.push(key);
+  fanfare();
+  if (collected.length >= totalSplits(N)) {
+    completed = true;
+    showHint(`🎉 全部找齐啦！${N} 一共有 ${totalSplits(N)} 种分法！`);
+    bigFanfare();
+    spawnConfetti();
+  } else {
+    showHint(`🌟 新拆分 ${key}！已收集 ${collected.length}/${totalSplits(N)}`);
+  }
+}
+function spawnConfetti() {
+  const colors = ["#ff6b6b","#ffd54f","#81c784","#64b5f6","#ba68c8","#ff8a65"];
+  for (let i = 0; i < 90; i++)
+    confetti.push({
+      x: Math.random() * W, y: -20 - Math.random() * H * 0.4,
+      vx: (Math.random() - 0.5) * 60, vy: 120 + Math.random() * 160,
+      c: colors[i % colors.length], rot: Math.random() * 6.28, vr: (Math.random() - 0.5) * 8
+    });
+}
+
+/* ================= 交互 ================= */
+let drag = null;   // {apple, dx, dy, moved, downT, pid}
+
+function hitApple(x, y) {
+  for (let i = apples.length - 1; i >= 0; i--) {
+    const a = apples[i];
+    if (Math.hypot(x - a.x, y - a.y) <= APPLE_R) return a;
+  }
+  return null;
+}
+function overBasket(x, y) {
+  const bg = basketGeom();
+  for (const key of ["L", "R"]) {
+    const b = bg[key];
+    if (x >= b.x - 10 && x <= b.x + b.w + 10 && y >= b.y - 30 && y <= b.y + b.h + 10) return key;
+  }
+  return null;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  // 点中选中苹果的 ✕ 手柄：送回上方
+  const sel = apples.find(a => a.selected);
+  if (sel && Math.hypot(x - (sel.x + 26), y - (sel.y - 26)) <= 16) {
+    sel.selected = false;
+    if (sel.basket) { sel.basket = null; pop(300); layoutAll(); }
+    return;
+  }
+  const a = hitApple(x, y);
+  if (!a) { apples.forEach(ap => ap.selected = false); return; }
+  canvas.setPointerCapture(e.pointerId);
+  drag = { apple: a, dx: a.x - x, dy: a.y - y, moved: false, downT: performance.now(), pid: e.pointerId };
+  tone(660, 0.06, 0.08, "triangle");
+  hintEl.style.opacity = "0";
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag || e.pointerId !== drag.pid) return;
+  const a = drag.apple;
+  a.x = e.clientX + drag.dx; a.y = e.clientY + drag.dy;
+  if (Math.abs(a.x - a.tx) + Math.abs(a.y - a.ty) > 6 || drag.moved) drag.moved = true;
+});
+window.addEventListener("pointerup", e => {
+  if (!drag || e.pointerId !== drag.pid) return;
+  const a = drag.apple, x = e.clientX, y = e.clientY;
+  if (!drag.moved && performance.now() - drag.downT < 400) {
+    // 轻点：选中/取消选中（出现 ✕ 手柄）
+    const was = a.selected;
+    apples.forEach(ap => ap.selected = false);
+    a.selected = !was;
+  } else {
+    a.selected = false;
+    const key = overBasket(x, y);
+    const oldBasket = a.basket;
+    a.basket = key;   // null = 拖回上方
+    if (key && key !== oldBasket) { pop(500 + Math.random() * 300); }
+    else if (!key && oldBasket)   { pop(300); }
+    layoutAll();
+    checkSplit();
+  }
+  drag = null;
+});
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill(); else ctx.stroke();
+}
+
+const CHIP_COLORS = ["#ff8a65","#ffd54f","#81c784","#64b5f6","#ba68c8","#f06292","#4db6ac"];
+
+function drawWall() {
+  const r = wallRect();
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  roundRect(r.x, r.y, r.w, r.h, 16, true);
+  ctx.strokeStyle = "rgba(180,140,90,0.5)"; ctx.lineWidth = 2;
+  roundRect(r.x, r.y, r.w, r.h, 16, false);
+  // 标题与进度
+  ctx.fillStyle = "#8d6e63";
+  ctx.font = "bold 18px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("🏆 收集墙", r.x + 16, r.y + r.h / 2);
+  ctx.textAlign = "right";
+  ctx.fillText(`${collected.length} / ${totalSplits(N)}`, r.x + r.w - 16, r.y + r.h / 2);
+  // 已收集的彩色标签
+  let cx = r.x + 120;
+  collected.forEach((key, i) => {
+    const label = key.replace("+", " + ");
+    ctx.font = "bold 22px sans-serif";
+    const tw = ctx.measureText(label).width + 28;
+    if (cx + tw > r.x + r.w - 90) return;
+    ctx.fillStyle = CHIP_COLORS[i % CHIP_COLORS.length];
+    roundRect(cx, r.y + (r.h - 40) / 2, tw, 40, 20, true);
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.fillText(label, cx + tw / 2, r.y + r.h / 2 + 1);
+    cx += tw + 12;
+  });
+}
+
+function drawEquation() {
+  const l = leftCount(), r = rightCount();
+  const parts = [
+    { t: String(N), c: "#5d4037" },
+    { t: " = ",     c: "#8d6e63" },
+    { t: String(l), c: "#e53935" },
+    { t: " + ",     c: "#8d6e63" },
+    { t: String(r), c: "#1e88e5" }
+  ];
+  ctx.font = "bold 56px sans-serif";
+  ctx.textBaseline = "middle";
+  const total = parts.reduce((s, p) => s + ctx.measureText(p.t).width, 0);
+  let x = W / 2 - total / 2;
+  for (const p of parts) {
+    ctx.fillStyle = p.c;
+    ctx.textAlign = "left";
+    ctx.fillText(p.t, x, eqY());
+    x += ctx.measureText(p.t).width;
+  }
+}
+
+function drawBasket(b, color, dark, label, count) {
+  // 篮身
+  ctx.fillStyle = color;
+  roundRect(b.x, b.y + 26, b.w, b.h - 26, 22, true);
+  // 篮口
+  ctx.fillStyle = dark;
+  roundRect(b.x - 6, b.y, b.w + 12, 40, 20, true);
+  // 篮身竖纹
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 4;
+  for (let i = 1; i < 5; i++) {
+    const x = b.x + (b.w * i) / 5;
+    ctx.beginPath(); ctx.moveTo(x, b.y + 56); ctx.lineTo(x, b.y + b.h - 14); ctx.stroke();
+  }
+  // 数量徽章
+  ctx.beginPath(); ctx.arc(b.x + b.w / 2, b.y + 20, 24, 0, 7);
+  ctx.fillStyle = "#fff"; ctx.fill();
+  ctx.strokeStyle = dark; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = dark;
+  ctx.font = "bold 26px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(String(count), b.x + b.w / 2, b.y + 21);
+  // 篮名（放在篮口左侧，避免被底部提示条遮挡）
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText(label, b.x + 14, b.y + 20);
+  ctx.textAlign = "center";
+}
+
+function drawApple(a) {
+  if (drag && drag.apple === a) { ctx.save(); ctx.globalAlpha = 0.9; }
+  ctx.font = "46px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("🍎", a.x, a.y);
+  if (drag && drag.apple === a) ctx.restore();
+  // 选中手柄：红色 ✕
+  if (a.selected) {
+    const hx = a.x + 26, hy = a.y - 26;
+    ctx.beginPath(); ctx.arc(hx, hy, 15, 0, 7);
+    ctx.fillStyle = "#e53935"; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(hx - 5, hy - 5); ctx.lineTo(hx + 5, hy + 5);
+    ctx.moveTo(hx + 5, hy - 5); ctx.lineTo(hx - 5, hy + 5);
+    ctx.stroke();
+  }
+}
+
+function drawConfetti(dt) {
+  for (const c of confetti) {
+    c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.c;
+    ctx.fillRect(-6, -4, 12, 8);
+    ctx.restore();
+  }
+  confetti = confetti.filter(c => c.y < H + 30);
+}
+
+function draw(dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#fff6e3";
+  ctx.fillRect(0, 0, W, H);
+  drawWall();
+  drawEquation();
+  const bg = basketGeom();
+  drawBasket(bg.L, "#ef5350", "#c62828", "红篮子", leftCount());
+  drawBasket(bg.R, "#42a5f5", "#1565c0", "蓝篮子", rightCount());
+  // 拖放高亮：悬停篮子描金边
+  if (drag) {
+    const key = overBasket(drag.apple.x, drag.apple.y);
+    if (key) {
+      const b = bg[key];
+      ctx.strokeStyle = "#ffd54f"; ctx.lineWidth = 5;
+      roundRect(b.x - 8, b.y - 6, b.w + 16, b.h + 14, 24, false);
+    }
+  }
+  for (const a of apples) if (!drag || drag.apple !== a) drawApple(a);
+  if (drag) drawApple(drag.apple);   // 拖拽中的苹果画最上层
+  drawConfetti(dt);
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  // 苹果平滑归位
+  for (const a of apples) {
+    if (drag && drag.apple === a) continue;
+    a.x += (a.tx - a.x) * 0.22;
+    a.y += (a.ty - a.y) * 0.22;
+  }
+  draw(dt);
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function fanfare()    { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 120)); }
+function bigFanfare() { [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => setTimeout(() => pop(f), i * 140)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text, long) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, long ? 4000 : 2000);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+document.getElementById("minus").addEventListener("click", () => {
+  if (N > 3) { N--; nvalEl.textContent = N; resetGame(); pop(440); showHint(`换成 ${N} 个苹果啦，重新收集吧！`); }
+});
+document.getElementById("plus").addEventListener("click", () => {
+  if (N < 10) { N++; nvalEl.textContent = N; resetGame(); pop(660); showHint(`换成 ${N} 个苹果啦，重新收集吧！`); }
+});
+
+/* ================= 启动 ================= */
+resize();
+resetGame();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

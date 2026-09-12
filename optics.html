@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>光的色散实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #palette {
+    position:absolute; left:0; top:0; bottom:0; width:212px;
+    background:linear-gradient(180deg,#fff8e7,#ffefc7);
+    border-right:3px solid #f0c96a;
+    padding:52px 8px 12px; z-index:10; user-select:none;
+    overflow-y:auto;
+  }
+  .pal-title { position:absolute; top:14px; left:0; right:0; text-align:center;
+    font-size:18px; font-weight:bold; color:#8a5a00; }
+  .pal-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .pal-item {
+    padding:8px 0; border-radius:16px;
+    background:#fff; border:2px solid #f0c96a;
+    display:flex; flex-direction:column; align-items:center; gap:2px;
+    font-size:28px; cursor:grab; touch-action:none;
+    box-shadow:0 2px 5px rgba(0,0,0,0.12);
+  }
+  .pal-item:active { cursor:grabbing; transform:scale(1.05); }
+  .pal-item span { font-size:12px; color:#7a5200; font-weight:bold; }
+  .pal-item .glyph { font-size:30px; font-weight:bold; color:#5a8ac0; line-height:1;
+    letter-spacing:-4px; text-indent:-4px; height:32px; }
+  #hint {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(40,40,60,0.85); color:#fff; padding:10px 20px;
+    border-radius:24px; font-size:16px; z-index:20; pointer-events:none;
+    transition:opacity 0.6s; max-width:70%; text-align:center;
+  }
+  #zoombar {
+    position:absolute; right:16px; bottom:16px; z-index:10;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  #zoombar button {
+    width:52px; height:52px; border-radius:50%;
+    border:2px solid #f0c96a; background:#fff8e7;
+    font-size:24px; cursor:pointer; touch-action:manipulation;
+    box-shadow:0 2px 5px rgba(0,0,0,0.25);
+  }
+  #zoombar button:active { transform:scale(1.1); }
+  #toolbar {
+    position:absolute; right:16px; top:16px; z-index:10;
+    display:flex; gap:10px;
+  }
+  #toolbar button {
+    width:52px; height:52px; border-radius:50%;
+    border:2px solid #f0c96a; background:#fff8e7;
+    font-size:24px; cursor:pointer; touch-action:manipulation;
+    box-shadow:0 2px 5px rgba(0,0,0,0.25);
+  }
+  #toolbar button:active { transform:scale(1.1); }
+  #scenePanel {
+    position:absolute; right:146px; top:16px; width:270px; max-height:72%;
+    z-index:15; background:#fff8e7; border:3px solid #f0c96a; border-radius:18px;
+    display:none; flex-direction:column; overflow:hidden;
+    box-shadow:0 6px 18px rgba(0,0,0,0.35);
+    font-family:"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  .panel-head {
+    display:flex; align-items:center; justify-content:space-between;
+    padding:12px 16px; background:#ffefc7; border-bottom:2px solid #f0c96a;
+    font-size:17px; font-weight:bold; color:#8a5a00;
+  }
+  .panel-head button {
+    border:none; background:none; font-size:20px; cursor:pointer; color:#a04040;
+  }
+  #sceneList { overflow-y:auto; padding:10px; }
+  .scene-row {
+    display:flex; align-items:center; gap:8px;
+    background:#fff; border:2px solid #f0c96a; border-radius:14px;
+    padding:10px 12px; margin-bottom:10px;
+  }
+  .scene-info { flex:1; min-width:0; }
+  .scene-name { font-size:15px; font-weight:bold; color:#7a5200; }
+  .scene-time { font-size:12px; color:#b08a4a; }
+  .scene-row button {
+    border:none; border-radius:10px; padding:8px 10px; font-size:14px;
+    font-weight:bold; cursor:pointer;
+  }
+  .load-btn { background:#4fc3f7; color:#01579b; }
+  .del-btn { background:#ffe1e1; color:#a04040; }
+  .empty { text-align:center; color:#b08a4a; font-size:14px; padding:24px 8px; line-height:1.8; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="palette">
+  <div class="pal-title">工具箱</div>
+  <div class="pal-grid" id="palGrid"></div>
+</div>
+<div id="zoombar">
+  <button id="zoomIn" title="放大">➕</button>
+  <button id="zoomOut" title="缩小">➖</button>
+  <button id="zoomReset" title="回到原位">🔄</button>
+</div>
+<div id="toolbar">
+  <button id="saveBtn" title="保存实验">💾</button>
+  <button id="openBtn" title="打开保存的实验">📂</button>
+</div>
+<div id="scenePanel">
+  <div class="panel-head">我的实验<button id="panelClose">✕</button></div>
+  <div id="sceneList"></div>
+</div>
+<div id="hint">拖器材到实验台，点一下器材出现手柄：↻ 旋转、⤡ 缩放、✕ 删除；空白处拖动平移，双指或按钮缩放画布！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const paletteEl = document.getElementById("palette");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 相机（画布平移缩放） ================= */
+const cam = { x:0, y:0, k:1 };   // 屏幕 = 世界 * k + (x,y)
+function toWorld(sx, sy) { return [(sx - cam.x) / cam.k, (sy - cam.y) / cam.k]; }
+function zoomAt(sx, sy, factor) {
+  const k2 = Math.min(4, Math.max(0.3, cam.k * factor));
+  const [wx, wy] = toWorld(sx, sy);
+  cam.k = k2;
+  cam.x = sx - wx * k2;
+  cam.y = sy - wy * k2;
+}
+function setWorldTransform() {
+  ctx.setTransform(DPR * cam.k, 0, 0, DPR * cam.k, DPR * cam.x, DPR * cam.y);
+}
+
+/* ================= 物理参数 ================= */
+// 柯西公式 n(λ) = A + B/λ² （λ 单位：微米）
+const MATS = {
+  glass:   { A:1.5046, B:0.00420, fill:"rgba(170,215,255,0.30)", edge:"rgba(90,160,220,0.95)" },
+  crystal: { A:1.5500, B:0.00650, fill:"rgba(200,180,255,0.30)", edge:"rgba(140,100,220,0.95)" }
+};
+function refIndex(mat, lambdaNm) {
+  const um = lambdaNm / 1000;
+  return mat.A + mat.B / (um * um);
+}
+// 7 个代表波长（纳米）和对应颜色
+const WAVES = [
+  { l:640, c:"#ff2418" }, { l:605, c:"#ff8c00" }, { l:580, c:"#ffd500" },
+  { l:530, c:"#25c93a" }, { l:490, c:"#00b7ff" }, { l:465, c:"#3a55ff" },
+  { l:415, c:"#9437e8" }
+];
+const WHITE = "rgba(255,255,235,0.95)";
+
+/* ================= 形状定义 ================= */
+// 多边形棱镜：顶点列表（局部坐标，y 向下）
+const POLYS = {
+  tri:  [[0,-80],[-69.3,40],[69.3,40]],          // 等边三棱镜（尖朝上）
+  rtri: [[-70,50],[50,50],[50,-70]],             // 直角三棱镜（45-45-90）
+  rect: [[-72,-44],[72,-44],[72,44],[-72,44]]    // 玻璃砖
+};
+// 透镜常数（局部坐标）
+const LENS = {
+  a: 58,                 // 半口径
+  cv: { c:16, cx:97.125, R:113.125, th:Math.atan2(58, 97.125) },   // 凸透镜
+  cc: { c:9, e:24, d:128.633, R:119.633, th:Math.atan2(58, 104.633) } // 凹透镜
+};
+const SEMI_R = 66;       // 半圆棱镜半径
+const MIRROR_L = 75;     // 平面镜半长
+
+/* ================= 场景数据 ================= */
+let items = [];   // {id, kind:'light'|'prism'|'mirror', shape, mat, wave, x, y, angle, s}
+let nextId = 1;
+let selected = null;
+
+function paletteWidth() { return paletteEl.offsetWidth; }
+
+function addInitialScene() {
+  const pw = paletteWidth();
+  items.push({ id:nextId++, kind:"light", wave:null, x:pw + 150, y:H * 0.45, angle:0, s:1 });
+  items.push({ id:nextId++, kind:"prism", shape:"tri", mat:"glass", x:pw + 410, y:H * 0.47, angle:0, s:1 });
+}
+/* ================= 保存 / 载入 ================= */
+function serializeScene() {
+  return JSON.stringify({ v:1, cam:{ x:cam.x, y:cam.y, k:cam.k }, items });
+}
+function restoreScene(json) {
+  try {
+    const d = JSON.parse(json);
+    if (!d || !Array.isArray(d.items)) return false;
+    items = d.items;
+    nextId = items.reduce((m, i) => Math.max(m, i.id || 0), 0) + 1;
+    if (d.cam) { cam.x = d.cam.x || 0; cam.y = d.cam.y || 0; cam.k = d.cam.k || 1; }
+    selected = null;
+    return true;
+  } catch (e) { return false; }
+}
+function getScenes() {
+  try { return JSON.parse(localStorage.getItem("light-lab-scenes")) || []; }
+  catch (e) { return []; }
+}
+function setScenes(s) {
+  try { localStorage.setItem("light-lab-scenes", JSON.stringify(s)); } catch (e) {}
+}
+let autoTimer = null;
+function scheduleAutosave() {
+  clearTimeout(autoTimer);
+  autoTimer = setTimeout(() => {
+    try { localStorage.setItem("light-lab-autosave", serializeScene()); } catch (e) {}
+  }, 600);
+}
+
+// 顶部消息提示
+let msgTimer = null;
+function showMsg(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(msgTimer);
+  msgTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 1800);
+}
+
+// 场景列表面板
+const panel = document.getElementById("scenePanel");
+const sceneList = document.getElementById("sceneList");
+function renderPanel() {
+  const scenes = getScenes();
+  sceneList.innerHTML = "";
+  if (!scenes.length) {
+    sceneList.innerHTML = '<div class="empty">还没有保存的实验<br>搭好实验台后点 💾 就能保存</div>';
+    return;
+  }
+  scenes.forEach((s, idx) => {
+    const row = document.createElement("div");
+    row.className = "scene-row";
+    const info = document.createElement("div");
+    info.className = "scene-info";
+    const t = new Date(s.time);
+    info.innerHTML = `<div class="scene-name">${s.name}</div>` +
+      `<div class="scene-time">${t.toLocaleString("zh-CN", { month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit" })}</div>`;
+    const loadBtn = document.createElement("button");
+    loadBtn.className = "load-btn"; loadBtn.textContent = "载入";
+    loadBtn.addEventListener("click", () => {
+      if (restoreScene(s.data)) {
+        showMsg("已载入「" + s.name + "」");
+        pop(880);
+        scheduleAutosave();
+      }
+      panel.style.display = "none";
+    });
+    const delBtn = document.createElement("button");
+    delBtn.className = "del-btn"; delBtn.textContent = "🗑";
+    delBtn.addEventListener("click", () => {
+      scenes.splice(idx, 1);
+      setScenes(scenes);
+      renderPanel();
+      pop(220);
+    });
+    row.appendChild(info); row.appendChild(loadBtn); row.appendChild(delBtn);
+    sceneList.appendChild(row);
+  });
+}
+document.getElementById("saveBtn").addEventListener("click", () => {
+  const scenes = getScenes();
+  scenes.unshift({ name:"实验 " + (scenes.length + 1), time:Date.now(), data:serializeScene() });
+  setScenes(scenes);
+  showMsg("保存成功！点 📂 可以找回它");
+  pop(880);
+});
+document.getElementById("openBtn").addEventListener("click", () => {
+  const show = panel.style.display !== "flex";
+  panel.style.display = show ? "flex" : "none";
+  if (show) { renderPanel(); pop(660); }
+});
+document.getElementById("panelClose").addEventListener("click", () => {
+  panel.style.display = "none";
+});
+
+// 启动：有自动保存就恢复上次的实验台，否则用初始场景
+if (!restoreScene(localStorage.getItem("light-lab-autosave"))) {
+  addInitialScene();
+}
+
+/* ================= 几何 ================= */
+function rot(x, y, a) { const c = Math.cos(a), s = Math.sin(a); return [x*c - y*s, x*s + y*c]; }
+const EPS = 0.6;
+
+function localPoint(it, wx, wy) {
+  const p = rot(wx - it.x, wy - it.y, -it.angle);
+  return [p[0] / it.s, p[1] / it.s];
+}
+function worldPoint(it, lx, ly) {
+  const p = rot(lx * it.s, ly * it.s, it.angle);
+  return [it.x + p[0], it.y + p[1]];
+}
+
+// 局部坐标内部测试
+function pointInPrismLocal(shape, lx, ly) {
+  const poly = POLYS[shape];
+  if (poly) {   // 凸多边形：所有边同侧
+    let sign = 0;
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i], b = poly[(i+1) % poly.length];
+      const cr = (b[0]-a[0]) * (ly-a[1]) - (b[1]-a[1]) * (lx-a[0]);
+      if (Math.abs(cr) < 1e-9) continue;
+      const s = cr > 0 ? 1 : -1;
+      if (sign === 0) sign = s; else if (s !== sign) return false;
+    }
+    return true;
+  }
+  if (shape === "semi") return ly <= 0 && lx*lx + ly*ly <= SEMI_R * SEMI_R;
+  if (shape === "lcv") {
+    const { cx, R } = LENS.cv;
+    return (lx-cx)*(lx-cx) + ly*ly <= R*R && (lx+cx)*(lx+cx) + ly*ly <= R*R;
+  }
+  if (shape === "lcc") {
+    const { a } = LENS, { e, d, R } = LENS.cc;
+    return Math.abs(lx) <= e && Math.abs(ly) <= a &&
+           (lx+d)*(lx+d) + ly*ly >= R*R && (lx-d)*(lx-d) + ly*ly >= R*R;
+  }
+  return false;
+}
+function pointInPrism(it, wx, wy) {
+  const [lx, ly] = localPoint(it, wx, wy);
+  return pointInPrismLocal(it.shape, lx, ly);
+}
+function pointSegDist(px, py, ax, ay, bx, by) {
+  const dx = bx-ax, dy = by-ay;
+  const L2 = dx*dx + dy*dy;
+  let u = L2 ? ((px-ax)*dx + (py-ay)*dy) / L2 : 0;
+  u = Math.max(0, Math.min(1, u));
+  return Math.hypot(px - (ax + u*dx), py - (ay + u*dy));
+}
+
+// 线段边，outward 法线用内部参考点判定
+function makeSeg(a, b, inside) {
+  const dx = b[0]-a[0], dy = b[1]-a[1];
+  let nx = dy, ny = -dx;
+  const L = Math.hypot(nx, ny); nx /= L; ny /= L;
+  const mx = (a[0]+b[0])/2, my = (a[1]+b[1])/2;
+  if ((inside[0]-mx)*nx + (inside[1]-my)*ny > 0) { nx = -nx; ny = -ny; }
+  return { kind:"seg", ax:a[0], ay:a[1], bx:b[0], by:b[1], nx, ny };
+}
+
+// 棱镜边界（世界坐标）：线段 + 圆弧（flip=true 表示外向法线指向圆心）
+function getBoundary(it) {
+  const b = [];
+  const P = (lx, ly) => worldPoint(it, lx, ly);
+  const poly = POLYS[it.shape];
+  if (poly) {
+    // 质心作为内部参考点
+    let cx = 0, cy = 0;
+    for (const v of poly) { cx += v[0]; cy += v[1]; }
+    const c = P(cx / poly.length, cy / poly.length);
+    const verts = poly.map(v => P(v[0], v[1]));
+    for (let i = 0; i < verts.length; i++) b.push(makeSeg(verts[i], verts[(i+1)%verts.length], c));
+  } else if (it.shape === "semi") {
+    b.push({ kind:"arc", cx:it.x, cy:it.y, r:SEMI_R*it.s,
+             a0:Math.PI + it.angle, a1:2*Math.PI + it.angle, flip:false });
+    b.push(makeSeg(P(-SEMI_R,0), P(SEMI_R,0), P(0,-20)));
+  } else if (it.shape === "lcv") {
+    const { cx, R, th } = LENS.cv, r = R * it.s;
+    const cL = P(cx, 0), cR = P(-cx, 0);
+    b.push({ kind:"arc", cx:cL[0], cy:cL[1], r, a0:Math.PI-th + it.angle, a1:Math.PI+th + it.angle, flip:false });
+    b.push({ kind:"arc", cx:cR[0], cy:cR[1], r, a0:-th + it.angle, a1:th + it.angle, flip:false });
+  } else if (it.shape === "lcc") {
+    const { d, R, th } = LENS.cc, r = R * it.s;
+    const cL = P(-d, 0), cR = P(d, 0);
+    b.push({ kind:"arc", cx:cL[0], cy:cL[1], r, a0:-th + it.angle, a1:th + it.angle, flip:true });
+    b.push({ kind:"arc", cx:cR[0], cy:cR[1], r, a0:Math.PI-th + it.angle, a1:Math.PI+th + it.angle, flip:true });
+  }
+  return b;
+}
+
+// 平面镜镜面线段（世界坐标）
+function mirrorSeg(it) {
+  const a = worldPoint(it, -MIRROR_L, 0), b = worldPoint(it, MIRROR_L, 0);
+  return { a, b };
+}
+
+function strokePrismPath(it) {
+  const P = (lx, ly) => worldPoint(it, lx, ly);
+  ctx.beginPath();
+  const poly = POLYS[it.shape];
+  if (poly) {
+    const v0 = P(poly[0][0], poly[0][1]);
+    ctx.moveTo(v0[0], v0[1]);
+    for (let i = 1; i < poly.length; i++) { const v = P(poly[i][0], poly[i][1]); ctx.lineTo(v[0], v[1]); }
+  } else {
+    // 弧类形状：采样成折线，避免 arc 扫描方向问题
+    const sampleArc = (cx, cy, r, a0, a1, n) => {
+      for (let i = 0; i <= n; i++) {
+        const t = a0 + (a1 - a0) * i / n;
+        ctx.lineTo(cx + r * Math.cos(t), cy + r * Math.sin(t));
+      }
+    };
+    if (it.shape === "semi") {
+      const l = P(-SEMI_R, 0);
+      ctx.moveTo(l[0], l[1]);
+      sampleArc(it.x, it.y, SEMI_R*it.s, Math.PI + it.angle, 2*Math.PI + it.angle, 24);
+    } else if (it.shape === "lcv") {
+      const { cx, R, th } = LENS.cv, r = R * it.s;
+      const cL = P(cx, 0), cR = P(-cx, 0);
+      const tip = P(0, LENS.a);
+      ctx.moveTo(tip[0], tip[1]);
+      sampleArc(cL[0], cL[1], r, Math.PI-th + it.angle, Math.PI+th + it.angle, 16);
+      sampleArc(cR[0], cR[1], r, -th + it.angle, th + it.angle, 16);
+    } else if (it.shape === "lcc") {
+      const { d, R, th, e } = LENS.cc, r = R * it.s;
+      const cL = P(-d, 0), cR = P(d, 0);
+      const tl = P(-e, -LENS.a), tr = P(e, -LENS.a);
+      ctx.moveTo(tl[0], tl[1]); ctx.lineTo(tr[0], tr[1]);
+      sampleArc(cR[0], cR[1], r, Math.PI+th + it.angle, Math.PI-th + it.angle, 16);
+      const br = P(e, LENS.a), bl = P(-e, LENS.a);
+      ctx.lineTo(br[0], br[1]); ctx.lineTo(bl[0], bl[1]);
+      sampleArc(cL[0], cL[1], r, th + it.angle, -th + it.angle, 16);
+    }
+  }
+  ctx.closePath();
+}
+
+/* ---- 求交 ---- */
+function raySeg(px,py,dx,dy, s) {
+  const sx = s.bx - s.ax, sy = s.by - s.ay;
+  const denom = dx*sy - dy*sx;
+  if (Math.abs(denom) < 1e-12) return null;
+  const qx = s.ax - px, qy = s.ay - py;
+  const t = (qx*sy - qy*sx) / denom;
+  const u = (qx*dy - qy*dx) / denom;
+  if (t > EPS && u >= -1e-9 && u <= 1+1e-9) return t;
+  return null;
+}
+function angIn(a, a0, a1) {
+  const TAU = 2*Math.PI;
+  while (a < a0) a += TAU;
+  while (a > a0 + TAU) a -= TAU;
+  return a <= a1 + 1e-9;
+}
+function rayArc(px,py,dx,dy, arc) {
+  const mx = px - arc.cx, my = py - arc.cy;
+  const b = mx*dx + my*dy, c = mx*mx + my*my - arc.r*arc.r;
+  const disc = b*b - c;
+  if (disc < 0) return null;
+  const sq = Math.sqrt(disc);
+  let best = null;
+  for (const t of [-b - sq, -b + sq]) {
+    if (t > EPS) {
+      const a = Math.atan2(py + dy*t - arc.cy, px + dx*t - arc.cx);
+      if (angIn(a, arc.a0, arc.a1) && (best === null || t < best)) best = t;
+    }
+  }
+  return best;
+}
+
+// 找最近的交点：insideIt 非空时光线在该棱镜内部（只测它），否则测所有棱镜和平面镜
+function nearestHit(px, py, dx, dy, insideIt) {
+  let best = null;
+  const consider = (t, nx, ny, item, isMirror) => {
+    if (t !== null && (best === null || t < best.t)) {
+      best = { t, pt:[px + dx*t, py + dy*t], n:[nx, ny], item, isMirror };
+    }
+  };
+  for (const it of items) {
+    if (it.kind === "prism") {
+      if (insideIt && it !== insideIt) continue;
+      for (const e of getBoundary(it)) {
+        if (e.kind === "seg") {
+          consider(raySeg(px, py, dx, dy, e), e.nx, e.ny, it, false);
+        } else {
+          const t = rayArc(px, py, dx, dy, e);
+          if (t !== null) {
+            const hx = px + dx*t, hy = py + dy*t;
+            const sgn = e.flip ? -1 : 1;
+            consider(t, sgn*(hx - e.cx)/e.r, sgn*(hy - e.cy)/e.r, it, false);
+          }
+        }
+      }
+    } else if (it.kind === "mirror" && !insideIt) {
+      const ms = mirrorSeg(it);
+      const seg = { ax:ms.a[0], ay:ms.a[1], bx:ms.b[0], by:ms.b[1] };
+      const t = raySeg(px, py, dx, dy, seg);
+      if (t !== null) {
+        let nx = -(seg.by - seg.ay), ny = seg.bx - seg.ax;
+        const L = Math.hypot(nx, ny);
+        consider(t, nx/L, ny/L, it, true);   // 双面镜，法线方向任意
+      }
+    }
+  }
+  return best;
+}
+
+/* ---- 折射 / 反射 ---- */
+function refract(dx, dy, nx, ny, n1, n2) {
+  let cosi = -(dx*nx + dy*ny);
+  if (cosi < 0) { nx = -nx; ny = -ny; cosi = -cosi; }
+  const eta = n1 / n2;
+  const k = 1 - eta*eta*(1 - cosi*cosi);
+  if (k < 0) return null; // 全反射
+  const cost = Math.sqrt(k);
+  return [eta*dx + (eta*cosi - cost)*nx, eta*dy + (eta*cosi - cost)*ny];
+}
+function reflect(dx, dy, nx, ny) {
+  let cosi = -(dx*nx + dy*ny);
+  if (cosi < 0) { nx = -nx; ny = -ny; cosi = -cosi; }
+  const d = 2*(dx*nx + dy*ny);
+  return [dx - d*nx, dy - d*ny];
+}
+
+/* ---- 光线追踪（世界坐标） ---- */
+function farPt(pos, d) { const L = (W + H) / cam.k + 400; return [pos[0] + d[0]*L, pos[1] + d[1]*L]; }
+function nudge(pt, d) { return [pt[0] + d[0]*EPS*2, pt[1] + d[1]*EPS*2]; }
+
+// 空气中的公共路径：经平面镜反射，直到进入棱镜或射出画布（所有波长路径相同）
+function traceCommon(start, dir) {
+  const pts = [start];
+  let pos = start, d = dir, depth = 0;
+  while (depth++ < 10) {
+    const h = nearestHit(pos[0], pos[1], d[0], d[1], null);
+    if (!h) { pts.push(farPt(pos, d)); return { pts, prismHit:null }; }
+    pts.push(h.pt);
+    if (h.isMirror) { d = reflect(d[0], d[1], h.n[0], h.n[1]); pos = nudge(h.pt, d); continue; }
+    return { pts, prismHit:h };
+  }
+  return { pts, prismHit:null };
+}
+
+function traceRays() {
+  const rays = [];
+  for (const src of items) {
+    if (src.kind !== "light") continue;
+    const dir = [Math.cos(src.angle), Math.sin(src.angle)];
+    const start = [src.x + dir[0]*48, src.y + dir[1]*48];
+    const common = traceCommon(start, dir);
+    rays.push({ color: src.wave ? src.wave.c : WHITE, w: src.wave ? 4 : 8,
+                glow: src.wave ? 12 : 18, pts: common.pts });
+    if (!common.prismHit) continue;
+    const waves = src.wave ? [src.wave] : WAVES;
+    const first = common.prismHit;
+    for (const wv of waves) {
+      let d = refract(dir[0], dir[1], first.n[0], first.n[1], 1, refIndex(MATS[first.item.mat], wv.l));
+      if (!d) d = reflect(dir[0], dir[1], first.n[0], first.n[1]);
+      const pts = [first.pt];
+      let pos = nudge(first.pt, d);
+      let inside = first.item;
+      let depth = 0;
+      while (depth++ < 14) {
+        const h = nearestHit(pos[0], pos[1], d[0], d[1], inside);
+        if (!h) { pts.push(farPt(pos, d)); break; }
+        pts.push(h.pt);
+        if (h.isMirror) {                       // 平面镜反射
+          d = reflect(d[0], d[1], h.n[0], h.n[1]);
+        } else if (inside === h.item) {         // 从棱镜里射出
+          const out = refract(d[0], d[1], h.n[0], h.n[1], refIndex(MATS[inside.mat], wv.l), 1);
+          if (out) { d = out; inside = null; }
+          else { d = reflect(d[0], d[1], h.n[0], h.n[1]); }   // 全反射
+        } else {                                // 从空气射入棱镜
+          const inn = refract(d[0], d[1], h.n[0], h.n[1], 1, refIndex(MATS[h.item.mat], wv.l));
+          if (inn) { d = inn; inside = h.item; }
+          else { d = reflect(d[0], d[1], h.n[0], h.n[1]); inside = null; }
+        }
+        pos = nudge(h.pt, d);
+      }
+      rays.push({ color:wv.c, w: src.wave ? 3.5 : 3, glow:7, pts });
+    }
+  }
+  return rays;
+}
+
+/* ================= 绘制 ================= */
+function drawBackground() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#2b3a55"); g.addColorStop(1, "#1c2637");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  setWorldTransform();
+  const [x0, y0] = toWorld(0, 0), [x1, y1] = toWorld(W, H);
+  const step = 60, r = 1.5 / cam.k;
+  ctx.fillStyle = "rgba(255,255,255,0.06)";
+  for (let x = Math.floor(x0 / step) * step; x <= x1; x += step)
+    for (let y = Math.floor(y0 / step) * step; y <= y1; y += step)
+      { ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); }
+}
+
+function drawPrism(it) {
+  const m = MATS[it.mat];
+  strokePrismPath(it);
+  ctx.fillStyle = m.fill;
+  ctx.fill();
+  if (selected === it) {
+    ctx.save();
+    ctx.setLineDash([8 / cam.k, 6 / cam.k]);
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3 / cam.k;
+    ctx.stroke();
+    ctx.restore();
+  }
+  strokePrismPath(it);
+  ctx.strokeStyle = m.edge; ctx.lineWidth = 2.5 / cam.k;
+  ctx.stroke();
+}
+
+function drawMirror(it) {
+  const ms = mirrorSeg(it);
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(ms.a[0], ms.a[1]); ctx.lineTo(ms.b[0], ms.b[1]);
+  ctx.strokeStyle = "#9fb2c8"; ctx.lineWidth = 9; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(ms.a[0], ms.a[1]); ctx.lineTo(ms.b[0], ms.b[1]);
+  ctx.strokeStyle = "#f2f8ff"; ctx.lineWidth = 4; ctx.stroke();
+  if (selected === it) {
+    ctx.setLineDash([6 / cam.k, 5 / cam.k]);
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 2.5 / cam.k;
+    ctx.beginPath(); ctx.arc(it.x, it.y, MIRROR_L * it.s + 12, 0, 7); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+}
+
+function drawLight(src) {
+  ctx.save();
+  ctx.translate(src.x, src.y);
+  ctx.rotate(src.angle);
+  const body = src.wave ? src.wave.c : "#ff7043";
+  const edge = "rgba(0,0,0,0.45)";
+  ctx.fillStyle = body;
+  ctx.strokeStyle = edge; ctx.lineWidth = 2.5 / cam.k;
+  roundRect(-46, -15, 54, 30, 9); ctx.fill(); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(6, -15); ctx.lineTo(46, -26); ctx.lineTo(46, 26); ctx.lineTo(6, 15);
+  ctx.closePath();
+  ctx.fillStyle = src.wave ? "#e8e8e8" : "#ffa06a";
+  ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(46, 0, 6, 25, 0, 0, 7);
+  ctx.fillStyle = src.wave ? src.wave.c : "#fff7c0"; ctx.fill();
+  ctx.restore();
+}
+
+// 手柄（保持恒定屏幕大小）
+function rotateHandlePos(it) { return [it.x, it.y - 92 / cam.k]; }
+function scaleHandlePos(it)  { return [it.x + 92 / cam.k, it.y]; }
+function deleteHandlePos(it) { return [it.x - 92 / cam.k, it.y]; }
+
+function drawKnob(x, y, color, ring, icon) {
+  const r = 15 / cam.k;
+  ctx.save();
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = ring; ctx.lineWidth = 2 / cam.k; ctx.stroke();
+  ctx.fillStyle = ring; ctx.font = `bold ${17 / cam.k}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(icon, x, y + 1 / cam.k);
+  ctx.restore();
+}
+function drawHandleLine(it, x, y, color) {
+  ctx.save();
+  ctx.strokeStyle = color; ctx.lineWidth = 2 / cam.k;
+  ctx.setLineDash([4 / cam.k, 4 / cam.k]);
+  ctx.beginPath(); ctx.moveTo(it.x, it.y); ctx.lineTo(x, y); ctx.stroke();
+  ctx.restore();
+}
+function drawHandles(it) {
+  const [rx, ry] = rotateHandlePos(it);
+  drawHandleLine(it, rx, ry, "rgba(255,213,74,0.8)");
+  drawKnob(rx, ry, "#ffd54a", "#a87800", "↻");
+  if (it.kind === "prism" || it.kind === "mirror") {
+    const [sx, sy] = scaleHandlePos(it);
+    drawHandleLine(it, sx, sy, "rgba(79,195,247,0.8)");
+    drawKnob(sx, sy, "#4fc3f7", "#01579b", "⤡");
+  }
+  const [dx, dy] = deleteHandlePos(it);
+  drawHandleLine(it, dx, dy, "rgba(255,82,82,0.8)");
+  drawKnob(dx, dy, "#ff5252", "#7f0000", "✕");
+}
+
+function drawRays(rays) {
+  ctx.save();
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  for (const r of rays) {
+    ctx.strokeStyle = r.color;
+    ctx.lineWidth = r.w / cam.k;
+    ctx.shadowColor = r.color;
+    ctx.shadowBlur = r.glow / cam.k;
+    ctx.beginPath();
+    ctx.moveTo(r.pts[0][0], r.pts[0][1]);
+    for (let i = 1; i < r.pts.length; i++) ctx.lineTo(r.pts[i][0], r.pts[i][1]);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function draw() {
+  drawBackground();   // 结束时已是世界变换
+  for (const it of items) if (it.kind === "prism") drawPrism(it);
+  for (const it of items) if (it.kind === "mirror") drawMirror(it);
+  drawRays(traceRays());
+  for (const it of items) if (it.kind === "light") drawLight(it);
+  if (selected) drawHandles(selected);
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+/* ================= 音效 ================= */
+let actx = null;
+function pop(freq) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.12, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.15);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + 0.16);
+  } catch (e) { /* 静音环境忽略 */ }
+}
+
+/* ================= 交互 ================= */
+const pointers = new Map();
+let drag = null;
+let pinch = null;
+
+function canvasPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+}
+function hitItem(wx, wy) {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.kind === "light") {
+      if (Math.hypot(wx - it.x, wy - it.y) < 52) return it;
+    } else if (it.kind === "mirror") {
+      const ms = mirrorSeg(it);
+      if (pointSegDist(wx, wy, ms.a[0], ms.a[1], ms.b[0], ms.b[1]) < 14 / cam.k) return it;
+    } else if (pointInPrism(it, wx, wy)) {
+      return it;
+    }
+  }
+  return null;
+}
+function overPalette(x, y) {
+  const r = paletteEl.getBoundingClientRect();
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+function dismissHint() { hintEl.style.opacity = "0"; }
+
+function pinchState() {
+  const ps = [...pointers.values()];
+  if (ps.length < 2) return null;
+  const [a, b] = ps;
+  return { d: Math.hypot(a.x - b.x, a.y - b.y), mid: [(a.x + b.x) / 2, (a.y + b.y) / 2] };
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const [sx, sy] = canvasPos(e);
+  pointers.set(e.pointerId, { x:sx, y:sy });
+  dismissHint();
+  if (pointers.size === 2) {          // 第二根手指：捏合模式
+    drag = null;
+    pinch = pinchState();
+    return;
+  }
+  const [wx, wy] = toWorld(sx, sy);
+  if (selected) {
+    const near = (hx, hy) => Math.hypot(wx - hx, wy - hy) < 22 / cam.k;
+    const [dx, dy] = deleteHandlePos(selected);
+    if (near(dx, dy)) {               // ✕ 删除
+      items = items.filter(i => i !== selected);
+      selected = null;
+      pop(220);
+      return;
+    }
+    const [hx, hy] = rotateHandlePos(selected);
+    if (near(hx, hy)) {
+      drag = { item:selected, mode:"rotate" };
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
+    if (selected.kind === "prism" || selected.kind === "mirror") {
+      const [kx, ky] = scaleHandlePos(selected);
+      if (near(kx, ky)) {
+        drag = { item:selected, mode:"scale",
+                 startDist: Math.max(10, Math.hypot(wx - selected.x, wy - selected.y)),
+                 startScale: selected.s };
+        canvas.setPointerCapture(e.pointerId);
+        return;
+      }
+    }
+  }
+  const it = hitItem(wx, wy);
+  if (it) {
+    selected = it;
+    drag = { item:it, mode:"move", offX:wx - it.x, offY:wy - it.y, isNew:false };
+    pop(660);
+    canvas.setPointerCapture(e.pointerId);
+  } else {
+    selected = null;
+    drag = { mode:"pan", sx, sy, camX:cam.x, camY:cam.y };
+    canvas.setPointerCapture(e.pointerId);
+  }
+});
+
+window.addEventListener("pointermove", e => {
+  if (pointers.has(e.pointerId)) {
+    const [sx, sy] = canvasPos(e);
+    pointers.set(e.pointerId, { x:sx, y:sy });
+  }
+  if (pinch && pointers.size >= 2) {
+    const now = pinchState();
+    if (now && pinch.d > 0) {
+      zoomAt(now.mid[0], now.mid[1], now.d / pinch.d);
+      cam.x += now.mid[0] - pinch.mid[0];
+      cam.y += now.mid[1] - pinch.mid[1];
+      pinch = now;
+    }
+    return;
+  }
+  if (!drag) return;
+  const [sx, sy] = canvasPos(e);
+  const [wx, wy] = toWorld(sx, sy);
+  if (drag.mode === "pan") {
+    cam.x = drag.camX + (sx - drag.sx);
+    cam.y = drag.camY + (sy - drag.sy);
+  } else if (drag.mode === "move") {
+    drag.item.x = wx - drag.offX;
+    drag.item.y = wy - drag.offY;
+  } else if (drag.mode === "rotate") {
+    drag.item.angle = Math.atan2(wy - drag.item.y, wx - drag.item.x) + Math.PI / 2;
+  } else if (drag.mode === "scale") {
+    const d = Math.hypot(wx - drag.item.x, wy - drag.item.y);
+    drag.item.s = Math.min(3, Math.max(0.4, drag.startScale * d / drag.startDist));
+  }
+});
+
+window.addEventListener("pointerup", e => {
+  pointers.delete(e.pointerId);
+  if (pinch && pointers.size < 2) pinch = null;
+  if (drag && drag.mode === "move") {
+    if (drag.isNew && overPalette(e.clientX, e.clientY)) {
+      items = items.filter(i => i !== drag.item);   // 拖回工具箱 = 取消
+      if (selected === drag.item) selected = null;
+    } else {
+      pop(880);
+    }
+  }
+  drag = null;
+  scheduleAutosave();
+});
+window.addEventListener("pointercancel", e => {
+  pointers.delete(e.pointerId);
+  if (pinch && pointers.size < 2) pinch = null;
+  drag = null;
+});
+
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const [sx, sy] = canvasPos(e);
+  zoomAt(sx, sy, Math.exp(-e.deltaY * 0.0012));
+  scheduleAutosave();
+}, { passive:false });
+
+document.getElementById("zoomIn").addEventListener("click", () => { zoomAt(W/2, H/2, 1.3); pop(760); scheduleAutosave(); });
+document.getElementById("zoomOut").addEventListener("click", () => { zoomAt(W/2, H/2, 1/1.3); pop(520); scheduleAutosave(); });
+document.getElementById("zoomReset").addEventListener("click", () => { cam.x = 0; cam.y = 0; cam.k = 1; pop(660); scheduleAutosave(); });
+
+/* ================= 工具箱 ================= */
+const LASERS = {
+  red:   { l:650, c:"#ff2a20" },
+  green: { l:532, c:"#2ee06a" },
+  blue:  { l:450, c:"#3a6bff" }
+};
+const PALETTE_ITEMS = [
+  { icon:"🔦", label:"白光手电", make:() => ({ kind:"light", wave:null }) },
+  { icon:"🔴", label:"红激光",   make:() => ({ kind:"light", wave:LASERS.red }) },
+  { icon:"🟢", label:"绿激光",   make:() => ({ kind:"light", wave:LASERS.green }) },
+  { icon:"🔵", label:"蓝激光",   make:() => ({ kind:"light", wave:LASERS.blue }) },
+  { icon:"🔺", label:"三棱镜",   make:() => ({ kind:"prism", shape:"tri",  mat:"glass" }) },
+  { icon:"💎", label:"水晶棱镜", make:() => ({ kind:"prism", shape:"tri",  mat:"crystal" }) },
+  { icon:"📐", label:"直角棱镜", make:() => ({ kind:"prism", shape:"rtri", mat:"glass" }) },
+  { icon:"🌓", label:"半圆棱镜", make:() => ({ kind:"prism", shape:"semi", mat:"glass" }) },
+  { icon:"⬜", label:"玻璃砖",   make:() => ({ kind:"prism", shape:"rect", mat:"glass" }) },
+  { icon:"()", label:"凸透镜", glyph:true, make:() => ({ kind:"prism", shape:"lcv", mat:"glass" }) },
+  { icon:")(", label:"凹透镜", glyph:true, make:() => ({ kind:"prism", shape:"lcc", mat:"glass" }) },
+  { icon:"🪞", label:"平面镜",   make:() => ({ kind:"mirror" }) }
+];
+const palGrid = document.getElementById("palGrid");
+PALETTE_ITEMS.forEach(def => {
+  const el = document.createElement("div");
+  el.className = "pal-item";
+  el.innerHTML = def.glyph
+    ? `<div class="glyph">${def.icon}</div><span>${def.label}</span>`
+    : `${def.icon}<span>${def.label}</span>`;
+  el.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    dismissHint();
+    const pw = paletteWidth();
+    const [wx, wy] = toWorld(Math.max(e.clientX, pw + 70), e.clientY);
+    const it = Object.assign({ id:nextId++, x:wx, y:wy, angle:0, s:1 }, def.make());
+    items.push(it);
+    selected = it;
+    drag = { item:it, mode:"move", offX:0, offY:0, isNew:true };
+    pop(660);
+  });
+  palGrid.appendChild(el);
+});
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

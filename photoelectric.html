@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>光电效应实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#0d1226; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,14,34,0.85); color:#8fd8ff; padding:10px 22px;
+    border-radius:24px; font-size:16px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,14,34,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:96vw;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">…</div>
+<div id="hint">拖动下方滑杆：改变光的颜色（频率）和强度，照射金属板！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 物理常量与状态 ================= */
+// 频率范围：红(4.0e14 Hz, ~750nm) → 紫(7.6e14 Hz, ~395nm)
+const NU_MIN = 4.0e14, NU_MAX = 7.6e14;
+const NU0 = 5.6e14;                 // 极限频率（金属钠）
+const H_EV = 4.136e-15;             // 普朗克常数 (eV·s)
+const PHI = H_EV * NU0;             // 逸出功 ≈ 2.32 eV
+const KE_MAX_AXIS = 0.9;            // 图纵轴上限 (eV)
+
+let freqT = 0.12;                   // 频率滑杆 0..1（初始红光）
+let intT = 0.55;                    // 光强滑杆 0..1
+let photons = [];                   // {s, phase, ty} 沿光束路径
+let electrons = [];                 // {x, y, vx, vy, ke}
+let collectTimes = [];              // 最近收集时间戳（算电流）
+let flashes = [];                   // 板面吸收闪光 {y, t, ok}
+let graphPts = [];                  // {nu, ke} 自动记录点
+let spawnAcc = 0;
+let emitHold = 0;                   // 当前频率持续出电子的时间
+let redHold = 0;                    // 红光强照持续时间
+let curSmooth = 0;                  // 平滑电流读数
+let saidRed = false, saidEmit = false, saidLine = false;
+
+function nu() { return NU_MIN + freqT * (NU_MAX - NU_MIN); }
+function photonE() { return H_EV * nu(); }                 // 光子能量 hν (eV)
+function keMax() { return Math.max(0, photonE() - PHI); }  // 最大初动能 (eV)
+function above() { return nu() >= NU0; }
+
+// 波长 → RGB（近似）
+function lightRGB(f) {
+  const wl = 3e17 / f;   // nm
+  let r = 0, g = 0, b = 0;
+  if (wl < 440)      { r = -(wl - 440) / 60; b = 1; }
+  else if (wl < 490) { g = (wl - 440) / 50;  b = 1; }
+  else if (wl < 510) { g = 1; b = -(wl - 510) / 20; }
+  else if (wl < 580) { r = (wl - 510) / 70;  g = 1; }
+  else if (wl < 645) { r = 1; g = -(wl - 645) / 65; }
+  else               { r = 1; }
+  let k = 1;
+  if (wl > 700) k = 0.35 + 0.65 * (750 - wl) / 50;
+  else if (wl < 420) k = 0.35 + 0.65 * (wl - 380) / 40;
+  return [Math.round(r * k * 255), Math.round(g * k * 255), Math.round(b * k * 255)];
+}
+function lightCSS(f, a) {
+  const c = lightRGB(f);
+  return `rgba(${c[0]},${c[1]},${c[2]},${a == null ? 1 : a})`;
+}
+function colorName() {
+  const wl = 3e17 / nu();
+  if (wl > 620) return "红光";
+  if (wl > 590) return "橙光";
+  if (wl > 565) return "黄光";
+  if (wl > 500) return "绿光";
+  if (wl > 450) return "蓝光";
+  return "紫光";
+}
+
+/* ================= 布局 ================= */
+// 左侧实验区 + 右侧记录图 + 底部两个滑杆
+const ui = {};
+function layout() {
+  const pw = W * 0.62;                       // 实验区宽
+  const y0 = 100;                            // 实验区顶
+  ui.pw = pw; ui.y0 = y0;
+  ui.src = { x: pw * 0.13, y: y0 + 30, a: 0.42 };  // 光源位置与出射角
+  ui.plate = { x: pw * 0.52, y: y0 + 165, w: 22, h: 175 };
+  ui.coll = { x: pw * 0.52 + 150, y: y0 + 165, w: 12, h: 175 };
+  ui.amm = { x: pw * 0.52 + 75, y: y0 + 165 + 165, r: 44 };
+  // 光束路径（光源口 → 金属板左面中心）
+  const sx = ui.src.x + 34 * Math.cos(ui.src.a), sy = ui.src.y + 34 * Math.sin(ui.src.a);
+  ui.beam = { x0: sx, y0: sy, x1: ui.plate.x, y1: ui.plate.y };
+  // 滑杆
+  const sw = Math.min(520, W * 0.5), sx0 = Math.max(20, (pw - sw) / 2);
+  ui.freq = { x: sx0, y: H - 168, w: sw, h: 16 };
+  ui.intn = { x: sx0, y: H - 92, w: sw, h: 16 };
+  // 记录图面板
+  ui.graph = { x: W * 0.655, y: 92, w: 0, h: 0 };
+  ui.graph.w = Math.max(240, W - 18 - ui.graph.x);
+  ui.graph.h = Math.max(240, Math.min(H - 260, H * 0.62));
+}
+resize();
+updateScore();
+
+/* ================= 物理 ================= */
+function physics(dt) {
+  const now = performance.now();
+  const on = intT > 0.02;
+  // 光子产生：光强决定数量
+  if (on) {
+    spawnAcc += dt * (2 + intT * 11);
+    while (spawnAcc >= 1) {
+      spawnAcc -= 1;
+      if (photons.length < 90)
+        photons.push({ s: 0, phase: Math.random() * 6.28, ty: (Math.random() - 0.5) * ui.plate.h * 0.7 });
+    }
+  }
+  // 光子飞行（沿光束，打到板面被吸收）
+  const b = ui.beam;
+  const pathLen = Math.hypot(b.x1 - b.x0, b.y1 - b.y0);
+  for (let i = photons.length - 1; i >= 0; i--) {
+    const p = photons[i];
+    p.s += 420 * dt / pathLen;
+    if (p.s >= 1) {
+      photons.splice(i, 1);
+      flashes.push({ y: ui.plate.y + p.ty, t: now, ok: above() });
+      if (above() && electrons.length < 60) {
+        const ke = keMax();
+        electrons.push({
+          x: ui.plate.x + ui.plate.w / 2 + 4, y: ui.plate.y + p.ty,
+          vx: 95 + ke * 260, vy: (Math.random() - 0.5) * 60, ke
+        });
+      }
+    }
+  }
+  // 电子飞行（最大动能 → 速度）
+  for (let i = electrons.length - 1; i >= 0; i--) {
+    const e = electrons[i];
+    e.x += e.vx * dt; e.y += e.vy * dt;
+    if (e.x >= ui.coll.x - ui.coll.w / 2) {
+      electrons.splice(i, 1);
+      collectTimes.push(now);
+      tickPop();
+    }
+  }
+  // 只保留最近 1 秒的收集记录
+  while (collectTimes.length && now - collectTimes[0] > 1000) collectTimes.shift();
+  // 闪光衰减
+  while (flashes.length && now - flashes[0].t > 350) flashes.shift();
+  // 电流 = 每秒收集电子数 × 系数（微安表头）
+  const curTarget = collectTimes.length * 6.5;
+  curSmooth += (curTarget - curSmooth) * Math.min(1, dt * 5);
+  // 出电子持续 0.6s → 自动记录数据点
+  if (on && above()) {
+    emitHold += dt;
+    if (emitHold > 0.6) {
+      const f = nu();
+      if (!graphPts.some(p => Math.abs(p.nu - f) < 0.1e14)) {
+        graphPts.push({ nu: f, ke: keMax() });
+        pop(1320);
+        if (graphPts.length === 1) showHint("记录到一个数据点！换几个频率再试试");
+        emitHold = -1e9;   // 同频率只记一次
+      }
+    }
+  } else emitHold = 0;
+  if (redHoldCheck(on, dt)) return;
+  // 彩蛋：三个点连成直线 → 斜率就是普朗克常数！
+  if (graphPts.length >= 3 && !saidLine) {
+    saidLine = true;
+    fanfare();
+    showHint("把点连起来——是一条直线！斜率就是普朗克常数 h ≈ 4.14×10⁻¹⁵ eV·s 🎉", 5200);
+  }
+  updateScore();
+}
+
+function redHoldCheck(on, dt) {
+  if (on && !above() && intT > 0.85) {
+    redHold += dt;
+    if (redHold > 1.2 && !saidRed) {
+      saidRed = true;
+      showHint("奇怪…红光再强也打不出电子！光强没用，频率才是关键！", 4200);
+    }
+  } else redHold = 0;
+  if (on && above() && !saidEmit) {
+    saidEmit = true;
+    pop(880);
+    showHint("电子飞出来了！频率超过极限频率才行，光强只影响电子数量", 4200);
+  }
+  return false;
+}
+
+function updateScore() {
+  const f = (nu() / 1e14).toFixed(2);
+  const e = photonE().toFixed(2);
+  if (above())
+    scorebar.textContent = `${colorName()} ν=${f}×10¹⁴Hz · hν=${e}eV · 最大动能 Ek=${keMax().toFixed(2)}eV · 电流 ${curSmooth.toFixed(0)}μA`;
+  else
+    scorebar.textContent = `${colorName()} ν=${f}×10¹⁴Hz · hν=${e}eV < 逸出功 φ=${PHI.toFixed(2)}eV · 无电子逸出 · 电流 0μA`;
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function drawApparatus() {
+  const { src, plate, coll, amm, beam } = ui;
+  const now = performance.now();
+  const col = lightCSS(nu());
+  const on = intT > 0.02;
+
+  // 光束（波形曲线，把"光"画出来）
+  if (on) {
+    const pathLen = Math.hypot(beam.x1 - beam.x0, beam.y1 - beam.y0);
+    const nx = (beam.x1 - beam.x0) / pathLen, ny = (beam.y1 - beam.y0) / pathLen;
+    const px = -ny, py = nx;   // 垂直方向
+    ctx.save();
+    ctx.strokeStyle = lightCSS(nu(), 0.25 + intT * 0.5);
+    ctx.lineWidth = 2.5 + intT * 3;
+    ctx.shadowColor = col; ctx.shadowBlur = 12 * intT;
+    ctx.beginPath();
+    for (let s = 0; s <= 1.001; s += 0.02) {
+      const amp = Math.sin(s * pathLen / 22 + now / 90) * 9 * Math.sin(s * Math.PI);
+      const x = beam.x0 + nx * s * pathLen + px * amp;
+      const y = beam.y0 + ny * s * pathLen + py * amp;
+      if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // 导线：板底 → 电流表 → 收集极底
+  ctx.strokeStyle = "#7a8699"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(plate.x, plate.y + plate.h / 2);
+  ctx.lineTo(plate.x, amm.y);
+  ctx.lineTo(amm.x - amm.r, amm.y);
+  ctx.moveTo(amm.x + amm.r, amm.y);
+  ctx.lineTo(coll.x, amm.y);
+  ctx.lineTo(coll.x, coll.y + coll.h / 2);
+  ctx.stroke();
+
+  // 金属板（钠）
+  let g = ctx.createLinearGradient(plate.x - plate.w / 2, 0, plate.x + plate.w / 2, 0);
+  g.addColorStop(0, "#c9ced8"); g.addColorStop(0.5, "#8f97a6"); g.addColorStop(1, "#5d6472");
+  ctx.fillStyle = g;
+  roundRect(plate.x - plate.w / 2, plate.y - plate.h / 2, plate.w, plate.h, 5, true);
+  ctx.fillStyle = "#dfe4ec"; ctx.font = "13px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("金属钠板", plate.x, plate.y + plate.h / 2 + 18);
+  ctx.fillText(`逸出功 φ=${PHI.toFixed(2)}eV`, plate.x, plate.y + plate.h / 2 + 34);
+  // 板内电子小点
+  ctx.fillStyle = "rgba(40,50,70,0.6)";
+  for (let i = 0; i < 10; i++) {
+    const ey = plate.y - plate.h / 2 + 14 + i * (plate.h - 28) / 9;
+    ctx.beginPath(); ctx.arc(plate.x, ey, 2.5, 0, 7); ctx.fill();
+  }
+  // 吸收闪光
+  for (const f of flashes) {
+    const k = 1 - (now - f.t) / 350;
+    ctx.beginPath();
+    ctx.arc(plate.x - plate.w / 2, f.y, 4 + 10 * (1 - k), 0, 7);
+    ctx.fillStyle = f.ok ? `rgba(255,240,160,${0.7 * k})` : `rgba(255,120,80,${0.45 * k})`;
+    ctx.fill();
+  }
+
+  // 收集极
+  g = ctx.createLinearGradient(coll.x - coll.w / 2, 0, coll.x + coll.w / 2, 0);
+  g.addColorStop(0, "#e8c060"); g.addColorStop(1, "#a87f28");
+  ctx.fillStyle = g;
+  roundRect(coll.x - coll.w / 2, coll.y - coll.h / 2, coll.w, coll.h, 4, true);
+  ctx.fillStyle = "#e8c060"; ctx.font = "13px sans-serif";
+  ctx.fillText("收集极", coll.x, coll.y - coll.h / 2 - 8);
+
+  // 电流表
+  ctx.beginPath(); ctx.arc(amm.x, amm.y, amm.r, 0, 7);
+  ctx.fillStyle = "#f4f0e4"; ctx.fill();
+  ctx.strokeStyle = "#444"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.save();
+  ctx.beginPath(); ctx.arc(amm.x, amm.y, amm.r - 3, 0, 7); ctx.clip();
+  // 刻度弧（与指针同一角度映射：-135° → -45°）
+  ctx.strokeStyle = "#666"; ctx.lineWidth = 1.5;
+  for (let i = 0; i <= 5; i++) {
+    const a = (-135 + i * 18) * Math.PI / 180;
+    ctx.beginPath();
+    ctx.moveTo(amm.x + Math.cos(a) * (amm.r - 12), amm.y + Math.sin(a) * (amm.r - 12));
+    ctx.lineTo(amm.x + Math.cos(a) * (amm.r - 6), amm.y + Math.sin(a) * (amm.r - 6));
+    ctx.stroke();
+  }
+  ctx.restore();
+  // 指针：0μA → -135°，100μA → -45°
+  const ang = (-135 + Math.min(100, curSmooth) / 100 * 90) * Math.PI / 180;
+  ctx.strokeStyle = "#d33"; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(amm.x, amm.y);
+  ctx.lineTo(amm.x + Math.cos(ang) * (amm.r - 10), amm.y + Math.sin(ang) * (amm.r - 10));
+  ctx.stroke();
+  ctx.fillStyle = "#333"; ctx.font = "bold 12px sans-serif";
+  ctx.fillText(`${curSmooth.toFixed(0)} μA`, amm.x, amm.y + amm.r - 12);
+  ctx.fillStyle = "#aeb8cc"; ctx.font = "11px sans-serif";
+  ctx.fillText("电流表", amm.x, amm.y + amm.r + 14);
+
+  // 光源
+  ctx.save();
+  ctx.translate(src.x, src.y); ctx.rotate(src.a);
+  g = ctx.createLinearGradient(-30, 0, 34, 0);
+  g.addColorStop(0, "#3a4050"); g.addColorStop(1, "#59627a");
+  ctx.fillStyle = g;
+  roundRect(-30, -20, 64, 40, 8, true);
+  if (on) {
+    ctx.beginPath(); ctx.arc(34, 0, 12, 0, 7);
+    ctx.fillStyle = lightCSS(nu(), 0.35 + intT * 0.65);
+    ctx.shadowColor = col; ctx.shadowBlur = 24 * intT;
+    ctx.fill();
+  }
+  ctx.restore();
+  ctx.fillStyle = "#aeb8cc"; ctx.font = "13px sans-serif";
+  ctx.fillText("光源", src.x, src.y - 34);
+
+  // 光子
+  if (on) {
+    const pathLen = Math.hypot(beam.x1 - beam.x0, beam.y1 - beam.y0);
+    const nx = (beam.x1 - beam.x0) / pathLen, ny = (beam.y1 - beam.y0) / pathLen;
+    const px = -ny, py = nx;
+    for (const p of photons) {
+      const ty = p.ty * 0.5;
+      const amp = Math.sin(p.s * pathLen / 22 + now / 90) * 9 * Math.sin(p.s * Math.PI);
+      const x = beam.x0 + nx * p.s * pathLen + px * (amp + ty);
+      const y = beam.y0 + ny * p.s * pathLen + py * (amp + ty);
+      ctx.beginPath(); ctx.arc(x, y, 3.5, 0, 7);
+      ctx.fillStyle = col; ctx.shadowColor = col; ctx.shadowBlur = 8;
+      ctx.fill(); ctx.shadowBlur = 0;
+    }
+  }
+
+  // 逸出电子（带速度箭头尾巴）
+  for (const e of electrons) {
+    ctx.beginPath(); ctx.arc(e.x, e.y, 4, 0, 7);
+    ctx.fillStyle = "#7fe9ff"; ctx.shadowColor = "#4fd0ff"; ctx.shadowBlur = 10;
+    ctx.fill(); ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(127,233,255,0.5)"; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(e.x, e.y);
+    ctx.lineTo(e.x - e.vx * 0.05, e.y - e.vy * 0.05);
+    ctx.stroke();
+  }
+  if (!above() && on) {
+    // 低于极限频率：板上画问号提示
+    ctx.fillStyle = "rgba(255,150,90,0.9)"; ctx.font = "bold 22px sans-serif";
+    ctx.fillText("电子被束缚着…", plate.x + 70, plate.y - plate.h / 2 - 24);
+  }
+}
+
+function drawSliders() {
+  const f = ui.freq, it = ui.intn;
+  ctx.textAlign = "left";
+  // ---- 频率滑杆：红→紫渐变 ----
+  ctx.fillStyle = "#dfe4ec"; ctx.font = "bold 15px sans-serif";
+  ctx.fillText(`光的颜色（频率）：${colorName()}  ν = ${(nu() / 1e14).toFixed(2)} × 10¹⁴ Hz`, f.x, f.y - 14);
+  ctx.save();
+  ctx.beginPath(); roundRect(f.x, f.y, f.w, f.h, 8, false); ctx.clip();
+  for (let i = 0; i <= 60; i++) {
+    ctx.fillStyle = lightCSS(NU_MIN + (i / 60) * (NU_MAX - NU_MIN));
+    ctx.fillRect(f.x + (i / 60) * f.w, f.y, f.w / 60 + 1, f.h);
+  }
+  ctx.restore();
+  // 极限频率刻度
+  const t0 = (NU0 - NU_MIN) / (NU_MAX - NU_MIN);
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 2;
+  ctx.setLineDash([4, 3]);
+  ctx.beginPath();
+  ctx.moveTo(f.x + t0 * f.w, f.y - 6); ctx.lineTo(f.x + t0 * f.w, f.y + f.h + 6);
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = "#ffd54a"; ctx.font = "11px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("极限频率 ν₀", f.x + t0 * f.w, f.y + f.h + 20);
+  // 旋钮
+  drawKnob(f.x + freqT * f.w, f.y + f.h / 2, lightCSS(nu()));
+  // ---- 光强滑杆 ----
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#dfe4ec"; ctx.font = "bold 15px sans-serif";
+  ctx.fillText(`光强：${Math.round(intT * 100)}%`, it.x, it.y - 14);
+  ctx.fillStyle = "rgba(255,255,255,0.15)";
+  roundRect(it.x, it.y, it.w, it.h, 8, true);
+  const ig = ctx.createLinearGradient(it.x, 0, it.x + it.w, 0);
+  ig.addColorStop(0, "rgba(255,255,255,0.15)"); ig.addColorStop(1, "rgba(255,255,255,0.85)");
+  ctx.fillStyle = ig;
+  if (intT > 0.005) roundRect(it.x, it.y, it.w * intT, it.h, 8, true);
+  drawKnob(it.x + intT * it.w, it.y + it.h / 2, "#ffffff");
+}
+function drawKnob(x, y, color) {
+  ctx.beginPath(); ctx.arc(x, y, 13, 0, 7);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.beginPath(); ctx.arc(x - 4, y - 4, 4, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.7)"; ctx.fill();
+}
+
+function drawGraph() {
+  const g = ui.graph;
+  // 面板
+  ctx.fillStyle = "rgba(8,12,30,0.75)";
+  roundRect(g.x, g.y, g.w, g.h, 14, true);
+  ctx.strokeStyle = "rgba(120,150,220,0.4)"; ctx.lineWidth = 1.5;
+  roundRect(g.x, g.y, g.w, g.h, 14, false); ctx.stroke();
+  ctx.fillStyle = "#cfe0ff"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("📈 实验记录：最大动能 vs 频率", g.x + 16, g.y + 26);
+  // 清除按钮
+  ui.clearBtn = { x: g.x + g.w - 84, y: g.y + 10, w: 70, h: 24 };
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  roundRect(ui.clearBtn.x, ui.clearBtn.y, ui.clearBtn.w, ui.clearBtn.h, 12, true);
+  ctx.fillStyle = "#cfe0ff"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("清除记录", ui.clearBtn.x + 35, ui.clearBtn.y + 16);
+
+  // 绘图区
+  const px0 = g.x + 52, py0 = g.y + 44, px1 = g.x + g.w - 18, py1 = g.y + g.h - 46;
+  const X = f => px0 + (f - NU_MIN) / (NU_MAX - NU_MIN) * (px1 - px0);
+  const Y = k => py1 - k / KE_MAX_AXIS * (py1 - py0);
+  // 轴
+  ctx.strokeStyle = "#8fa0c8"; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(px0, py0); ctx.lineTo(px0, py1); ctx.lineTo(px1, py1);
+  ctx.stroke();
+  ctx.fillStyle = "#8fa0c8"; ctx.font = "11px sans-serif"; ctx.textAlign = "center";
+  for (let f = 4; f <= 7.5; f += 1) {
+    const x = X(f * 1e14);
+    ctx.fillText(f.toFixed(0), x, py1 + 14);
+    ctx.beginPath(); ctx.moveTo(x, py1); ctx.lineTo(x, py1 + 4); ctx.stroke();
+  }
+  ctx.textAlign = "right";
+  for (let k = 0; k <= 0.9; k += 0.3) {
+    ctx.fillText(k.toFixed(1), px0 - 6, Y(k) + 4);
+    ctx.beginPath(); ctx.moveTo(px0 - 4, Y(k)); ctx.lineTo(px0, Y(k)); ctx.stroke();
+  }
+  ctx.textAlign = "center";
+  ctx.fillText("ν (×10¹⁴ Hz)", (px0 + px1) / 2, py1 + 30);
+  ctx.save();
+  ctx.translate(g.x + 16, (py0 + py1) / 2); ctx.rotate(-Math.PI / 2);
+  ctx.fillText("Ek (eV)", 0, 0);
+  ctx.restore();
+  // 网格
+  ctx.strokeStyle = "rgba(140,160,200,0.12)"; ctx.lineWidth = 1;
+  for (let f = 5; f <= 7; f += 1) {
+    ctx.beginPath(); ctx.moveTo(X(f * 1e14), py0); ctx.lineTo(X(f * 1e14), py1); ctx.stroke();
+  }
+  for (let k = 0.3; k <= 0.9; k += 0.3) {
+    ctx.beginPath(); ctx.moveTo(px0, Y(k)); ctx.lineTo(px1, Y(k)); ctx.stroke();
+  }
+
+  // 数据点
+  for (const p of graphPts) {
+    ctx.beginPath(); ctx.arc(X(p.nu), Y(p.ke), 5.5, 0, 7);
+    ctx.fillStyle = lightCSS(p.nu); ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  // 连线（≥3 点：直线！）
+  if (graphPts.length >= 3) {
+    const k1 = 0, k2 = H_EV * (NU_MAX - NU0);   // 理论直线 Ek = h(ν-ν0)
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(X(NU0), Y(k1)); ctx.lineTo(X(NU_MAX), Y(Math.min(KE_MAX_AXIS, k2)));
+    ctx.stroke();
+    // 极限频率截距
+    ctx.setLineDash([4, 4]); ctx.strokeStyle = "rgba(255,213,74,0.5)"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(X(NU0), Y(0)); ctx.lineTo(X(NU0), py0); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#ffd54a"; ctx.font = "bold 13px sans-serif"; ctx.textAlign = "left";
+    ctx.fillText("是一条直线！", px0 + 8, py0 + 20);
+    ctx.font = "12px sans-serif";
+    ctx.fillText("斜率 = h ≈ 4.14×10⁻¹⁵ eV·s（普朗克常数）", px0 + 8, py0 + 38);
+    ctx.fillText("横轴截距 = 极限频率 ν₀", px0 + 8, py0 + 56);
+  } else {
+    ctx.fillStyle = "rgba(200,215,245,0.65)"; ctx.font = "13px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(`换不同的频率照射，自动记录数据点（${graphPts.length}/3）`, (px0 + px1) / 2, (py0 + py1) / 2);
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#131a3a"); g.addColorStop(1, "#0a0e20");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 标题
+  ctx.fillStyle = "#8fd8ff"; ctx.font = "bold 17px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("🔬 光电效应实验室", 16, 30);
+  ctx.fillStyle = "rgba(160,180,220,0.8)"; ctx.font = "12px sans-serif";
+  ctx.fillText("爱因斯坦：光是一份一份的光子，E = hν", 16, 50);
+  drawApparatus();
+  drawGraph();
+  drawSliders();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 交互：拖拽滑杆 ================= */
+let drag = null;   // "freq" | "int"
+function sliderAt(x, y) {
+  for (const [key, r] of [["freq", ui.freq], ["int", ui.intn]]) {
+    if (x >= r.x - 20 && x <= r.x + r.w + 20 && y >= r.y - 22 && y <= r.y + r.h + 22) return key;
+  }
+  return null;
+}
+function setSlider(key, x) {
+  const r = key === "freq" ? ui.freq : ui.intn;
+  const t = Math.max(0, Math.min(1, (x - r.x) / r.w));
+  if (key === "freq") { freqT = t; emitHold = 0; }
+  else intT = t;
+  updateScore();
+}
+canvas.addEventListener("pointerdown", e => {
+  const key = sliderAt(e.clientX, e.clientY);
+  if (key) {
+    drag = key;
+    setSlider(key, e.clientX);
+    canvas.setPointerCapture(e.pointerId);
+    pop(660);
+    hintEl.style.opacity = "0";
+    return;
+  }
+  const c = ui.clearBtn;
+  if (c && e.clientX >= c.x && e.clientX <= c.x + c.w && e.clientY >= c.y && e.clientY <= c.y + c.h) {
+    graphPts = []; saidLine = false; emitHold = 0;
+    pop(440);
+    showHint("记录已清除，重新扫几个频率吧！");
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (drag) setSlider(drag, e.clientX);
+});
+window.addEventListener("pointerup", () => { drag = null; });
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.1);
+let lastTick = 0;
+function tickPop() {
+  const now = performance.now();
+  if (now - lastTick > 90) { lastTick = now; tone(1500 + Math.random() * 300, 0.04, 0.05, "square"); }
+}
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 提示 ================= */
+let hintTimer = null;
+function showHint(text, ms) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, ms || 2600);
+}
+
+/* ================= 调试/测试接口 ================= */
+window.__lab = {
+  setFreq: t => { freqT = t; emitHold = 0; updateScore(); },
+  setInt: t => { intT = t; updateScore(); },
+  step: dt => physics(dt),
+  get points() { return graphPts.map(p => ({ nu: p.nu, ke: p.ke })); },
+  get nu() { return nu(); },
+  get above() { return above(); },
+  get current() { return curSmooth; },
+  NU0
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

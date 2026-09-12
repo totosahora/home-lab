@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>波的干涉</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#0a1a2c; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(8,16,28,0.85); color:#7fd8ff; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:118px; left:50%; transform:translateX(-50%);
+    background:rgba(8,16,28,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  #tabs {
+    position:absolute; top:12px; left:14px; z-index:10; display:flex; gap:10px;
+  }
+  #tabs button {
+    font-size:18px; font-weight:bold; padding:10px 22px;
+    border-radius:24px; border:2px solid rgba(127,216,255,0.4);
+    background:rgba(8,16,28,0.85); color:#9fb6cc; cursor:pointer;
+  }
+  #tabs button.on { background:#1f6fa8; color:#fff; border-color:#7fd8ff; }
+  #tabs button:active { transform:scale(1.05); }
+  #panel {
+    position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+    background:rgba(8,16,28,0.85); border-radius:20px; z-index:10;
+    padding:12px 22px; display:flex; align-items:center; gap:26px;
+    color:#cfe4f5; font-size:16px; font-weight:bold; white-space:nowrap;
+    max-width:96vw; flex-wrap:wrap; justify-content:center;
+  }
+  #panel label { display:flex; align-items:center; gap:10px; }
+  #panel input[type=range] {
+    -webkit-appearance:none; appearance:none; width:170px; height:14px;
+    border-radius:7px; background:#33506e; outline:none; cursor:pointer;
+  }
+  #panel input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance:none; appearance:none; width:34px; height:34px;
+    border-radius:50%; background:#7fd8ff; border:3px solid #fff;
+    box-shadow:0 2px 6px rgba(0,0,0,0.5); cursor:pointer;
+  }
+  #panel input[type=range]::-moz-range-thumb {
+    width:30px; height:30px; border-radius:50%; background:#7fd8ff;
+    border:3px solid #fff; cursor:pointer;
+  }
+  #panel .chk { display:flex; align-items:center; gap:8px; cursor:pointer; }
+  #panel .chk input { width:26px; height:26px; accent-color:#1f6fa8; cursor:pointer; }
+  #panel .val { color:#ffd54a; min-width:80px; display:inline-block; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="tabs">
+  <button id="tabSrc" class="on">🌊 双波源</button>
+  <button id="tabSlit">〰️ 双缝</button>
+</div>
+<div id="scorebar"></div>
+<div id="hint"></div>
+<div id="panel"></div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const panel = document.getElementById("panel");
+let W = 0, H = 0, DPR = 1;
+let prevW = 0, prevH = 0;
+
+// 波高场用低分辨率离屏画布逐像素计算，再放大铺满全屏
+const SCALE = 3;
+let gw = 2, gh = 2;
+const off = document.createElement("canvas");
+const offCtx = off.getContext("2d");
+let imgData = null;
+
+function resize() {
+  prevW = W; prevH = H;
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  gw = Math.max(2, Math.round(W / SCALE));
+  gh = Math.max(2, Math.round(H / SCALE));
+  off.width = gw; off.height = gh;
+  imgData = offCtx.createImageData(gw, gh);
+  layout();
+  recompute();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+let mode = "src";           // src 双波源 | slit 双缝
+const V = 90;               // 波速 v (px/s)，恒定 → λ = v / f
+let freq = 1.2;             // 频率 Hz
+let phaseDeg = 0;           // 双波源模式：S₂ 超前相位（度）
+let showLines = false;      // 是否显示加强/减弱条纹线
+let simT = 0;
+
+let s1, s2;                 // 双波源位置
+let src;                    // 双缝模式：入射波源
+let xb = 0;                 // 挡板 x
+let slitA, slitB;           // 两条缝（y 可拖）
+let probe;                  // 测量点
+const WALL = 12;            // 挡板厚度
+
+let targets = [];           // 减弱线：{ds, found, foundAt}
+let antis = [];             // 加强线：ds 值
+let foundKeys = new Set();  // 参数变化后保留已找到的线
+let celebrated = false;
+
+const lambda = () => V / freq;
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+// 干涉焦点：双波源=两个波源；双缝=两个缝口
+const foci = () => (mode === "src" ? [s1, s2] : [slitA, slitB]);
+// 焦点处两波的相位差 φ₁−φ₂（双缝由几何决定）
+function phDiff() {
+  if (mode === "src") return -phaseDeg * Math.PI / 180;
+  const k = 2 * Math.PI / lambda();
+  return k * (dist(src, slitA) - dist(src, slitB));
+}
+const keyOf = ds => Math.round(ds / lambda() * 2) / 2;
+
+let initialized = false;
+function layout() {
+  if (!initialized) {
+    initialized = true;
+    const lam = lambda();
+    s1 = { x: W / 2 - 1.1 * lam, y: H * 0.48 };
+    s2 = { x: W / 2 + 1.1 * lam, y: H * 0.48 };
+    src = { x: W * 0.16, y: H * 0.48 };
+    xb = W * 0.42;
+    slitA = { x: xb, y: H * 0.48 - 1.1 * lam };
+    slitB = { x: xb, y: H * 0.48 + 1.1 * lam };
+    probe = { x: W * 0.72, y: H * 0.26 };
+  } else if (prevW > 0) {
+    const rx = W / prevW, ry = H / prevH;
+    for (const p of [s1, s2, src, slitA, slitB, probe]) { p.x *= rx; p.y *= ry; }
+    xb = W * 0.42; slitA.x = xb; slitB.x = xb;
+  }
+  clampAll();
+}
+function clampAll() {
+  for (const p of [s1, s2, probe]) {
+    p.x = Math.max(40, Math.min(W - 40, p.x));
+    p.y = Math.max(70, Math.min(H - 40, p.y));
+  }
+  src.x = Math.max(50, Math.min(xb - 70, src.x));
+  src.y = Math.max(70, Math.min(H - 40, src.y));
+  const y0 = 90, y1 = H - 60;
+  slitA.y = Math.max(y0, Math.min(y1 - 40, slitA.y));
+  slitB.y = Math.max(slitA.y + 40, Math.min(y1, slitB.y));
+  if (mode === "slit") probe.x = Math.max(xb + 40, probe.x);
+}
+
+/* ================= 物理：波高叠加 ================= */
+// 每点波高 = 两列圆形波之和  h = Σ A·sin(k·r − ωt + φ) · 衰减
+function renderField(t) {
+  const lam = lambda(), k = 2 * Math.PI / lam, w = 2 * Math.PI * freq;
+  const ph = phaseDeg * Math.PI / 180;
+  const rSA = mode === "slit" ? dist(src, slitA) : 0;
+  const rSB = mode === "slit" ? dist(src, slitB) : 0;
+  const xWall = xb - WALL / 2;
+  const data = imgData.data;
+  let p = 0;
+  for (let j = 0; j < gh; j++) {
+    const y = (j + 0.5) * SCALE;
+    for (let i = 0; i < gw; i++) {
+      const x = (i + 0.5) * SCALE;
+      let h = 0;
+      if (mode === "src") {
+        const r1 = Math.hypot(x - s1.x, y - s1.y);
+        const r2 = Math.hypot(x - s2.x, y - s2.y);
+        h = (Math.sin(k * r1 - w * t) / (1 + r1 * 0.006)
+           + Math.sin(k * r2 - w * t + ph) / (1 + r2 * 0.006)) * 0.5;
+      } else if (x < xWall) {
+        // 挡板左侧：只有入射波
+        const r = Math.hypot(x - src.x, y - src.y);
+        h = Math.sin(k * r - w * t) / (1 + r * 0.006) * 0.9;
+      } else {
+        // 挡板右侧：缝口作为子波源（相位 = 入射波到达缝口的相位）
+        const r1 = Math.hypot(x - slitA.x, y - slitA.y);
+        const r2 = Math.hypot(x - slitB.x, y - slitB.y);
+        h = (Math.sin(k * (r1 + rSA) - w * t) / (1 + r1 * 0.006)
+           + Math.sin(k * (r2 + rSB) - w * t) / (1 + r2 * 0.006)) * 0.55;
+      }
+      // 波高 → 颜色：波峰亮青、波谷暗黑、中间为水面蓝
+      const v = Math.tanh(1.7 * h);
+      let r, g, b;
+      if (v >= 0) { r = 14 + v * 186; g = 52 + v * 188; b = 92 + v * 163; }
+      else { const u = -v; r = 14 - u * 13; g = 52 - u * 46; b = 92 - u * 74; }
+      data[p] = r; data[p + 1] = g; data[p + 2] = b; data[p + 3] = 255;
+      p += 4;
+    }
+  }
+  offCtx.putImageData(imgData, 0, 0);
+}
+
+// 重算加强/减弱线：ΔΦ = k·Δs + (φ₁−φ₂)；加强 ΔΦ=2nπ，减弱 ΔΦ=(2n+1)π
+function recompute() {
+  const [f1, f2] = foci();
+  const d = dist(f1, f2);
+  const lam = lambda(), k = 2 * Math.PI / lam, ph = phDiff();
+  const oldAt = new Map(targets.map(t => [keyOf(t.ds), t.foundAt]));
+  targets = []; antis = [];
+  for (let n = -30; n <= 30; n++) {
+    const dsN = ((2 * n + 1) * Math.PI - ph) / k;
+    if (Math.abs(dsN) < d - 0.5) {
+      const key = keyOf(dsN);
+      targets.push({ ds: dsN, found: foundKeys.has(key), foundAt: oldAt.get(key) || null });
+    }
+    const dsA = (2 * n * Math.PI - ph) / k;
+    if (Math.abs(dsA) < d - 0.5) antis.push(dsA);
+  }
+  targets.sort((a, b) => a.ds - b.ds);
+  updateScorebar();
+  checkCelebrate();
+}
+
+function checkCelebrate() {
+  if (targets.length > 0 && targets.every(t => t.found)) {
+    if (!celebrated) {
+      celebrated = true;
+      fanfare();
+      showHint("🎉 太棒了！所有减弱线都找到了：Δs = (n+½)λ 处波峰遇上波谷，相互抵消！");
+      updateScorebar();
+    }
+  } else celebrated = false;
+}
+
+/* ================= 绘制 ================= */
+// 条纹线 = 以两焦点为焦点的双曲线（Δs 恒定），Δs=0 时为中垂线
+function traceLine(ds) {
+  const [f1, f2] = foci();
+  const cx = (f1.x + f2.x) / 2, cy = (f1.y + f2.y) / 2;
+  const d = dist(f1, f2);
+  const ux = (f2.x - f1.x) / d, uy = (f2.y - f1.y) / d;
+  const vx = -uy, vy = ux;
+  const diag = Math.hypot(W, H);
+  const a = Math.abs(ds) / 2, c = d / 2;
+  if (a < 1) return [[cx - vx * diag, cy - vy * diag], [cx + vx * diag, cy + vy * diag]];
+  const b = Math.sqrt(Math.max(1, c * c - a * a));
+  const sgn = ds > 0 ? 1 : -1;
+  const T = Math.acosh(diag / a + 1);
+  const pts = [];
+  for (let i = 0; i <= 64; i++) {
+    const t = -T + 2 * T * i / 64;
+    pts.push([cx + ux * sgn * a * Math.cosh(t) + vx * b * Math.sinh(t),
+              cy + uy * sgn * a * Math.cosh(t) + vy * b * Math.sinh(t)]);
+  }
+  return pts;
+}
+
+function strokePts(pts) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.stroke();
+}
+
+function drawLines() {
+  ctx.save();
+  if (mode === "slit") {   // 条纹只存在于挡板右侧
+    ctx.beginPath(); ctx.rect(xb + WALL / 2, 0, W, H); ctx.clip();
+  }
+  if (showLines) {
+    ctx.setLineDash([5, 7]);
+    ctx.strokeStyle = "rgba(127,216,255,0.5)"; ctx.lineWidth = 1.6;
+    for (const ds of antis) strokePts(traceLine(ds));
+    ctx.strokeStyle = "rgba(255,170,80,0.6)"; ctx.lineWidth = 2;
+    for (const t of targets) if (!t.found) strokePts(traceLine(t.ds));
+    ctx.setLineDash([]);
+  }
+  // 已找到的减弱线：金色高亮 + ✓ 标记
+  for (const t of targets) {
+    if (!t.found) continue;
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 4;
+    ctx.shadowColor = "rgba(255,213,74,0.8)"; ctx.shadowBlur = 12;
+    strokePts(traceLine(t.ds));
+    ctx.shadowBlur = 0;
+    if (t.foundAt) {
+      ctx.fillStyle = "#ffd54a"; ctx.font = "bold 22px sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("✓ 减弱", t.foundAt.x, t.foundAt.y - 14);
+    }
+  }
+  ctx.restore();
+}
+
+function drawBarrier() {
+  ctx.fillStyle = "#3d4a5c";
+  ctx.fillRect(xb - WALL / 2, 0, WALL, slitA.y - 16);
+  ctx.fillRect(xb - WALL / 2, slitA.y + 16, WALL, slitB.y - slitA.y - 32);
+  ctx.fillRect(xb - WALL / 2, slitB.y + 16, WALL, H - slitB.y - 16);
+  ctx.strokeStyle = "rgba(127,216,255,0.5)"; ctx.lineWidth = 2;
+  ctx.strokeRect(xb - WALL / 2, -4, WALL, slitA.y - 12);
+  ctx.strokeRect(xb - WALL / 2, slitA.y + 16, WALL, slitB.y - slitA.y - 32);
+  ctx.strokeRect(xb - WALL / 2, slitB.y + 16, WALL, H - slitB.y - 12);
+  ctx.fillStyle = "#9fb6cc"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("挡板", xb, 26);
+  // 缝口（可上下拖动）
+  for (const [s, name] of [[slitA, "缝₁"], [slitB, "缝₂"]]) {
+    ctx.beginPath(); ctx.arc(s.x, s.y, 13, 0, 7);
+    ctx.fillStyle = "#ffd54a"; ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.fillStyle = "#5a3d00"; ctx.font = "bold 13px sans-serif";
+    ctx.fillText(name, s.x, s.y + 4);
+  }
+}
+
+function drawSource(p, name, phase) {
+  const pulse = 15 + 3 * Math.sin(2 * Math.PI * freq * simT + phase);
+  ctx.beginPath(); ctx.arc(p.x, p.y, pulse + 8, 0, 7);
+  ctx.fillStyle = "rgba(255,138,128,0.25)"; ctx.fill();
+  ctx.beginPath(); ctx.arc(p.x, p.y, pulse, 0, 7);
+  const g = ctx.createRadialGradient(p.x - 4, p.y - 5, 2, p.x, p.y, pulse);
+  g.addColorStop(0, "#ffc4c0"); g.addColorStop(1, "#e0483e");
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(name, p.x, p.y + 5);
+}
+
+function drawProbe() {
+  const [f1, f2] = foci();
+  const r1 = dist(probe, f1), r2 = dist(probe, f2);
+  const ds = r1 - r2, lam = lambda();
+  // 到两焦点的测量虚线
+  ctx.setLineDash([7, 7]); ctx.lineWidth = 2;
+  ctx.strokeStyle = "rgba(255,138,128,0.85)";
+  ctx.beginPath(); ctx.moveTo(f1.x, f1.y); ctx.lineTo(probe.x, probe.y); ctx.stroke();
+  ctx.strokeStyle = "rgba(179,157,255,0.85)";
+  ctx.beginPath(); ctx.moveTo(f2.x, f2.y); ctx.lineTo(probe.x, probe.y); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+  ctx.fillStyle = "#ff8a80";
+  ctx.fillText("r₁", (f1.x + probe.x) / 2, (f1.y + probe.y) / 2 - 8);
+  ctx.fillStyle = "#b39dff";
+  ctx.fillText("r₂", (f2.x + probe.x) / 2, (f2.y + probe.y) / 2 - 8);
+  // 测量点十字
+  ctx.beginPath(); ctx.arc(probe.x, probe.y, 13, 0, 7);
+  ctx.fillStyle = "rgba(255,213,74,0.9)"; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(probe.x - 20, probe.y); ctx.lineTo(probe.x + 20, probe.y);
+  ctx.moveTo(probe.x, probe.y - 20); ctx.lineTo(probe.x, probe.y + 20);
+  ctx.strokeStyle = "rgba(255,213,74,0.9)"; ctx.lineWidth = 2; ctx.stroke();
+  // 判定：ΔΦ = k·Δs + (φ₁−φ₂)，偶数倍 π → 加强，奇数倍 π → 减弱
+  const q = (2 * Math.PI / lam * ds + phDiff()) / Math.PI;
+  const m = Math.round(q);
+  let verdict, vc;
+  if (Math.abs(q - m) < 0.25) {
+    if (m % 2 === 0) { verdict = "加强区（亮纹）Δs ≈ nλ"; vc = "#7fd8ff"; }
+    else { verdict = "减弱区（暗纹）Δs ≈ (n+½)λ"; vc = "#ffb74d"; }
+  } else { verdict = "介于加强和减弱之间"; vc = "#9fb6cc"; }
+  // 信息框
+  const lines = [
+    `r₁ = ${Math.round(r1)} px    r₂ = ${Math.round(r2)} px`,
+    `Δs = r₁ − r₂ = ${ds >= 0 ? "+" : ""}${Math.round(ds)} px ≈ ${(ds / lam).toFixed(2)} λ`,
+    verdict,
+  ];
+  ctx.font = "bold 15px sans-serif";
+  const bw = Math.max(...lines.map(s => ctx.measureText(s).width)) + 30;
+  let bx = probe.x + 26, by = probe.y - 66;
+  if (bx + bw > W - 8) bx = probe.x - 26 - bw;
+  if (by < 8) by = probe.y + 26;
+  ctx.fillStyle = "rgba(8,16,28,0.88)";
+  roundRect(bx, by, bw, 66, 10, true);
+  ctx.strokeStyle = "rgba(255,213,74,0.6)"; ctx.lineWidth = 1.5;
+  roundRect(bx, by, bw, 66, 10, false);
+  ctx.textAlign = "left";
+  lines.forEach((s, i) => {
+    ctx.fillStyle = i === 2 ? vc : "#cfe4f5";
+    ctx.fillText(s, bx + 15, by + 22 + i * 21);
+  });
+}
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill(); else ctx.stroke();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#0a1a2c";
+  ctx.fillRect(0, 0, W, H);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(off, 0, 0, gw, gh, 0, 0, W, H);
+  if (mode === "slit") drawBarrier();
+  drawLines();
+  if (mode === "src") {
+    drawSource(s1, "S₁", 0);
+    drawSource(s2, "S₂", phaseDeg * Math.PI / 180);
+  } else {
+    drawSource(src, "S", 0);
+    ctx.fillStyle = "#9fb6cc"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("（可拖动）", src.x, src.y + 40);
+  }
+  drawProbe();
+}
+
+/* ================= 交互 ================= */
+let drag = null;   // probe | s1 | s2 | src | slitA | slitB
+const near = (p, x, y, r) => Math.hypot(x - p.x, y - p.y) < r;
+
+canvas.addEventListener("pointerdown", e => {
+  unlockAudio();
+  const x = e.clientX, y = e.clientY;
+  if (near(probe, x, y, 32)) drag = "probe";
+  else if (mode === "src" && near(s1, x, y, 34)) drag = "s1";
+  else if (mode === "src" && near(s2, x, y, 34)) drag = "s2";
+  else if (mode === "slit" && near(src, x, y, 34)) drag = "src";
+  else if (mode === "slit" && near(slitA, x, y, 30)) drag = "slitA";
+  else if (mode === "slit" && near(slitB, x, y, 30)) drag = "slitB";
+  if (drag) {
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    pop(660);
+  } else {
+    tryFind(x, y);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const x = e.clientX, y = e.clientY;
+  if (drag === "probe") { probe.x = x; probe.y = y; }
+  else if (drag === "s1") { s1.x = x; s1.y = y; }
+  else if (drag === "s2") { s2.x = x; s2.y = y; }
+  else if (drag === "src") { src.x = x; src.y = y; }
+  else if (drag === "slitA") slitA.y = y;
+  else if (drag === "slitB") slitB.y = y;
+  clampAll();
+  if (drag !== "probe") recompute();
+});
+window.addEventListener("pointerup", () => {
+  if (drag) { drag = null; pop(440); }
+});
+
+// 任务：点击暗纹，找出所有减弱线
+function tryFind(x, y) {
+  if (mode === "slit" && x < xb + WALL) {
+    showHint("双缝右侧才是干涉区，去右边找暗纹吧！");
+    pop(240);
+    return;
+  }
+  const [f1, f2] = foci();
+  const ds = Math.hypot(x - f1.x, y - f1.y) - Math.hypot(x - f2.x, y - f2.y);
+  const lam = lambda();
+  let best = null, bd = 1e9;
+  for (const t of targets) { const dd = Math.abs(t.ds - ds); if (dd < bd) { bd = dd; best = t; } }
+  if (best && bd < 0.22 * lam) {
+    if (best.found) {
+      showHint("这条减弱线已经找到啦 ✓");
+      pop(500);
+    } else {
+      best.found = true;
+      best.foundAt = { x, y };
+      foundKeys.add(keyOf(best.ds));
+      ding();
+      showHint(`✅ 找到一条减弱线！此处 Δs ≈ ${(best.ds / lam).toFixed(1)}λ = (n+½)λ，波峰遇波谷！`);
+      updateScorebar();
+      checkCelebrate();
+    }
+  } else {
+    showHint(`这里 Δs/λ ≈ ${(ds / lam).toFixed(2)}，不是 (n+½)；减弱线在最暗的纹上！`);
+    pop(300);
+  }
+}
+
+/* ---- 模式切换与面板 ---- */
+function setMode(m) {
+  mode = m;
+  document.getElementById("tabSrc").classList.toggle("on", m === "src");
+  document.getElementById("tabSlit").classList.toggle("on", m === "slit");
+  clampAll();
+  buildPanel();
+  recompute();
+  if (m === "src") showHint("两个波源 S₁、S₂ 可拖动；点击最暗的纹，找出所有减弱线！");
+  else showHint("波穿过双缝变成两个子波源；在挡板右侧找出所有减弱线！");
+  pop(700);
+}
+document.getElementById("tabSrc").addEventListener("click", () => setMode("src"));
+document.getElementById("tabSlit").addEventListener("click", () => setMode("slit"));
+
+function buildPanel() {
+  const chkHtml = `<label class="chk"><input type="checkbox" id="cL" ${showLines ? "checked" : ""}> 显示条纹线</label>`;
+  if (mode === "src") {
+    panel.innerHTML = `
+      <label>频率 f <input type="range" id="sF" min="0.5" max="3" step="0.05" value="${freq}"><span class="val" id="vF"></span></label>
+      <label>相位差 Δφ <input type="range" id="sP" min="0" max="360" step="5" value="${phaseDeg}"><span class="val" id="vP"></span></label>
+      ${chkHtml}`;
+    const sF = document.getElementById("sF"), sP = document.getElementById("sP");
+    const upd = () => {
+      freq = parseFloat(sF.value);
+      phaseDeg = parseFloat(sP.value);
+      document.getElementById("vF").textContent = freq.toFixed(2) + " Hz";
+      document.getElementById("vP").textContent = phaseDeg + "°";
+      recompute();
+    };
+    sF.addEventListener("input", upd);
+    sP.addEventListener("input", upd);
+    upd();
+  } else {
+    panel.innerHTML = `
+      <label>频率 f <input type="range" id="sF" min="0.5" max="3" step="0.05" value="${freq}"><span class="val" id="vF"></span></label>
+      <span style="font-size:14px;color:#9fb6cc">缝口与波源可拖动（居中时两缝同相）</span>
+      ${chkHtml}`;
+    const sF = document.getElementById("sF");
+    const upd = () => {
+      freq = parseFloat(sF.value);
+      document.getElementById("vF").textContent = freq.toFixed(2) + " Hz";
+      recompute();
+    };
+    sF.addEventListener("input", upd);
+    upd();
+  }
+  document.getElementById("cL").addEventListener("change", e => {
+    showLines = e.target.checked;
+    if (showLines) showHint("蓝虚线=加强（Δs=nλ），橙虚线=减弱（Δs=(n+½)λ）——照着橙线点！");
+  });
+}
+
+function updateScorebar() {
+  const lam = lambda();
+  const total = targets.length, found = targets.filter(t => t.found).length;
+  if (total === 0) {
+    scorebar.textContent = `λ = v/f ≈ ${Math.round(lam)} px ｜ 当前没有减弱线：增大 f 或拉远波源试试`;
+  } else if (found === total) {
+    scorebar.textContent = `🎉 全部 ${total} 条减弱线找到！减弱条件：Δs = (n+½)λ`;
+  } else {
+    scorebar.textContent = `λ = v/f ≈ ${Math.round(lam)} px ｜ 任务：找到所有减弱线 ${found} / ${total}`;
+  }
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function unlockAudio() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === "suspended") actx.resume();
+  } catch (e) {}
+}
+function tone(freq, dur, vol, type) {
+  try {
+    unlockAudio();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function ding() {
+  tone(880, 0.4, 0.16);
+  setTimeout(() => tone(1320, 0.35, 0.12), 120);
+}
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 4200);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+// 测试钩子（不影响游戏）
+window.__wi = {
+  targets: () => targets.map(t => ({ ds: t.ds, found: t.found })),
+  foci: () => foci().map(p => ({ x: p.x, y: p.y })),
+  lambda, mode: () => mode,
+};
+
+/* ================= 主循环 ================= */
+resize();
+buildPanel();
+updateScorebar();
+showHint("拖动测量点 📍 看 Δs 与 λ 的关系；点击最暗的纹，找出所有减弱线！");
+
+renderField(0);
+draw();
+
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  simT += dt;
+  renderField(simT);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

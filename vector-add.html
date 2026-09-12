@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>向量加法实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#1b2432; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,28,0.8); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,28,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  .btnGroup { position:absolute; z-index:10; display:flex; gap:8px; }
+  #viewBtns { top:12px; left:12px; }
+  #modeBtns { top:12px; right:12px; }
+  .btnGroup button {
+    font-size:14px; font-weight:bold; padding:8px 14px;
+    border-radius:20px; border:2px solid rgba(255,255,255,0.25);
+    background:rgba(10,16,28,0.7); color:#cfe0ff; cursor:pointer;
+  }
+  .btnGroup button.on { background:#3a86d8; border-color:#3a86d8; color:#fff; }
+  .btnGroup button:active { transform:scale(1.06); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">自由沙盒</div>
+<div class="btnGroup" id="viewBtns">
+  <button data-v="para" class="on">平行四边形</button>
+  <button data-v="tri">三角形法则</button>
+  <button data-v="num">数值坐标</button>
+</div>
+<div class="btnGroup" id="modeBtns">
+  <button data-m="sandbox" class="on">自由沙盒</button>
+  <button data-m="challenge">挑战关</button>
+</div>
+<div id="hint">拖动蓝色向量 b 的中间可以平移它，拖动箭头端点可以改变方向和长度！</div>
+<div id="winPanel">
+  <div class="msg">🎉 五关全部通过！<br>你是向量加法小达人！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 网格与视图 ================= */
+// 数学坐标系：x 向右，y 向上；1 格 = view.s 像素；原点在屏幕中央
+const view = { s: 48, ox: 0, oy: 0 };
+function fitView() {
+  view.s = Math.max(34, Math.min(60, Math.min(W / 22, H / 15)));
+  view.ox = W / 2;
+  view.oy = H / 2;
+}
+function toWorld(sx, sy) { return [(sx - view.ox) / view.s, (view.oy - sy) / view.s]; }
+function toScreen(wx, wy) { return [view.ox + wx * view.s, view.oy - wy * view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 场景数据 ================= */
+// 向量用分量表示；pos 是 b 的起点（尾），a 永远从原点出发
+const COL_A = "#ff5252", COL_B = "#40a0ff", COL_SUM = "#2fd47a", COL_C = "#ffd54a";
+const GRID_LIM = 12;
+let mode = "sandbox";       // sandbox | challenge
+let viewMode = "para";      // para | tri | num
+let a = { x: 3, y: 2 };     // 向量 a（红）
+let b = { x: 1, y: 4 };     // 向量 b（蓝）
+let bTail = { x: 0, y: 0 }; // b 的尾端位置（平移用）
+let targetC = null;         // 挑战目标向量 c
+let levelIdx = 0;
+let solved = false;         // 当前关是否已拼成（防重复触发）
+
+const LEVELS = [
+  { a:[3,2],  b:[1,1],  tail:[-5,-3], c:[4,6]  },
+  { a:[2,4],  b:[-1,2], tail:[4,-4],  c:[6,3]  },
+  { a:[-3,2], b:[2,-1], tail:[5,4],   c:[2,-4] },
+  { a:[4,-2], b:[-2,-2],tail:[-6,4],  c:[-1,-6]},
+  { a:[-2,-3],b:[1,4],  tail:[3,5],   c:[3,5]  },
+];
+
+function setSandbox() {
+  mode = "sandbox";
+  a = { x: 3, y: 2 };
+  b = { x: 1, y: 4 };
+  bTail = { x: 0, y: 0 };
+  targetC = null;
+  solved = false;
+  winPanel.style.display = "none";
+  scorebar.textContent = "自由沙盒 · 随意探索";
+  showHint("切换上方三种视图，看看 a + b 是怎么拼出来的！");
+  syncBtns();
+}
+
+function setLevel(i) {
+  mode = "challenge";
+  levelIdx = i;
+  const L = LEVELS[i];
+  a = { x: L.a[0], y: L.a[1] };
+  b = { x: L.b[0], y: L.b[1] };
+  bTail = { x: L.tail[0], y: L.tail[1] };
+  targetC = { x: L.c[0], y: L.c[1] };
+  solved = false;
+  winPanel.style.display = "none";
+  scorebar.textContent = `挑战 第 ${i + 1} / ${LEVELS.length} 关`;
+  showHint("拖动蓝色向量 b，让 a + b 等于金色目标 c！");
+  syncBtns();
+}
+
+function syncBtns() {
+  document.querySelectorAll("#viewBtns button").forEach(btn =>
+    btn.classList.toggle("on", btn.dataset.v === viewMode));
+  document.querySelectorAll("#modeBtns button").forEach(btn =>
+    btn.classList.toggle("on", btn.dataset.m === mode));
+}
+
+/* ================= 交互（拖拽） ================= */
+// 拖 b 的中间 = 平移；拖 b 箭头端点 = 改方向长度；沙盒里 a 的端点也可拖
+let drag = null;   // {kind:"bBody"|"bTip"|"aTip", dx, dy}
+const HIT_PX = 18;
+
+function distToSeg(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const L2 = dx * dx + dy * dy;
+  let t = L2 === 0 ? 0 : ((px - x1) * dx + (py - y1) * dy) / L2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+function clampVec(v) {
+  v.x = Math.max(-GRID_LIM, Math.min(GRID_LIM, v.x));
+  v.y = Math.max(-GRID_LIM, Math.min(GRID_LIM, v.y));
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex" || solved) return;
+  const [sx, sy] = [e.clientX, e.clientY];
+  const bTip = toScreen(bTail.x + b.x, bTail.y + b.y);
+  const bTailS = toScreen(bTail.x, bTail.y);
+  const aTip = toScreen(a.x, a.y);
+  hintEl.style.opacity = "0";
+  // 1) b 端点手柄
+  if (Math.hypot(sx - bTip[0], sy - bTip[1]) < HIT_PX) {
+    drag = { kind: "bTip" };
+  } else if (mode === "sandbox" && Math.hypot(sx - aTip[0], sy - aTip[1]) < HIT_PX) {
+    drag = { kind: "aTip" };
+  } else if (distToSeg(sx, sy, bTailS[0], bTailS[1], bTip[0], bTip[1]) < HIT_PX * 0.8) {
+    const [wx, wy] = toWorld(sx, sy);
+    drag = { kind: "bBody", dx: bTail.x - wx, dy: bTail.y - wy };
+  }
+  if (drag) { canvas.setPointerCapture(e.pointerId); pop(700); }
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const [wx, wy] = toWorld(e.clientX, e.clientY);
+  if (drag.kind === "bTip") {
+    b.x = Math.round(wx - bTail.x);
+    b.y = Math.round(wy - bTail.y);
+    clampVec(b);
+  } else if (drag.kind === "aTip") {
+    a.x = Math.round(wx);
+    a.y = Math.round(wy);
+    clampVec(a);
+  } else if (drag.kind === "bBody") {
+    bTail.x = Math.max(-GRID_LIM, Math.min(GRID_LIM, Math.round(wx + drag.dx)));
+    bTail.y = Math.max(-GRID_LIM, Math.min(GRID_LIM, Math.round(wy + drag.dy)));
+  }
+  checkWin();
+});
+
+window.addEventListener("pointerup", () => {
+  if (drag) { pop(500); drag = null; }
+});
+
+/* ================= 挑战判定 ================= */
+function checkWin() {
+  if (mode !== "challenge" || solved || !targetC) return;
+  if (a.x + b.x === targetC.x && a.y + b.y === targetC.y) {
+    solved = true;
+    drag = null;
+    fanfare();
+    showHint(`🎉 拼成功！a + b = (${targetC.x}, ${targetC.y}) = c`);
+    if (levelIdx + 1 >= LEVELS.length) {
+      setTimeout(() => { winPanel.style.display = "flex"; fanfare(); }, 1500);
+    } else {
+      setTimeout(() => setLevel(levelIdx + 1), 1800);
+    }
+  }
+}
+
+/* ================= 绘制 ================= */
+function drawGrid() {
+  const [lx, ty] = toWorld(0, 0);          // 左上世界坐标
+  const [rx, by] = toWorld(W, H);          // 右下
+  const x0 = Math.floor(lx), x1 = Math.ceil(rx);
+  const y0 = Math.floor(by), y1 = Math.ceil(ty);
+  ctx.lineWidth = 1;
+  for (let x = x0; x <= x1; x++) {
+    const [sx] = toScreen(x, 0);
+    ctx.strokeStyle = x === 0 ? "rgba(255,255,255,0.55)" : "rgba(255,255,255,0.10)";
+    ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, H); ctx.stroke();
+  }
+  for (let y = y0; y <= y1; y++) {
+    const [, sy] = toScreen(0, y);
+    ctx.strokeStyle = y === 0 ? "rgba(255,255,255,0.55)" : "rgba(255,255,255,0.10)";
+    ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(W, sy); ctx.stroke();
+  }
+  // 刻度数字（每 2 格）
+  ctx.fillStyle = "rgba(255,255,255,0.45)";
+  ctx.font = "11px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let x = x0; x <= x1; x++) {
+    if (x === 0 || x % 2 !== 0) continue;
+    const [sx, sy0] = toScreen(x, 0);
+    ctx.fillText(x, sx, sy0 + 4);
+  }
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let y = y0; y <= y1; y++) {
+    if (y === 0 || y % 2 !== 0) continue;
+    const [sx0, sy] = toScreen(0, y);
+    ctx.fillText(y, sx0 - 6, sy);
+  }
+  // 原点
+  const [ox, oy] = toScreen(0, 0);
+  ctx.beginPath(); ctx.arc(ox, oy, 4, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.8)"; ctx.fill();
+  ctx.font = "bold 13px sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillStyle = "rgba(255,255,255,0.7)";
+  ctx.fillText("O", ox + 8, oy + 6);
+}
+
+// 画箭头（世界坐标），dash=true 画虚线
+function drawArrow(x1, y1, x2, y2, color, width, dash) {
+  const [sx1, sy1] = toScreen(x1, y1);
+  const [sx2, sy2] = toScreen(x2, y2);
+  const len = Math.hypot(sx2 - sx1, sy2 - sy1);
+  ctx.save();
+  if (dash) ctx.setLineDash([9, 8]);
+  ctx.strokeStyle = color; ctx.lineWidth = width;
+  ctx.beginPath(); ctx.moveTo(sx1, sy1); ctx.lineTo(sx2, sy2); ctx.stroke();
+  ctx.setLineDash([]);
+  if (len > 14) {
+    const ang = Math.atan2(sy2 - sy1, sx2 - sx1);
+    const hl = Math.min(16, 9 + width);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(sx2, sy2);
+    ctx.lineTo(sx2 - hl * Math.cos(ang - 0.42), sy2 - hl * Math.sin(ang - 0.42));
+    ctx.lineTo(sx2 - hl * Math.cos(ang + 0.42), sy2 - hl * Math.sin(ang + 0.42));
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// 向量旁边的标签，如 a=(3,2)
+function drawLabel(text, wx, wy, color, dxPx, dyPx) {
+  const [sx, sy] = toScreen(wx, wy);
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const w = ctx.measureText(text).width + 14;
+  ctx.fillStyle = "rgba(10,16,28,0.75)";
+  roundRect(sx + dxPx - w / 2, sy + dyPx - 12, w, 24, 12, true);
+  ctx.fillStyle = color;
+  ctx.fillText(text, sx + dxPx, sy + dyPx + 1);
+}
+
+function drawHandle(wx, wy, color) {
+  const [sx, sy] = toScreen(wx, wy);
+  ctx.beginPath(); ctx.arc(sx, sy, 11, 0, 7);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = "#fff"; ctx.stroke();
+}
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+// 数值坐标视图的大面板
+function drawNumPanel() {
+  const lines = [
+    { t: `a = (${a.x}, ${a.y})`, c: COL_A },
+    { t: `b = (${b.x}, ${b.y})`, c: COL_B },
+    { t: `a + b = (${a.x} + ${b.x}, ${a.y} + ${b.y}) = (${a.x + b.x}, ${a.y + b.y})`, c: COL_SUM },
+  ];
+  if (targetC) lines.push({ t: `目标 c = (${targetC.x}, ${targetC.y})`, c: COL_C });
+  ctx.font = "bold 20px sans-serif";
+  let pw = 0;
+  for (const l of lines) pw = Math.max(pw, ctx.measureText(l.t).width);
+  pw += 44;
+  const ph = lines.length * 34 + 24;
+  const px = (W - pw) / 2, py = 62;
+  ctx.fillStyle = "rgba(10,16,28,0.82)";
+  roundRect(px, py, pw, ph, 16, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.2)"; ctx.lineWidth = 2;
+  roundRect(px, py, pw, ph, 16, false); ctx.stroke();
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  lines.forEach((l, i) => {
+    ctx.fillStyle = l.c;
+    ctx.fillText(l.t, W / 2, py + 12 + 17 + i * 34);
+  });
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#1b2432";
+  ctx.fillRect(0, 0, W, H);
+  drawGrid();
+
+  const sx = a.x + b.x, sy = a.y + b.y;   // 和向量分量
+  const bTip = { x: bTail.x + b.x, y: bTail.y + b.y };
+
+  // 目标 c（挑战模式）
+  if (targetC) {
+    drawArrow(0, 0, targetC.x, targetC.y, COL_C, 4, true);
+    drawLabel(`c=(${targetC.x},${targetC.y})`, targetC.x, targetC.y, COL_C, 0, -26);
+  }
+
+  // 构造线（三种法则视图）
+  if (viewMode === "para") {
+    // 平行四边形：把 b 虚线拷贝到原点、a 虚线拷贝到 b 的端点
+    drawArrow(0, 0, b.x, b.y, "rgba(64,160,255,0.55)", 3, true);
+    drawArrow(a.x, a.y, sx, sy, "rgba(64,160,255,0.55)", 3, true);
+    drawArrow(b.x, b.y, sx, sy, "rgba(255,82,82,0.55)", 3, true);
+    drawArrow(0, 0, sx, sy, COL_SUM, 4, false);
+    drawLabel(`a+b=(${sx},${sy})`, sx, sy, COL_SUM, 0, 24);
+  } else if (viewMode === "tri") {
+    // 三角形法则：b 的虚线拷贝接到 a 的端点（首尾相接）
+    drawArrow(a.x, a.y, sx, sy, "rgba(64,160,255,0.55)", 3, true);
+    drawArrow(0, 0, sx, sy, COL_SUM, 4, false);
+    drawLabel(`a+b=(${sx},${sy})`, sx, sy, COL_SUM, 0, 24);
+  }
+
+  // 向量 a（红，固定从原点）
+  drawArrow(0, 0, a.x, a.y, COL_A, 5, false);
+  drawLabel(`a=(${a.x},${a.y})`, a.x / 2, a.y / 2, COL_A, -40, 0);
+  if (mode === "sandbox") drawHandle(a.x, a.y, COL_A);
+
+  // 向量 b（蓝，可拖动）
+  drawArrow(bTail.x, bTail.y, bTip.x, bTip.y, COL_B, 5, false);
+  drawLabel(`b=(${b.x},${b.y})`, bTail.x + b.x / 2, bTail.y + b.y / 2, COL_B, 40, 0);
+  if (!solved) drawHandle(bTip.x, bTip.y, COL_B);
+
+  if (viewMode === "num") drawNumPanel();
+}
+
+/* ================= 主循环 ================= */
+function loop() {
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+document.querySelectorAll("#viewBtns button").forEach(btn =>
+  btn.addEventListener("click", () => { viewMode = btn.dataset.v; syncBtns(); pop(880); }));
+document.querySelectorAll("#modeBtns button").forEach(btn =>
+  btn.addEventListener("click", () => {
+    if (btn.dataset.m === "sandbox") setSandbox(); else setLevel(0);
+    pop(880);
+  }));
+document.getElementById("replayBtn").addEventListener("click", () => { setLevel(0); pop(880); });
+setSandbox();
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

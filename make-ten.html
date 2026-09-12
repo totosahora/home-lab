@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>凑十大作战</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#16224a; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,40,0.8); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; top:62px; left:50%; transform:translateX(-50%);
+    background:rgba(10,16,40,0.8); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  @media (max-width:520px) {
+    #scorebar { font-size:14px; padding:7px 12px; }
+    #hint { font-size:13px; padding:7px 14px; top:56px; }
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">⭐ 0 / 5 · 共收集 0 颗</div>
+<div id="hint">把两个能凑成 10 的泡泡撞在一起！</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+let R = 32;                 // 泡泡半径（随屏幕自适应，新泡泡生效）
+let bgStars = [];           // 夜空背景星星
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  R = Math.max(26, Math.min(38, Math.round(Math.min(W, H) / 15)));
+  bgStars = [];
+  for (let i = 0; i < 70; i++)
+    bgStars.push({ x: Math.random() * W, y: Math.random() * H * 0.7, r: 0.6 + Math.random() * 1.6, tw: Math.random() * 7 });
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 游戏状态 ================= */
+const COLORS = ["#ff8a8a", "#ffb56b", "#ffe066", "#9be38a", "#7ad9c2", "#7fb8ff", "#b59bff", "#ff9ad5", "#8ad0e8"];
+// 3x3 骰子/多米诺点数图案（1-9）
+const PIPS = {
+  1: [[0,0]],
+  2: [[-1,-1],[1,1]],
+  3: [[-1,-1],[0,0],[1,1]],
+  4: [[-1,-1],[1,-1],[-1,1],[1,1]],
+  5: [[-1,-1],[1,-1],[0,0],[-1,1],[1,1]],
+  6: [[-1,-1],[1,-1],[-1,0],[1,0],[-1,1],[1,1]],
+  7: [[-1,-1],[1,-1],[-1,0],[0,0],[1,0],[-1,1],[1,1]],
+  8: [[-1,-1],[0,-1],[1,-1],[-1,0],[1,0],[-1,1],[0,1],[1,1]],
+  9: [[-1,-1],[0,-1],[1,-1],[-1,0],[0,0],[1,0],[-1,1],[0,1],[1,1]]
+};
+const JAR = { x:16, y:12, w:92, h:112 };        // 左上角星星收集罐
+const MAX_BUBBLES = 12;                          // 场上泡泡上限（同时是"太挤"阈值）
+
+let bubbles = [];        // {x, y, vx, vy, r, n, color, wob, shake, landed, grabbed, failCd, failWith}
+let flying = [];         // 飞入罐中的金色星星 {x, y, t, phase}
+let sparkles = [];       // 合并庆祝金粉 {x, y, vx, vy, life, maxLife}
+let fireworks = [];      // 烟花粒子 {x, y, vx, vy, life, maxLife, hue}
+let grabbedB = null;     // 正被拖动的泡泡
+let grabDX = 0, grabDY = 0;
+let ptrSamples = [];     // 指针采样（松手抛出用）
+let starsCollected = 0;
+let spawnT = 0.5;
+let jarBounce = 0;       // 罐子弹跳动画计时
+let crowdHintAt = 0;     // "太挤啦"提示节流
+
+function spawnBubble(n, x, y) {
+  n = n || (1 + Math.floor(Math.random() * 9));
+  if (x === undefined) {
+    x = 60 + Math.random() * Math.max(1, W - 120);
+    for (let tries = 0; tries < 6; tries++) {   // 尽量避免叠在别的泡泡上出生
+      let ok = true;
+      for (const b of bubbles) if (b.y < 120 && Math.abs(b.x - x) < b.r * 2.2) { ok = false; break; }
+      if (ok) break;
+      x = 60 + Math.random() * Math.max(1, W - 120);
+    }
+  }
+  bubbles.push({
+    x, y: y === undefined ? -50 : y, vx: 0, vy: 0, r: R, n,
+    color: COLORS[(n - 1) % COLORS.length],
+    wob: Math.random() * 7, shake: 0, landed: false, grabbed: false, failCd: 0, failWith: null
+  });
+}
+function jarMouth() { return [JAR.x + JAR.w / 2, JAR.y + 14]; }
+function updateScore() {
+  scorebar.textContent = `⭐ ${starsCollected % 5} / 5 · 共收集 ${starsCollected} 颗`;
+}
+
+/* ================= 物理 ================= */
+const GRAV = 260;          // 下落加速度（缓慢飘落）
+const MAX_FALL = 170;      // 最大下落速度
+
+function physics(dt) {
+  // 生成新泡泡
+  spawnT -= dt;
+  if (spawnT <= 0) {
+    if (bubbles.length < MAX_BUBBLES) spawnBubble();
+    spawnT = 2.2;
+  }
+
+  for (const b of bubbles) {
+    b.wob += dt;
+    if (b.shake > 0) b.shake -= dt;
+    if (b.failCd > 0) b.failCd -= dt;
+    if (b.grabbed) continue;             // 被抓着的泡泡由指针控制
+    b.vy = Math.min(MAX_FALL, b.vy + GRAV * dt);
+    b.vx *= Math.max(0, 1 - 1.5 * dt);   // 空气阻力
+    b.x += b.vx * dt + Math.sin(b.wob * 2) * 8 * dt;   // 轻轻摇摆
+    b.y += b.vy * dt;
+    // 左右墙
+    if (b.x < b.r) { b.x = b.r; b.vx = Math.abs(b.vx) * 0.4; }
+    if (b.x > W - b.r) { b.x = W - b.r; b.vx = -Math.abs(b.vx) * 0.4; }
+    // 地面
+    if (b.y > H - b.r) {
+      b.y = H - b.r;
+      if (Math.abs(b.vy) > 60) { b.vy = -b.vy * 0.25; pop(300 + b.n * 30); }
+      else b.vy = 0;
+      b.vx *= 0.9;
+      b.landed = true;
+    }
+  }
+
+  // 拖动撞击判定（先于位置分离，避免目标泡泡被推走）
+  if (grabbedB) {
+    for (const o of bubbles) {
+      if (o === grabbedB) continue;
+      const d = Math.hypot(o.x - grabbedB.x, o.y - grabbedB.y);
+      if (d < (o.r + grabbedB.r) * 0.85) {
+        if (o.n + grabbedB.n === 10) { mergeBubbles(grabbedB, o); break; }
+        if (grabbedB.failCd <= 0 || grabbedB.failWith !== o) bounceApart(grabbedB, o);
+      }
+    }
+  }
+
+  // 泡泡间碰撞：位置分离 + 法向速度衰减（稳定堆积）；被抓取的泡泡不参与
+  for (let iter = 0; iter < 3; iter++) {
+    for (let i = 0; i < bubbles.length; i++) {
+      const a = bubbles[i];
+      if (a.grabbed) continue;
+      for (let j = i + 1; j < bubbles.length; j++) {
+        const c = bubbles[j];
+        if (c.grabbed) continue;
+        const dx = c.x - a.x, dy = c.y - a.y;
+        const d = Math.hypot(dx, dy), rs = a.r + c.r;
+        if (d > 0 && d < rs) {
+          const nx = dx / d, ny = dy / d, ov = (rs - d) / 2 + 0.3;
+          a.x -= nx * ov; a.y -= ny * ov;
+          c.x += nx * ov; c.y += ny * ov;
+          const va = a.vx * nx + a.vy * ny, vc = c.vx * nx + c.vy * ny;
+          if (va - vc > 0) {
+            const imp = (va - vc) * 0.5;
+            a.vx -= imp * nx; a.vy -= imp * ny;
+            c.vx += imp * nx; c.vy += imp * ny;
+          }
+          // 落在已落地的泡泡上 → 也算落地（计入堆积）
+          if (a.landed || c.landed) { a.landed = true; c.landed = true; }
+        }
+      }
+    }
+  }
+}
+
+// 和不为 10：弹开并轻晃（无惩罚）
+function bounceApart(a, b) {
+  let dx = b.x - a.x, dy = b.y - a.y;
+  let d = Math.hypot(dx, dy);
+  if (d < 1) { dx = 1; dy = 0; d = 1; }
+  const nx = dx / d, ny = dy / d;
+  // 先分开，避免连续触发
+  const need = a.r + b.r + 2 - d;
+  b.x += nx * need; b.y += ny * need;
+  b.vx += nx * 300; b.vy += ny * 300 - 60;
+  a.shake = 0.45; b.shake = 0.45;
+  a.failCd = 0.6; a.failWith = b;
+  boing();
+  showHint(`${a.n} + ${b.n} = ${a.n + b.n}，不是 10 哦，再试试！`);
+}
+
+// 和为 10：合并成金色 "10" 星星
+function mergeBubbles(a, b) {
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  bubbles = bubbles.filter(x => x !== a && x !== b);
+  if (grabbedB === a || grabbedB === b) grabbedB = null;
+  flying.push({ x: mx, y: my, t: 0, phase: "pop" });
+  // 庆祝金粉
+  for (let i = 0; i < 18; i++) {
+    const ang = Math.random() * Math.PI * 2, sp = 80 + Math.random() * 200;
+    sparkles.push({ x: mx, y: my, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, life: 0.5 + Math.random() * 0.4, maxLife: 0.9 });
+  }
+  fanfare();
+  showHint("🎉 凑成 10 啦！");
+}
+
+function updateFlying(dt) {
+  const [jx, jy] = jarMouth();
+  for (let i = flying.length - 1; i >= 0; i--) {
+    const s = flying[i];
+    s.t += dt;
+    if (s.phase === "pop" && s.t > 0.5) { s.phase = "fly"; s.t = 0; s.x0 = s.x; s.y0 = s.y; }
+    else if (s.phase === "fly") {
+      const k = Math.min(1, s.t / 0.8);
+      const e = k * k * (3 - 2 * k);                 // smoothstep
+      const cx = (s.x0 + jx) / 2, cy = Math.min(s.y0, jy) - 120;  // 弧线控制点
+      s.x = (1 - e) * (1 - e) * s.x0 + 2 * (1 - e) * e * cx + e * e * jx;
+      s.y = (1 - e) * (1 - e) * s.y0 + 2 * (1 - e) * e * cy + e * e * jy;
+      if (k >= 1) {
+        flying.splice(i, 1);
+        starsCollected++;
+        jarBounce = 0.35;
+        updateScore();
+        pop(880); setTimeout(() => pop(1175), 90);
+        if (starsCollected % 5 === 0) launchFireworks();
+      }
+    }
+  }
+  if (jarBounce > 0) jarBounce -= dt;
+}
+
+function updateParticles(dt) {
+  for (let i = sparkles.length - 1; i >= 0; i--) {
+    const p = sparkles[i];
+    p.life -= dt;
+    if (p.life <= 0) { sparkles.splice(i, 1); continue; }
+    p.vy += 120 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (let i = fireworks.length - 1; i >= 0; i--) {
+    const p = fireworks[i];
+    p.life -= dt;
+    if (p.life <= 0) { fireworks.splice(i, 1); continue; }
+    p.vy += 260 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+}
+
+// 集满 5 颗星：放烟花
+function launchFireworks() {
+  showHint("🎆 集满 5 颗星，放烟花啦！");
+  for (let i = 0; i < 5; i++) setTimeout(() => { fwBurst(); boom(); }, i * 260);
+}
+function fwBurst() {
+  const x = W * (0.15 + Math.random() * 0.7), y = H * (0.1 + Math.random() * 0.35);
+  const hue = Math.floor(Math.random() * 360);
+  for (let i = 0; i < 46; i++) {
+    const ang = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 280;
+    fireworks.push({ x, y, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, life: 1.1 + Math.random() * 0.7, maxLife: 1.8, hue: hue + Math.random() * 30 });
+  }
+}
+
+/* ================= 交互（拖拽撞击） ================= */
+canvas.addEventListener("pointerdown", e => {
+  const px = e.clientX, py = e.clientY;
+  for (let i = bubbles.length - 1; i >= 0; i--) {   // 从上层往下找
+    const b = bubbles[i];
+    if (Math.hypot(b.x - px, b.y - py) < b.r + 8) {
+      grabbedB = b; b.grabbed = true;
+      grabDX = b.x - px; grabDY = b.y - py;
+      b.vx = 0; b.vy = 0;
+      ptrSamples = [{ x: px, y: py, t: performance.now() }];
+      canvas.setPointerCapture(e.pointerId);
+      pop(500 + b.n * 40);
+      hintEl.style.opacity = "0";
+      break;
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!grabbedB) return;
+  const px = e.clientX, py = e.clientY;
+  grabbedB.x = Math.max(grabbedB.r, Math.min(W - grabbedB.r, px + grabDX));
+  grabbedB.y = Math.max(grabbedB.r, Math.min(H - grabbedB.r, py + grabDY));
+  ptrSamples.push({ x: px, y: py, t: performance.now() });
+  if (ptrSamples.length > 5) ptrSamples.shift();
+  // 跟踪指针速度，松手时把泡泡抛出去
+  const s0 = ptrSamples[0], s1 = ptrSamples[ptrSamples.length - 1];
+  const dt = Math.max(0.001, (s1.t - s0.t) / 1000);
+  grabbedB.vx = (s1.x - s0.x) / dt;
+  grabbedB.vy = (s1.y - s0.y) / dt;
+});
+function endDrag() {
+  if (!grabbedB) return;
+  const cap = 900, sp = Math.hypot(grabbedB.vx, grabbedB.vy);
+  if (sp > cap) { grabbedB.vx *= cap / sp; grabbedB.vy *= cap / sp; }
+  grabbedB.grabbed = false;
+  grabbedB.failCd = 0; grabbedB.failWith = null;
+  grabbedB = null;
+}
+window.addEventListener("pointerup", endDrag);
+window.addEventListener("pointercancel", endDrag);
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function starPath(cx, cy, rOut, rIn) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 5;
+    const rr = i % 2 === 0 ? rOut : rIn;
+    const x = cx + Math.cos(a) * rr, y = cy + Math.sin(a) * rr;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+function drawBackground(now) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#101a3d"); g.addColorStop(1, "#2b3a6b");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 夜空星星（闪烁）
+  ctx.fillStyle = "#ffffff";
+  for (const s of bgStars) {
+    ctx.globalAlpha = 0.25 + 0.35 * (0.5 + 0.5 * Math.sin(now / 600 + s.tw));
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawBubble(b, now) {
+  const r = b.r;
+  ctx.save();
+  const sx = b.shake > 0 ? Math.sin(b.shake * 42) * 4 * Math.min(1, b.shake * 3) : 0;
+  ctx.translate(b.x + sx, b.y);
+  // 拖动时：给能凑成 10 的目标泡泡画金色脉冲圈
+  if (grabbedB && b !== grabbedB && b.n === 10 - grabbedB.n) {
+    const pr = r + 6 + Math.sin(now / 130) * 3;
+    ctx.beginPath(); ctx.arc(0, 0, pr, 0, 7);
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 4; ctx.stroke();
+  }
+  // 被抓取的泡泡外发光
+  if (b.grabbed) {
+    ctx.beginPath(); ctx.arc(0, 0, r + 5, 0, 7);
+    ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 3; ctx.stroke();
+  }
+  // 泡体
+  const g = ctx.createRadialGradient(-r * 0.35, -r * 0.4, r * 0.1, 0, 0, r);
+  g.addColorStop(0, "#ffffff");
+  g.addColorStop(0.4, b.color);
+  g.addColorStop(1, b.color);
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, 7);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.75)"; ctx.lineWidth = 2.5; ctx.stroke();
+  // 高光
+  ctx.beginPath();
+  ctx.ellipse(-r * 0.35, -r * 0.45, r * 0.28, r * 0.16, -0.6, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.fill();
+  // 数字
+  ctx.fillStyle = "rgba(50,25,60,0.9)";
+  ctx.font = `bold ${Math.round(r * 0.58)}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(String(b.n), 0, -r * 0.2);
+  // 骰子点数
+  const gap = r * 0.27, pr = r * 0.06, cy = r * 0.38;
+  ctx.fillStyle = "rgba(50,25,60,0.7)";
+  for (const [gx, gy] of PIPS[b.n]) {
+    ctx.beginPath(); ctx.arc(gx * gap, cy + gy * gap, pr, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawFlyingStar(s) {
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  let sc = 1;
+  if (s.phase === "pop") {
+    const k = s.t / 0.5;
+    sc = k < 0.5 ? k * 2 * 1.35 : 1.35 - (k - 0.5) * 0.7;   // 弹一下再稳定
+  } else {
+    sc = 1 - (s.t / 0.8) * 0.35;                             // 飞入时略缩小
+  }
+  ctx.scale(sc, sc);
+  const rOut = 30, rIn = 13;
+  const g = ctx.createRadialGradient(-6, -8, 2, 0, 0, rOut);
+  g.addColorStop(0, "#fff3b0"); g.addColorStop(1, "#ffb400");
+  starPath(0, 0, rOut, rIn);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "#b87400"; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.fillStyle = "#7a4a00";
+  ctx.font = "bold 22px \"PingFang SC\",\"Microsoft YaHei\",sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("10", 0, 1);
+  ctx.restore();
+}
+
+function drawJar() {
+  ctx.save();
+  const [mx, my] = jarMouth();
+  // 星星落入时罐子弹跳
+  if (jarBounce > 0) {
+    const sc = 1 + Math.sin(jarBounce * 20) * 0.08 * jarBounce;
+    ctx.translate(mx, my); ctx.scale(sc, sc); ctx.translate(-mx, -my);
+  }
+  // 玻璃罐身
+  ctx.fillStyle = "rgba(255,255,255,0.14)";
+  roundRect(JAR.x, JAR.y + 12, JAR.w, JAR.h - 12, 14, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 2.5;
+  roundRect(JAR.x, JAR.y + 12, JAR.w, JAR.h - 12, 14, false); ctx.stroke();
+  // 罐盖
+  ctx.fillStyle = "#c98a3d";
+  roundRect(JAR.x - 4, JAR.y, JAR.w + 8, 16, 8, true);
+  // 罐内小星星（本轮回合进度 0-4）
+  const prog = starsCollected % 5;
+  const spots = [[-24, -18], [0, -18], [24, -18], [-12, -44], [12, -44]];
+  for (let i = 0; i < prog; i++) {
+    const [ox, oy] = spots[i];
+    starPath(JAR.x + JAR.w / 2 + ox, JAR.y + JAR.h + oy - 8, 11, 4.8);
+    ctx.fillStyle = "#ffd54a"; ctx.fill();
+    ctx.strokeStyle = "#b87400"; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  // 标签
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.font = "bold 13px \"PingFang SC\",\"Microsoft YaHei\",sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("集星罐", JAR.x + JAR.w / 2, JAR.y + JAR.h + 14);
+  ctx.restore();
+}
+
+function drawParticles() {
+  for (const p of sparkles) {
+    ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
+    ctx.fillStyle = "#ffd54a";
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, 7); ctx.fill();
+  }
+  for (const p of fireworks) {
+    ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
+    ctx.fillStyle = `hsl(${p.hue},95%,65%)`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3.2, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  const now = performance.now();
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground(now);
+  for (const b of bubbles) drawBubble(b, now);
+  drawParticles();
+  for (const s of flying) drawFlyingStar(s);
+  drawJar();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  physics(dt);
+  updateFlying(dt);
+  updateParticles(dt);
+  // 底部堆满 12 个：不清空，只提示
+  const landed = bubbles.reduce((k, b) => k + (b.landed ? 1 : 0), 0);
+  if (landed >= MAX_BUBBLES && now > crowdHintAt) {
+    crowdHintAt = now + 5000;
+    showHint("太挤啦，快凑十！");
+    tone(180, 0.25, 0.1, "triangle");
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+function boing() {           // 撞错：软绵绵弹开
+  tone(220, 0.12, 0.1, "triangle");
+  setTimeout(() => tone(150, 0.15, 0.1, "triangle"), 70);
+}
+function boom() { tone(80, 0.5, 0.18); tone(55, 0.6, 0.12, "triangle"); }
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2000);
+}
+hintEl.addEventListener("pointerdown", () => { hintEl.style.opacity = "0"; });
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

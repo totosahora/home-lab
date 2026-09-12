@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>坐标变换小动物</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#fbf6ec; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(60,50,30,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:148px; left:50%; transform:translateX(-50%);
+    background:rgba(60,50,30,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92%;
+  }
+  #toolbar {
+    position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+    display:flex; gap:12px; z-index:10;
+  }
+  #toolbar .card {
+    font-size:19px; font-weight:bold; padding:16px 24px;
+    border-radius:18px; border:3px solid #d8c9a8; background:#ffffff; color:#5a4a28;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.15);
+    font-family:inherit; touch-action:manipulation;
+  }
+  #toolbar .card.sel { background:#ffd54a; border-color:#e0a800; color:#5a3d00; transform:translateY(-4px); }
+  #toolbar .card:active { transform:scale(1.05); }
+  #axisbar {
+    position:absolute; bottom:84px; left:50%; transform:translateX(-50%);
+    display:none; gap:12px; z-index:10;
+  }
+  #axisbar button {
+    font-size:18px; font-weight:bold; padding:13px 22px;
+    border-radius:16px; border:3px solid #8fb8e8; background:#e8f2ff; color:#1a4fc0;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.15);
+    font-family:inherit; touch-action:manipulation;
+  }
+  #axisbar button:active { transform:scale(1.06); background:#cfe4ff; }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.45);
+  }
+  #winPanel .msg {
+    font-size:40px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">第 1 / 5 关 · 步数：0</div>
+<div id="hint">选一张变换卡片，把彩色小动物变到灰色影子的位置！</div>
+<div id="axisbar">
+  <button data-axis="x">⇅ 沿 x 轴翻折</button>
+  <button data-axis="y">⇄ 沿 y 轴翻折</button>
+</div>
+<div id="toolbar">
+  <button class="card sel" data-mode="translate">🧭 平移</button>
+  <button class="card" data-mode="rotate">🔄 旋转</button>
+  <button class="card" data-mode="reflect">🪞 翻折</button>
+  <button class="card" id="undoBtn">↩ 撤销</button>
+</div>
+<div id="winPanel">
+  <div class="msg">🎉 全部通关！<br>你是坐标变换小达人！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const axisbar = document.getElementById("axisbar");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 坐标系与视图 ================= */
+// 数学坐标：y 向上，原点在网格中心；网格范围 x∈[-9,9]，y∈[-6,6]
+const GX = 9, GY = 6;
+const view = { s:1, ox:0, oy:0 };
+function fitView() {
+  view.s = Math.min((W - 30) / (GX * 2), (H - 190) / (GY * 2));
+  view.ox = W / 2;
+  view.oy = 64 + (H - 64 - 150) / 2;   // 给顶部 scorebar、底部工具栏留位
+}
+function toGrid(sx, sy) { return [(sx - view.ox) / view.s, (view.oy - sy) / view.s]; }
+function toScreen(gx, gy) { return [view.ox + gx * view.s, view.oy - gy * view.s]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 变换的数学（核心，保证准确） ================= */
+// 位姿 pose = { x, y, a, m }：先对局部图形做镜像 Sx^m（m 为真则左右翻转），
+// 再绕原点旋转 a 度（逆时针，90 的倍数），最后平移到 (x, y)。
+// 即任意点 p -> R(a) · Sx^m · p + t。
+const normA = a => ((a % 360) + 360) % 360;
+function applyTranslate(p, dx, dy) { return { x:p.x + dx, y:p.y + dy, a:p.a, m:p.m }; }
+function applyRotate(p, k) {          // k = 90° 的个数（逆时针）
+  const b = k * Math.PI / 2;
+  const c = Math.round(Math.cos(b)), s = Math.round(Math.sin(b));
+  return { x:c * p.x - s * p.y, y:s * p.x + c * p.y, a:normA(p.a + k * 90), m:p.m };
+}
+function applyReflectY(p) {           // 沿 y 轴翻折：(x,y)->(-x,y)
+  return { x:-p.x, y:p.y, a:normA(-p.a), m:!p.m };
+}
+function applyReflectX(p) {           // 沿 x 轴翻折：(x,y)->(x,-y)
+  return { x:p.x, y:-p.y, a:normA(180 - p.a), m:!p.m };
+}
+function samePose(a, b) {
+  return a.x === b.x && a.y === b.y && a.m === b.m && normA(a.a - b.a) === 0;
+}
+// 通用操作入口（也供测试脚本调用）
+function applyOp(kind, args, animate) {
+  let next = null;
+  if (kind === "t") next = applyTranslate(cur, args[0], args[1]);
+  else if (kind === "r") next = applyRotate(cur, args[0]);
+  else if (kind === "rx") next = applyReflectX(cur);
+  else if (kind === "ry") next = applyReflectY(cur);
+  if (!next) return;
+  undoStack.push(cur);
+  steps++;
+  updateScore();
+  if (animate === false) { cur = next; }
+  else startAnim(cur, next);
+}
+
+/* ================= 关卡数据 ================= */
+// sol 是参考答案（用于算出目标影子，保证每关 2~3 步可达）
+const LEVELS = [
+  { start:{ x:-4, y:-1, a:0, m:false }, sol:[["t", 5, 2]] },
+  { start:{ x:-5, y:3,  a:0, m:false }, sol:[["ry"], ["t", -2, -4]] },
+  { start:{ x:-4, y:-3, a:0, m:false }, sol:[["r", 1], ["t", 1, 3]] },
+  { start:{ x:-5, y:-2, a:0, m:false }, sol:[["rx"], ["r", 1], ["t", 4, 2]] },
+  { start:{ x:2,  y:4,  a:0, m:false }, sol:[["r", 2], ["ry"], ["t", -4, 1]] },
+];
+
+/* ================= 游戏状态 ================= */
+let levelIdx = 0, steps = 0;
+let cur = null, target = null;       // 当前位姿 / 目标位姿
+let undoStack = [];
+let mode = "translate";              // translate | rotate | reflect
+let anim = null;                     // {from, to, t0, dur}
+let won = false;                     // 本关已完成（庆祝中）
+let dragT = null;                    // 平移拖拽 {dx, dy}
+let dragR = null;                    // 旋转拖拽 {k, active}
+let confetti = [];
+
+function loadLevel(i) {
+  levelIdx = i;
+  const L = LEVELS[i];
+  cur = { ...L.start };
+  // 目标 = 起点依次应用参考答案
+  target = { ...L.start };
+  for (const op of L.sol) {
+    if (op[0] === "t") target = applyTranslate(target, op[1], op[2]);
+    else if (op[0] === "r") target = applyRotate(target, op[1]);
+    else if (op[0] === "rx") target = applyReflectX(target);
+    else if (op[0] === "ry") target = applyReflectY(target);
+  }
+  steps = 0; undoStack = []; anim = null; won = false;
+  dragT = null; dragR = null; confetti = [];
+  updateScore();
+}
+function updateScore() {
+  scorebar.textContent = `第 ${levelIdx + 1} / ${LEVELS.length} 关 · 步数：${steps}`;
+}
+loadLevel(0);
+
+/* ================= 动画 ================= */
+const ANIM_MS = 550;
+function ease(t) { return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; }
+function startAnim(from, to) {
+  anim = { from:{ ...from }, to:{ ...to }, t0:performance.now(), dur:ANIM_MS };
+  dragT = null; dragR = null;
+}
+function animPose(now) {
+  if (!anim) return null;
+  const p = Math.min(1, (now - anim.t0) / anim.dur);
+  const e = ease(p);
+  const f = anim.from, t = anim.to;
+  // 角度沿最短方向插值
+  let da = normA(t.a - f.a); if (da > 180) da -= 360;
+  return {
+    x: f.x + (t.x - f.x) * e,
+    y: f.y + (t.y - f.y) * e,
+    a: f.a + da * e,
+    s: (f.m ? -1 : 1) + ((t.m ? -1 : 1) - (f.m ? -1 : 1)) * e,  // 镜像：缩放过 0 实现翻面
+    done: p >= 1
+  };
+}
+
+/* ================= 交互：卡片选择 ================= */
+const MODE_HINTS = {
+  translate: "平移：按住小动物拖动，箭头按整格吸附，松手完成平移",
+  rotate: "旋转：按住画布绕原点拖圈，小动物每次转 90°",
+  reflect: "翻折：点下面的按钮，选一条对称轴（x 轴或 y 轴）",
+};
+document.querySelectorAll("#toolbar .card[data-mode]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    mode = btn.dataset.mode;
+    document.querySelectorAll("#toolbar .card[data-mode]").forEach(b => b.classList.toggle("sel", b === btn));
+    axisbar.style.display = mode === "reflect" ? "flex" : "none";
+    hintEl.textContent = MODE_HINTS[mode];
+    hintEl.style.opacity = "1";
+    pop(660);
+  });
+});
+document.getElementById("undoBtn").addEventListener("click", () => {
+  if (anim || won || !undoStack.length) return;
+  const prev = undoStack.pop();
+  steps = Math.max(0, steps - 1);
+  updateScore();
+  startAnim(cur, prev);
+  pop(440);
+});
+axisbar.querySelectorAll("button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    if (anim || won) return;
+    applyOp(btn.dataset.axis === "x" ? "rx" : "ry", [], true);
+    flipSound();
+  });
+});
+
+/* ================= 交互：画布拖拽 ================= */
+canvas.addEventListener("pointerdown", e => {
+  if (anim || won || winPanel.style.display === "flex") return;
+  const [gx, gy] = toGrid(e.clientX, e.clientY);
+  if (mode === "translate") {
+    if (Math.hypot(gx - cur.x, gy - cur.y) < 1.5) {
+      dragT = { dx:0, dy:0 };
+      canvas.setPointerCapture(e.pointerId);
+    }
+  } else if (mode === "rotate") {
+    dragR = { k: rotateK(gx, gy) };
+    canvas.setPointerCapture(e.pointerId);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  const [gx, gy] = toGrid(e.clientX, e.clientY);
+  if (dragT) {
+    dragT.dx = Math.round(gx - cur.x);
+    dragT.dy = Math.round(gy - cur.y);
+  } else if (dragR) {
+    dragR.k = rotateK(gx, gy);
+  }
+});
+window.addEventListener("pointerup", () => {
+  if (dragT) {
+    const { dx, dy } = dragT;
+    dragT = null;
+    if (dx !== 0 || dy !== 0) { applyOp("t", [dx, dy], true); whoosh(); }
+  } else if (dragR) {
+    const k = ((dragR.k % 4) + 4) % 4;
+    dragR = null;
+    if (k !== 0) { applyOp("r", [k], true); rotateSound(); }
+  }
+});
+function rotateK(gx, gy) {   // 指针相对原点的角度 → 最近的 90° 倍数
+  if (Math.hypot(gx, gy) < 0.6) return 0;
+  return Math.round(Math.atan2(gy, gx) / (Math.PI / 2));
+}
+
+/* ================= 绘制 ================= */
+const NOSE = [0.96, 0.18];   // 鼻尖（局部坐标），用作顶点标签
+function noseGrid(p) {       // p 可为插值位姿 {x,y,a,s} 或 pose {x,y,a,m}
+  const s = p.s !== undefined ? p.s : (p.m ? -1 : 1);
+  const nx = NOSE[0] * s, ny = NOSE[1];
+  const r = p.a * Math.PI / 180;
+  return [p.x + nx * Math.cos(r) - ny * Math.sin(r), p.y + nx * Math.sin(r) + ny * Math.cos(r)];
+}
+
+function drawGrid() {
+  const [x0, y1] = toScreen(-GX, GY), [x1, y0] = toScreen(GX, -GY);   // y1=上, y0=下
+  ctx.fillStyle = "#fffdf5";
+  ctx.fillRect(x0, y1, x1 - x0, y0 - y1);
+  // 网格线
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "#e8e0cc";
+  for (let i = -GX; i <= GX; i++) {
+    const [sx] = toScreen(i, 0);
+    ctx.beginPath(); ctx.moveTo(sx, y0); ctx.lineTo(sx, y1); ctx.stroke();
+  }
+  for (let j = -GY; j <= GY; j++) {
+    const [, sy] = toScreen(0, j);
+    ctx.beginPath(); ctx.moveTo(x0, sy); ctx.lineTo(x1, sy); ctx.stroke();
+  }
+  // 坐标轴
+  ctx.strokeStyle = "#8a7a55"; ctx.lineWidth = 2.5;
+  const [ox, oy] = toScreen(0, 0);
+  ctx.beginPath(); ctx.moveTo(x0, oy); ctx.lineTo(x1, oy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(ox, y0); ctx.lineTo(ox, y1); ctx.stroke();
+  // 轴箭头
+  ctx.fillStyle = "#8a7a55";
+  ctx.beginPath(); ctx.moveTo(x1, oy); ctx.lineTo(x1 - 10, oy - 5); ctx.lineTo(x1 - 10, oy + 5); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(ox, y1); ctx.lineTo(ox - 5, y1 + 10); ctx.lineTo(ox + 5, y1 + 10); ctx.closePath(); ctx.fill();
+  // 轴名与刻度
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#6a5a38";
+  ctx.fillText("x", x1 - 14, oy - 14);
+  ctx.fillText("y", ox + 14, y1 + 14);
+  ctx.font = "11px sans-serif"; ctx.fillStyle = "#a89a78";
+  for (let i = -GX; i <= GX; i++) {
+    if (i === 0) continue;
+    const [sx] = toScreen(i, 0);
+    ctx.fillText(String(i), sx, oy + 12);
+  }
+  for (let j = -GY; j <= GY; j++) {
+    if (j === 0) continue;
+    const [, sy] = toScreen(0, j);
+    ctx.fillText(String(j), ox - 12, sy);
+  }
+  ctx.fillText("O", ox - 11, oy + 12);
+}
+
+// 小狐狸（局部坐标，脸朝 +x，尾巴在 -x，镜像后朝向明显改变）
+function drawAnimalShape(main, belly, dark) {
+  // 尾巴
+  ctx.fillStyle = dark;
+  ctx.beginPath();
+  ctx.moveTo(-0.42, 0.08);
+  ctx.quadraticCurveTo(-1.0, 0.42, -1.02, -0.02);
+  ctx.quadraticCurveTo(-0.92, -0.30, -0.45, -0.22);
+  ctx.closePath(); ctx.fill();
+  // 尾巴尖
+  ctx.fillStyle = belly;
+  ctx.beginPath();
+  ctx.moveTo(-0.82, 0.22);
+  ctx.quadraticCurveTo(-1.0, 0.32, -1.02, -0.02);
+  ctx.quadraticCurveTo(-0.96, -0.12, -0.84, -0.05);
+  ctx.closePath(); ctx.fill();
+  // 身体
+  ctx.fillStyle = main;
+  ctx.beginPath(); ctx.ellipse(-0.05, -0.10, 0.56, 0.42, 0, 0, Math.PI * 2); ctx.fill();
+  // 肚皮
+  ctx.fillStyle = belly;
+  ctx.beginPath(); ctx.ellipse(0.02, -0.22, 0.33, 0.22, 0, 0, Math.PI * 2); ctx.fill();
+  // 耳朵
+  ctx.fillStyle = main;
+  ctx.beginPath(); ctx.moveTo(0.28, 0.46); ctx.lineTo(0.36, 0.80); ctx.lineTo(0.50, 0.52); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(0.52, 0.55); ctx.lineTo(0.66, 0.82); ctx.lineTo(0.74, 0.50); ctx.closePath(); ctx.fill();
+  // 头
+  ctx.beginPath(); ctx.arc(0.50, 0.22, 0.34, 0, Math.PI * 2); ctx.fill();
+  // 吻部
+  ctx.fillStyle = belly;
+  ctx.beginPath(); ctx.moveTo(0.60, 0.32); ctx.lineTo(0.98, 0.18); ctx.lineTo(0.60, 0.04); ctx.closePath(); ctx.fill();
+  // 鼻子
+  ctx.fillStyle = "#3a2a1a";
+  ctx.beginPath(); ctx.arc(NOSE[0], NOSE[1], 0.06, 0, Math.PI * 2); ctx.fill();
+  // 眼睛
+  ctx.beginPath(); ctx.arc(0.58, 0.32, 0.05, 0, Math.PI * 2); ctx.fill();
+}
+
+// 在指定位姿画小动物；p: {x,y,a,s}（s=±1 或插值）
+function drawAnimal(p, colors, alpha) {
+  const [sx, sy] = toScreen(p.x, p.y);
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(sx, sy);
+  ctx.scale(view.s, -view.s);       // y 翻转：回到数学坐标
+  ctx.rotate(p.a * Math.PI / 180);
+  ctx.scale(p.s, 1);
+  drawAnimalShape(colors[0], colors[1], colors[2]);
+  ctx.restore();
+}
+
+// 顶点坐标标签（屏幕空间）
+function drawCoordLabel(p, bg, fg) {
+  const [gx, gy] = noseGrid(p);
+  const [sx, sy] = toScreen(gx, gy);
+  const text = `(${Math.round(gx)}, ${Math.round(gy)})`;
+  ctx.font = "bold 14px sans-serif";
+  const tw = ctx.measureText(text).width;
+  let bx = Math.min(Math.max(sx - tw / 2 - 8, 6), W - tw - 22);
+  let by = Math.min(Math.max(sy - 44, 6), H - 34);
+  ctx.fillStyle = bg;
+  roundRect(bx, by, tw + 16, 26, 13, true);
+  ctx.fillStyle = fg;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(text, bx + tw / 2 + 8, by + 14);
+  // 顶点标记点
+  ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 7);
+  ctx.fillStyle = fg; ctx.fill();
+}
+
+function drawDial() {
+  if (mode !== "rotate" || won) return;
+  const [ox, oy] = toScreen(0, 0);
+  const R = view.s * 1.7;
+  ctx.save();
+  ctx.strokeStyle = "rgba(47,127,233,0.7)"; ctx.lineWidth = 3;
+  ctx.setLineDash([7, 7]);
+  ctx.beginPath(); ctx.arc(ox, oy, R, 0, 7); ctx.stroke();
+  ctx.setLineDash([]);
+  // 四个方向的刻度点
+  ctx.fillStyle = "rgba(47,127,233,0.8)";
+  for (let k = 0; k < 4; k++) {
+    const a = k * Math.PI / 2;
+    ctx.beginPath(); ctx.arc(ox + R * Math.cos(a), oy - R * Math.sin(a), 6, 0, 7); ctx.fill();
+  }
+  ctx.font = "bold 13px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#2f7fe9";
+  ctx.fillText("绕原点旋转", ox, oy + R + 16);
+  // 拖拽中的角度手柄
+  if (dragR && dragR.k !== null) {
+    const a = dragR.k * Math.PI / 2;
+    ctx.strokeStyle = "#2f7fe9"; ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ox + R * Math.cos(a), oy - R * Math.sin(a)); ctx.stroke();
+    ctx.beginPath(); ctx.arc(ox + R * Math.cos(a), oy - R * Math.sin(a), 12, 0, 7);
+    ctx.fillStyle = "#ffd54a"; ctx.fill();
+    ctx.strokeStyle = "#e0a800"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.fillStyle = "#5a3d00";
+    ctx.fillText(`转 ${(((dragR.k % 4) + 4) % 4) * 90}°`, ox, oy - R - 16);
+  }
+  ctx.restore();
+}
+
+function drawConfetti(dt) {
+  for (const c of confetti) {
+    c.vy += 900 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    c.rot += c.vr * dt;
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+  confetti = confetti.filter(c => c.y < H + 30);
+}
+function spawnConfetti(gx, gy) {
+  const [sx, sy] = toScreen(gx, gy);
+  const colors = ["#ff5252", "#ffd54a", "#2fbf4a", "#2f7fe9", "#9b3de0", "#ff7a1a"];
+  for (let i = 0; i < 60; i++) {
+    confetti.push({
+      x: sx, y: sy,
+      vx: (Math.random() - 0.5) * 700,
+      vy: -Math.random() * 600 - 100,
+      rot: Math.random() * 6, vr: (Math.random() - 0.5) * 12,
+      color: colors[i % colors.length],
+    });
+  }
+}
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+
+function draw(now, dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#fbf6ec";
+  ctx.fillRect(0, 0, W, H);
+  drawGrid();
+
+  // 目标影子（灰色）
+  const GHOST = ["#b8bec4", "#d5dade", "#a8aeb4"];
+  drawAnimal({ x:target.x, y:target.y, a:target.a, s:target.m ? -1 : 1 }, GHOST, 0.55);
+  drawCoordLabel({ x:target.x, y:target.y, a:target.a, s:target.m ? -1 : 1 }, "rgba(150,150,150,0.85)", "#ffffff");
+  // “目标”小字
+  const [tx, ty] = toScreen(target.x, target.y);
+  ctx.font = "bold 13px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#98a0a8";
+  ctx.fillText("目标", tx, ty + view.s * 0.95);
+
+  // 当前小动物（动画 / 拖拽预览 / 静止）
+  const FOX = ["#ff9f43", "#ffe3ba", "#e8811a"];
+  let pose = anim ? animPose(now) : { x:cur.x, y:cur.y, a:cur.a, s:cur.m ? -1 : 1 };
+  if (anim && pose.done) {
+    cur = { ...anim.to };
+    anim = null;
+    pose = { x:cur.x, y:cur.y, a:cur.a, s:cur.m ? -1 : 1 };
+    checkWin();
+  }
+  drawAnimal(pose, FOX, 1);
+  drawCoordLabel(pose, "rgba(47,127,233,0.9)", "#ffffff");
+
+  // 平移拖拽：箭头 + 落点预览
+  if (dragT && (dragT.dx !== 0 || dragT.dy !== 0)) {
+    const pp = { x:cur.x + dragT.dx, y:cur.y + dragT.dy, a:cur.a, s:cur.m ? -1 : 1 };
+    drawAnimal(pp, FOX, 0.45);
+    const [ax, ay] = toScreen(cur.x, cur.y), [bx, by] = toScreen(pp.x, pp.y);
+    ctx.strokeStyle = "#2fbf4a"; ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+    const ang = Math.atan2(by - ay, bx - ax);
+    ctx.fillStyle = "#2fbf4a";
+    ctx.beginPath();
+    ctx.moveTo(bx, by);
+    ctx.lineTo(bx - 16 * Math.cos(ang - 0.4), by - 16 * Math.sin(ang - 0.4));
+    ctx.lineTo(bx - 16 * Math.cos(ang + 0.4), by - 16 * Math.sin(ang + 0.4));
+    ctx.closePath(); ctx.fill();
+    drawCoordLabel(pp, "rgba(47,191,74,0.9)", "#ffffff");
+    ctx.font = "bold 14px sans-serif"; ctx.fillStyle = "#2fbf4a";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(`平移 (${dragT.dx}, ${dragT.dy})`, (ax + bx) / 2, (ay + by) / 2 - 16);
+  }
+  // 旋转拖拽：预览位姿
+  if (dragR && ((dragR.k % 4) + 4) % 4 !== 0) {
+    const pp = applyRotate(cur, dragR.k);
+    drawAnimal({ x:pp.x, y:pp.y, a:pp.a, s:pp.m ? -1 : 1 }, FOX, 0.45);
+    drawCoordLabel({ x:pp.x, y:pp.y, a:pp.a, s:pp.m ? -1 : 1 }, "rgba(47,127,233,0.7)", "#ffffff");
+  }
+
+  drawDial();
+  drawConfetti(dt);
+}
+
+/* ================= 通关判定 ================= */
+function checkWin() {
+  if (!samePose(cur, target)) return;
+  won = true;
+  spawnConfetti(cur.x, cur.y);
+  fanfare();
+  showHint(`🎉 第 ${levelIdx + 1} 关完成！用了 ${steps} 步`);
+  setTimeout(() => {
+    if (levelIdx + 1 < LEVELS.length) {
+      loadLevel(levelIdx + 1);
+      showHint("新一关！观察影子的位置和朝向");
+    } else {
+      winPanel.style.display = "flex";
+      fanfare();
+    }
+  }, 1900);
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  draw(now, dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const whoosh = () => tone(520, 0.18, 0.09, "triangle");
+const rotateSound = () => { pop(440); setTimeout(() => pop(660), 110); };
+const flipSound = () => { tone(700, 0.1, 0.1, "triangle"); setTimeout(() => tone(350, 0.14, 0.1, "triangle"), 100); };
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 1800);
+}
+document.getElementById("replayBtn").addEventListener("click", () => {
+  winPanel.style.display = "none";
+  loadLevel(0);
+  pop(880);
+});
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

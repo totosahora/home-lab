@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>回归直线实验室</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#16222e; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,18,26,0.85); color:#7ee0a3; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; max-width:96vw;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,18,26,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:96vw;
+  }
+  #toolbar {
+    position:absolute; top:12px; right:12px; z-index:10;
+    display:flex; flex-direction:column; gap:8px; align-items:flex-end;
+  }
+  #toolbar button {
+    font-size:15px; font-weight:bold; padding:9px 16px;
+    border-radius:20px; border:none; cursor:pointer;
+    background:rgba(10,18,26,0.85); color:#ffd54a;
+    box-shadow:0 2px 8px rgba(0,0,0,0.35);
+  }
+  #toolbar button:active { transform:scale(1.05); }
+  #toolbar button.on { background:#ffd54a; color:#4a3400; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar"></div>
+<div id="hint">拖动橙色直线的端点或线身，让虚线残差尽量短！</div>
+<div id="toolbar">
+  <button id="modeBtn">切换到：撒点模式</button>
+  <button id="bestBtn">显示最优解</button>
+  <button id="resetBtn">重置</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+let W = 0, H = 0, DPR = 1;
+
+/* ================= 坐标系与视图 ================= */
+// 数据坐标：x = 身高(cm)，y = 体重(kg)
+const X0 = 145, X1 = 195, Y0 = 25, Y1 = 100;
+const plot = { l:0, t:0, w:0, h:0 };   // 屏幕上的绘图区
+function fitView() {
+  plot.l = Math.max(70, W * 0.08);
+  plot.t = Math.max(70, H * 0.11);
+  plot.w = W - plot.l - Math.max(40, W * 0.05);
+  plot.h = H - plot.t - Math.max(90, H * 0.14);
+}
+function xPix(x) { return plot.l + (x - X0) / (X1 - X0) * plot.w; }
+function yPix(y) { return plot.t + plot.h - (y - Y0) / (Y1 - Y0) * plot.h; }
+function xData(px) { return X0 + (px - plot.l) / plot.w * (X1 - X0); }
+function yData(py) { return Y0 + (plot.t + plot.h - py) / plot.h * (Y1 - Y0); }
+function clampX(x) { return Math.max(X0, Math.min(X1, x)); }
+function clampY(y) { return Math.max(Y0 - 5, Math.min(Y1 + 5, y)); }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 数据 ================= */
+// 模式一：20 名学生的身高-体重样例（固定种子伪随机，保证每次一致）
+let samplePts = [];
+function makeSample() {
+  let seed = 20240517;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  samplePts = [];
+  for (let i = 0; i < 20; i++) {
+    const x = 150 + i * 2 + rnd() * 1.5;               // 身高 150~190
+    const y = 0.92 * x - 96 + (rnd() - 0.5) * 14;      // 体重 ≈ 0.92h - 96 + 噪声
+    samplePts.push({ x, y });
+  }
+}
+
+// 模式二：孩子自己撒的点（含一个高亮异常点）
+let freePts = [];    // {x, y, outlier}
+function makeFree() {
+  freePts = [];
+  let seed = 777;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  for (let i = 0; i < 10; i++) {
+    const x = 152 + i * 3.5 + rnd() * 2;
+    const y = 0.9 * x - 95 + (rnd() - 0.5) * 10;
+    freePts.push({ x, y, outlier:false });
+  }
+  freePts.push({ x:190, y:32, outlier:true });   // 异常点：很高却很轻
+}
+
+/* ================= 最小二乘法 ================= */
+function leastSquares(pts) {
+  const n = pts.length;
+  if (n < 2) return null;
+  let sx = 0, sy = 0;
+  for (const p of pts) { sx += p.x; sy += p.y; }
+  const mx = sx / n, my = sy / n;
+  let sxx = 0, sxy = 0, syy = 0;
+  for (const p of pts) {
+    sxx += (p.x - mx) * (p.x - mx);
+    sxy += (p.x - mx) * (p.y - my);
+    syy += (p.y - my) * (p.y - my);
+  }
+  if (sxx < 1e-9) return null;
+  const k = sxy / sxx, b = my - k * mx;
+  const r = syy < 1e-9 ? 1 : sxy / Math.sqrt(sxx * syy);   // 相关系数
+  let sse = 0;
+  for (const p of pts) { const d = p.y - (k * p.x + b); sse += d * d; }
+  return { k, b, r, sse };
+}
+function sseOf(k, b, pts) {
+  let s = 0;
+  for (const p of pts) { const d = p.y - (k * p.x + b); s += d * d; }
+  return s;
+}
+
+/* ================= 游戏状态 ================= */
+let mode = "fit";            // fit（拖线拟合） | scatter（撒点+异常值）
+let handleA = { x:150, y:38 };   // 孩子的直线：两个端点（数据坐标）
+let handleB = { x:190, y:85 };
+let showBest = false;        // 是否显示最优解直线
+let celebrated = false;      // 接近最优的庆祝只触发一次（带迟滞）
+let drag = null;             // {kind:'a'|'b'|'line'|'pt', ...}
+
+function userLine() {        // 由两端点求 k、b
+  const dx = handleB.x - handleA.x;
+  if (Math.abs(dx) < 1e-6) return { k:0, b:handleA.y };
+  const k = (handleB.y - handleA.y) / dx;
+  return { k, b: handleA.y - k * handleA.x };
+}
+function bestFit() { return leastSquares(samplePts); }
+
+function resetAll() {
+  makeSample();
+  makeFree();
+  handleA = { x:150, y:38 };
+  handleB = { x:190, y:85 };
+  showBest = false;
+  celebrated = false;
+  document.getElementById("bestBtn").classList.remove("on");
+  document.getElementById("bestBtn").textContent = "显示最优解";
+  updateScore();
+}
+resetAll();
+
+function updateScore() {
+  if (mode === "fit") {
+    const u = userLine(), best = bestFit();
+    const sse = sseOf(u.k, u.b, samplePts);
+    const ratio = best ? sse / best.sse : 1;
+    let grade = "";
+    if (ratio <= 1.02) grade = " · 🏆 几乎最优！";
+    else if (ratio <= 1.15) grade = " · 👍 很接近了";
+    scorebar.textContent = `残差平方和：${sse.toFixed(1)}（理论最小 ${best.sse.toFixed(1)}）${grade}`;
+    // 接近最优：庆祝（迟滞防重复）
+    if (ratio <= 1.02 && !celebrated) {
+      celebrated = true;
+      fanfare();
+      showHint("🎉 太棒了！你的线几乎就是最小二乘回归线！点「显示最优解」对比看看");
+    } else if (ratio > 1.12) celebrated = false;
+  } else {
+    const fit = leastSquares(freePts);
+    if (!fit) { scorebar.textContent = `点数：${freePts.length} · 至少 2 个点才能拟合`; return; }
+    scorebar.textContent =
+      `点数：${freePts.length} · 回归线 y = ${fit.k.toFixed(2)}x ${fit.b >= 0 ? "+" : "−"} ${Math.abs(fit.b).toFixed(1)} · 相关系数 r = ${fit.r.toFixed(3)}`;
+  }
+}
+
+/* ================= 交互 ================= */
+function distToSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const L2 = dx * dx + dy * dy;
+  let t = L2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / L2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + dx * t), py - (ay + dy * t));
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const px = e.clientX, py = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+  if (mode === "fit") {
+    const ax = xPix(handleA.x), ay = yPix(handleA.y);
+    const bx = xPix(handleB.x), by = yPix(handleB.y);
+    if (Math.hypot(px - ax, py - ay) < 22) { drag = { kind:"a" }; pop(700); return; }
+    if (Math.hypot(px - bx, py - by) < 22) { drag = { kind:"b" }; pop(700); return; }
+    if (distToSeg(px, py, ax, ay, bx, by) < 16) {
+      // 抓住线身：记录指针与两端点的偏移，整体平移
+      drag = { kind:"line", lx:xData(px), ly:yData(py),
+               ax:handleA.x, ay:handleA.y, bx:handleB.x, by:handleB.y };
+      pop(600);
+      return;
+    }
+  } else {
+    // 撒点模式：优先抓住已有点（异常点优先）
+    let best = null, bestD = 22;
+    for (const p of freePts) {
+      const d = Math.hypot(px - xPix(p.x), py - yPix(p.y)) - (p.outlier ? 6 : 0);
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    if (best) { drag = { kind:"pt", p:best }; pop(750); return; }
+    // 记下按下位置，松手时若没怎么移动则添加新点
+    drag = { kind:"tap", sx:px, sy:py };
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const px = e.clientX, py = e.clientY;
+  if (drag.kind === "a") {
+    handleA.x = clampX(xData(px)); handleA.y = clampY(yData(py));
+    updateScore();
+  } else if (drag.kind === "b") {
+    handleB.x = clampX(xData(px)); handleB.y = clampY(yData(py));
+    updateScore();
+  } else if (drag.kind === "line") {
+    const dx = xData(px) - drag.lx, dy = yData(py) - drag.ly;
+    // 整体平移，并把两个端点一起夹回范围内
+    let ax = drag.ax + dx, bx = drag.bx + dx;
+    const lo = Math.min(ax, bx), hi = Math.max(ax, bx);
+    if (lo < X0) { ax += X0 - lo; bx += X0 - lo; }
+    if (hi > X1) { ax -= hi - X1; bx -= hi - X1; }
+    handleA.x = ax; handleB.x = bx;
+    handleA.y = clampY(drag.ay + dy); handleB.y = clampY(drag.by + dy);
+    updateScore();
+  } else if (drag.kind === "pt") {
+    drag.p.x = clampX(xData(px)); drag.p.y = clampY(yData(py));
+    updateScore();
+  }
+});
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  if (drag.kind === "tap") {
+    const moved = Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy);
+    if (moved < 8 && freePts.length < 40) {
+      const x = clampX(xData(drag.sx)), y = clampY(yData(drag.sy));
+      freePts.push({ x, y, outlier:false });
+      pop(950);
+      updateScore();
+      if (freePts.length === 2) showHint("出现绿色回归线了！继续撒点，或拖动红色⭐异常点看看");
+    }
+  } else {
+    pop(500);
+  }
+  drag = null;
+});
+
+/* ================= 绘制 ================= */
+function drawPanel() {
+  // 绘图面板
+  ctx.fillStyle = "#f7f9fc";
+  roundRect(plot.l - 46, plot.t - 34, plot.w + 82, plot.h + 74, 14, true);
+  ctx.strokeStyle = "rgba(255,255,255,0.12)"; ctx.lineWidth = 2;
+  roundRect(plot.l - 46, plot.t - 34, plot.w + 82, plot.h + 74, 14, false, true);
+  // 网格与刻度
+  ctx.font = "12px sans-serif";
+  ctx.fillStyle = "#8899aa";
+  ctx.strokeStyle = "#dbe3ec"; ctx.lineWidth = 1;
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let x = 150; x <= 190; x += 10) {
+    const px = xPix(x);
+    ctx.beginPath(); ctx.moveTo(px, plot.t); ctx.lineTo(px, plot.t + plot.h); ctx.stroke();
+    ctx.fillText(x, px, plot.t + plot.h + 8);
+  }
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let y = 30; y <= 100; y += 10) {
+    const py = yPix(y);
+    ctx.beginPath(); ctx.moveTo(plot.l, py); ctx.lineTo(plot.l + plot.w, py); ctx.stroke();
+    ctx.fillText(y, plot.l - 10, py);
+  }
+  // 轴名
+  ctx.fillStyle = "#44586c"; ctx.font = "bold 14px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  ctx.fillText("身高 (cm)", plot.l + plot.w / 2, plot.t + plot.h + 26);
+  ctx.save();
+  ctx.translate(plot.l - 36, plot.t + plot.h / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("体重 (kg)", 0, 0);
+  ctx.restore();
+}
+
+function drawPoint(p, color, r, star) {
+  const px = xPix(p.x), py = yPix(p.y);
+  ctx.beginPath(); ctx.arc(px, py, r, 0, 7);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.beginPath(); ctx.arc(px - r * 0.3, py - r * 0.35, r * 0.3, 0, 7);
+  ctx.fillStyle = "rgba(255,255,255,0.6)"; ctx.fill();
+  if (star) {
+    ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 3;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.arc(px, py, r + 7, 0, 7); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+// 残差：竖直虚线 + 半透明正方形（面积 = 残差²）
+function drawResiduals(pts, k, b, strong) {
+  for (const p of pts) {
+    const px = xPix(p.x), py = yPix(p.y), fy = yPix(k * p.x + b);
+    const side = Math.abs(py - fy);
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = "rgba(230,60,60,0.85)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px, fy); ctx.stroke();
+    ctx.setLineDash([]);
+    if (strong && side > 2) {
+      const dir = (px + side <= plot.l + plot.w) ? 1 : -1;
+      ctx.fillStyle = "rgba(230,60,60,0.14)";
+      ctx.strokeStyle = "rgba(230,60,60,0.4)"; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.rect(Math.min(px, px + dir * side), Math.min(py, fy), side, side);
+      ctx.fill(); ctx.stroke();
+    }
+  }
+}
+
+function drawLineKB(k, b, color, width, dash, glow) {
+  const ya = k * X0 + b, yb = k * X1 + b;
+  ctx.save();
+  if (dash) ctx.setLineDash([12, 8]);
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = 10; }
+  ctx.strokeStyle = color; ctx.lineWidth = width;
+  ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(xPix(X0), yPix(ya)); ctx.lineTo(xPix(X1), yPix(yb)); ctx.stroke();
+  ctx.restore();
+}
+
+function drawHandles() {
+  for (const h of [handleA, handleB]) {
+    const px = xPix(h.x), py = yPix(h.y);
+    const active = drag && ((drag.kind === "a" && h === handleA) || (drag.kind === "b" && h === handleB));
+    const r = active ? 13 : 10;
+    ctx.beginPath(); ctx.arc(px, py, r, 0, 7);
+    ctx.fillStyle = "#ff8c1a"; ctx.fill();
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.beginPath(); ctx.arc(px, py, r - 5, 0, 7);
+    ctx.fillStyle = "rgba(255,255,255,0.5)"; ctx.fill();
+  }
+}
+
+function drawModeFit() {
+  const u = userLine();
+  drawResiduals(samplePts, u.k, u.b, true);
+  if (showBest) {
+    const best = bestFit();
+    drawLineKB(best.k, best.b, "#2fbf4a", 4, true, false);
+    // 标注最优解
+    ctx.font = "bold 14px sans-serif";
+    ctx.fillStyle = "#1d8a3c";
+    ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+    ctx.fillText(`最优解（最小二乘）：y = ${best.k.toFixed(2)}x ${best.b >= 0 ? "+" : "−"} ${Math.abs(best.b).toFixed(1)}`,
+      plot.l + 10, plot.t + 22);
+  }
+  drawLineKB(u.k, u.b, "#ff8c1a", 5, false, true);
+  for (const p of samplePts) drawPoint(p, "#2f7fe9", 6);
+  drawHandles();
+}
+
+function drawModeScatter() {
+  const fit = leastSquares(freePts);
+  const inliers = freePts.filter(p => !p.outlier);
+  const outlier = freePts.find(p => p.outlier);
+  if (fit) {
+    drawResiduals(freePts, fit.k, fit.b, false);
+    // 灰色幽灵线：去掉异常点后的回归线，对比「拉扯」
+    if (outlier && inliers.length >= 2) {
+      const g = leastSquares(inliers);
+      if (g) drawLineKB(g.k, g.b, "rgba(120,130,140,0.7)", 3, true, false);
+    }
+    drawLineKB(fit.k, fit.b, "#2fbf4a", 5, false, true);
+    // 公式标注
+    ctx.font = "bold 14px sans-serif";
+    ctx.fillStyle = "#1d8a3c";
+    ctx.textAlign = "left"; ctx.textBaseline = "top";
+    ctx.fillText("绿线＝全部点的回归线", plot.l + 10, plot.t + 10);
+    if (outlier) {
+      ctx.fillStyle = "#77808a";
+      ctx.fillText("灰虚线＝去掉⭐异常点后的回归线", plot.l + 10, plot.t + 30);
+    }
+  }
+  for (const p of freePts) {
+    drawPoint(p, p.outlier ? "#e93b3b" : "#2f7fe9", p.outlier ? 9 : 6, p.outlier);
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#1d2f40"); g.addColorStop(1, "#101a24");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  drawPanel();
+  ctx.save();
+  ctx.beginPath(); ctx.rect(plot.l - 40, plot.t - 30, plot.w + 76, plot.h + 66); ctx.clip();
+  if (mode === "fit") drawModeFit(); else drawModeScatter();
+  ctx.restore();
+}
+
+function roundRect(x, y, w, h, r, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+/* ================= 主循环 ================= */
+function loop() {
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+updateScore();
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 按钮与提示 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2600);
+}
+const modeBtn = document.getElementById("modeBtn");
+const bestBtn = document.getElementById("bestBtn");
+modeBtn.addEventListener("click", () => {
+  mode = mode === "fit" ? "scatter" : "fit";
+  modeBtn.textContent = mode === "fit" ? "切换到：撒点模式" : "切换到：拖线拟合";
+  bestBtn.style.display = mode === "fit" ? "" : "none";
+  pop(880);
+  updateScore();
+  if (mode === "scatter") showHint("点击空白处撒点；拖动红色⭐异常点到远处，看绿线被「拉扯」！");
+  else showHint("拖动橙色直线的端点旋转、抓线身平移，让红色残差尽量短！");
+});
+bestBtn.addEventListener("click", () => {
+  showBest = !showBest;
+  bestBtn.classList.toggle("on", showBest);
+  bestBtn.textContent = showBest ? "隐藏最优解" : "显示最优解";
+  pop(showBest ? 1000 : 600);
+  if (showBest) showHint("绿色虚线就是残差平方和最小的直线，把你的橙线贴上去试试！");
+});
+document.getElementById("resetBtn").addEventListener("click", () => {
+  resetAll();
+  pop(700);
+  showHint("已重置，再来一次！");
+});
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

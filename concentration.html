@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>配制溶液小实验</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#e8f4e8; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,50,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:17px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap; max-width:96vw; overflow:hidden; text-overflow:ellipsis;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,60,50,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:94vw; overflow:hidden; text-overflow:ellipsis;
+  }
+  #resetBtn {
+    position:absolute; top:12px; right:12px; z-index:10;
+    font-size:17px; font-weight:bold; padding:10px 18px;
+    border-radius:24px; border:none; background:#ff8a65; color:#fff;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.25);
+  }
+  #resetBtn:active { transform:scale(1.06); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:38px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#4a3500;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🧂 配制溶液</div>
+<button id="resetBtn">🔄 重来本任务</button>
+<div id="hint">拖砝码到右盘、拖盐勺往左盘加盐，称出需要的盐！</div>
+<div id="winPanel">
+  <div class="msg">🎉 全部任务完成！<br>你是配液小达人！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 任务卡数据 ================= */
+// 三张任务卡递增难度：浓度 = 溶质 ÷ (溶质 + 溶剂) × 100%
+const TASKS = [
+  { total:100, pct:5  },   // 盐 5g + 水 95g
+  { total:50,  pct:10 },   // 盐 5g + 水 45g
+  { total:200, pct:2  },   // 盐 4g + 水 196g
+];
+let taskIdx = 0, task = TASKS[0];
+let saltNeed = 5, waterNeed = 95;
+// 阶段：weigh 称盐 → dishReady 把盐拖进烧杯 → water 量水并倒入 → stir 搅拌 → celebrate 庆祝
+let phase = "weigh";
+
+/* ================= 场景数据 ================= */
+const bal = { cx:0, beamY:0, half:110, baseY:0, a:0, shakeL:0, shakeR:0 };  // 天平
+let weights = [];        // 砝码 {v,x,y,hx,hy,onPan}
+const bottle = { x:0, y:0, w:74, h:110, shake:0 };   // 盐瓶
+const spoon = { x:0, y:0, hx:0, hy:0 };              // 盐勺
+const dish = { x:0, y:0, state:"pan" };              // 称量纸（左盘）state: pan|drag|pour
+const beaker = { cx:0, y:0, w:180, h:200, salt:0, water:0, shake:0 };   // 烧杯
+const cyl = { x:0, y:0, w:86, h:300, water:0, max:250, done:false, shake:0 }; // 量筒
+const pitcher = { x:0, y:0, hx:0, hy:0 };            // 水壶
+const dropper = { x:0, y:0, hx:0, hy:0 };            // 胶头滴管
+const rod = { x:0, y:0, hx:0, hy:0 };                // 玻璃棒
+let saltOnPan = 0;       // 左盘盐（g）
+let stirProg = 0;        // 搅拌进度 0~1
+let swirlA = 0;          // 搅拌旋涡角
+let pourAnim = null;     // 倾倒动画 {type,t,dur,startX...}
+let drag = null;         // {type,obj,dx,dy,lastX,lastY}
+let grains = [];         // 盐粒/水滴粒子
+let confetti = [];       // 庆祝彩带
+let celebT = 0;
+let overshootWarnT = 0;
+
+function layout() {
+  bal.cx = W * 0.20; bal.beamY = H * 0.36; bal.half = Math.min(115, W * 0.085);
+  bal.baseY = Math.min(H * 0.66, bal.beamY + 230);
+  // 砝码托盘（天平下方两排）
+  const gap = Math.min(64, W * 0.05);
+  weights.forEach((wt, i) => {
+    wt.hx = bal.cx + ((i % 4) - 1.5) * gap;
+    wt.hy = i < 4 ? H * 0.78 : H * 0.88;
+    if (!wt.onPan && (!drag || drag.obj !== wt)) { wt.x = wt.hx; wt.y = wt.hy; }
+  });
+  bottle.x = W * 0.035; bottle.y = H * 0.50;
+  spoon.hx = bottle.x + bottle.w + 34; spoon.hy = bottle.y + 46;
+  if (!drag || drag.obj !== spoon) { spoon.x = spoon.hx; spoon.y = spoon.hy; }
+
+  beaker.cx = W * 0.52; beaker.w = Math.min(200, W * 0.17);
+  beaker.h = beaker.w * 1.1; beaker.y = H * 0.52;
+
+  cyl.x = W * 0.735; cyl.w = 84; cyl.y = H * 0.24; cyl.h = H * 0.48; cyl.hx = cyl.x;
+
+  pitcher.hx = W * 0.895; pitcher.hy = H * 0.34;
+  if (!drag || drag.obj !== pitcher) { pitcher.x = pitcher.hx; pitcher.y = pitcher.hy; }
+  dropper.hx = W * 0.895; dropper.hy = H * 0.58;
+  if (!drag || drag.obj !== dropper) { dropper.x = dropper.hx; dropper.y = dropper.hy; }
+  rod.hx = beaker.cx + beaker.w * 0.95; rod.hy = beaker.y + 30;
+  if (!drag || drag.obj !== rod) { rod.x = rod.hx; rod.y = rod.hy; }
+}
+
+function panLPos() { return { x: bal.cx - Math.cos(bal.a) * bal.half, y: bal.beamY - Math.sin(bal.a) * bal.half + 42 }; }
+function panRPos() { return { x: bal.cx + Math.cos(bal.a) * bal.half, y: bal.beamY + Math.sin(bal.a) * bal.half + 42 }; }
+function weightSum() { return weights.reduce((s, w2) => s + (w2.onPan ? w2.v : 0), 0); }
+
+function startTask(i) {
+  taskIdx = i; task = TASKS[i];
+  saltNeed = Math.round(task.total * task.pct / 100);
+  waterNeed = task.total - saltNeed;
+  phase = "weigh";
+  saltOnPan = 0; stirProg = 0; swirlA = 0; pourAnim = null; drag = null;
+  beaker.salt = 0; beaker.water = 0; beaker.shake = 0;
+  cyl.water = 0; cyl.done = false; cyl.shake = 0;
+  dish.state = "pan";
+  grains = []; confetti = [];
+  weights = [1, 2, 2, 5, 10, 20, 50].map(v => ({ v, x:0, y:0, hx:0, hy:0, onPan:false }));
+  layout();
+  scorebar.textContent = `🧂 任务 ${i + 1}/3：配制 ${task.total}g ${task.pct}% 的盐水（盐 ${saltNeed}g + 水 ${waterNeed}g）`;
+  showHint(`第 1 步：拖砝码到右盘，拖盐勺往左盘加盐，称出 ${saltNeed} g 盐`);
+}
+
+/* ================= 检查与反馈 ================= */
+function checkWeigh() {
+  const ws = weightSum();
+  if (saltOnPan === saltNeed && ws === saltNeed) {
+    phase = "dishReady";
+    ding();
+    showHint(`天平平衡啦！正好 ${saltNeed} g ✓ 把左盘的盐拖进烧杯`);
+    return;
+  }
+  if (saltOnPan > saltNeed) {
+    bal.shakeL = 0.7; pop(180);
+    showHint(`盐多了 ${saltOnPan - saltNeed} g！从左盘拖一勺回盐瓶（目标 ${saltNeed} g）`);
+  } else if (ws > 0 && saltOnPan === ws && saltOnPan !== saltNeed) {
+    bal.shakeL = 0.7; bal.shakeR = 0.7; pop(180);
+    showHint(`天平平衡在 ${saltOnPan} g，但任务需要 ${saltNeed} g 哦`);
+  } else if (ws > saltOnPan && saltOnPan > 0) {
+    showHint(`砝码 ${ws} g 比盐重，继续加盐或换小砝码`);
+  } else if (saltOnPan > ws && ws > 0) {
+    showHint(`盐比砝码 ${ws} g 重，再加砝码`);
+  }
+}
+
+function startSaltPour() {
+  pourAnim = { type:"salt", t:0, dur:0.9 };
+  dish.state = "pour";
+  whooshS();
+}
+function startWaterPour() {
+  pourAnim = { type:"water", t:0, dur:1.4, start:cyl.water };
+  whooshS();
+}
+
+function nextTask() {
+  if (taskIdx + 1 >= TASKS.length) {
+    winPanel.style.display = "flex";
+    fanfare();
+  } else {
+    startTask(taskIdx + 1);
+  }
+}
+
+/* ================= 交互 ================= */
+function overLeftPan(x, y)  { const p = panLPos(); return Math.hypot(x - p.x, y - p.y) < 62; }
+function overRightPan(x, y) { const p = panRPos(); return Math.hypot(x - p.x, y - p.y) < 62; }
+function overBottle(x, y)   { return x > bottle.x - 12 && x < bottle.x + bottle.w + 12 && y > bottle.y - 12 && y < bottle.y + bottle.h + 12; }
+function overCylMouth(x, y) { return Math.abs(x - (cyl.x + cyl.w / 2)) < 66 && y < cyl.y + 56; }
+function overBeaker(x, y)   { return Math.abs(x - beaker.cx) < beaker.w * 0.75 && y > beaker.y - 60 && y < beaker.y + beaker.h + 20; }
+function inBeakerLiquid(x, y) { return Math.abs(x - beaker.cx) < beaker.w / 2 && y > beaker.y + 10 && y < beaker.y + beaker.h; }
+
+canvas.addEventListener("pointerdown", e => {
+  hintEl.style.opacity = "0";
+  if (winPanel.style.display === "flex" || pourAnim || phase === "celebrate") return;
+  const x = e.clientX, y = e.clientY;
+  // 称好的盐（称量纸）→ 烧杯
+  if (phase === "dishReady" && dish.state === "pan" && overLeftPan(x, y)) {
+    const p = panLPos();
+    drag = { type:"dish", obj:dish, dx:x - p.x, dy:y - p.y };
+    dish.state = "drag"; dish.x = p.x; dish.y = p.y;
+  } else if (phase === "weigh" && overLeftPan(x, y) && saltOnPan > 0) {
+    // 从左盘舀回一勺盐
+    drag = { type:"saltBack", x, y };
+  } else if (phase === "weigh" && Math.hypot(x - spoon.x, y - spoon.y) < 34) {
+    drag = { type:"spoon", obj:spoon, dx:x - spoon.x, dy:y - spoon.y };
+  } else if (phase === "weigh") {
+    for (const wt of weights) {
+      if (Math.hypot(x - wt.x, y - wt.y) < 30) { drag = { type:"weight", obj:wt, dx:x - wt.x, dy:y - wt.y }; break; }
+    }
+  }
+  if (!drag && phase === "water") {
+    if (cyl.done && x > cyl.x - 14 && x < cyl.x + cyl.w + 14 && y > cyl.y - 14 && y < cyl.y + cyl.h + 14) {
+      drag = { type:"cylinder", obj:cyl, dx:x - cyl.x, dy:y - cyl.y };
+    } else if (Math.hypot(x - pitcher.x, y - pitcher.y) < 52) {
+      drag = { type:"pitcher", obj:pitcher, dx:x - pitcher.x, dy:y - pitcher.y };
+    } else if (Math.hypot(x - dropper.x, y - dropper.y) < 34) {
+      drag = { type:"dropper", obj:dropper, dx:x - dropper.x, dy:y - dropper.y };
+    }
+  }
+  if (!drag && phase === "stir" && Math.hypot(x - rod.x, y - rod.y) < 48) {
+    drag = { type:"rod", obj:rod, lastX:x, lastY:y };
+  }
+  if (drag) canvas.setPointerCapture(e.pointerId);
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const x = e.clientX, y = e.clientY;
+  if (drag.type === "rod") {
+    rod.x = x; rod.y = y;
+    const d = Math.hypot(x - drag.lastX, y - drag.lastY);
+    drag.lastX = x; drag.lastY = y;
+    if (inBeakerLiquid(x, y) && beaker.water > 0) {
+      stirProg = Math.min(1, stirProg + d / 900);
+      swirlA += d * 0.03;
+      if (stirProg >= 1 && phase === "stir") celebrate();
+    }
+    return;
+  }
+  if (drag.type === "saltBack") { drag.x = x; drag.y = y; return; }
+  drag.obj.x = x - (drag.dx || 0);
+  drag.obj.y = y - (drag.dy || 0);
+});
+
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  const x = e.clientX, y = e.clientY;
+  const d = drag; drag = null;
+  if (d.type === "weight") {
+    const wt = d.obj;
+    if (overRightPan(x, y)) { wt.onPan = true; pop(660); }
+    else { wt.onPan = false; wt.x = wt.hx; wt.y = wt.hy; pop(440); }
+    checkWeigh();
+  } else if (d.type === "spoon") {
+    if (overLeftPan(x, y) && saltOnPan < 30) {
+      saltOnPan += 1; pop(880);
+      const p = panLPos();
+      for (let i = 0; i < 8; i++) grains.push({ x:p.x + (Math.random()-0.5)*30, y:p.y - 40, vx:(Math.random()-0.5)*40, vy:-30-Math.random()*40, life:0.7, kind:"salt" });
+      checkWeigh();
+    }
+    spoon.x = spoon.hx; spoon.y = spoon.hy;
+  } else if (d.type === "saltBack") {
+    if (overBottle(x, y) && saltOnPan > 0) { saltOnPan -= 1; pop(520); }
+  } else if (d.type === "dish") {
+    if (overBeaker(x, y)) startSaltPour();
+    else dish.state = "pan";
+  } else if (d.type === "pitcher") {
+    pitcher.x = pitcher.hx; pitcher.y = pitcher.hy;
+  } else if (d.type === "dropper") {
+    dropper.x = dropper.hx; dropper.y = dropper.hy;
+  } else if (d.type === "cylinder") {
+    cyl.x = cyl.hx;   // 回到台面位置
+    if (overBeaker(x, y)) startWaterPour();
+  } else if (d.type === "rod") {
+    rod.x = rod.hx; rod.y = rod.hy;
+  }
+});
+
+/* ================= 模拟 ================= */
+function update(dt) {
+  // 天平横梁弹簧趋稳：右盘重则右倾
+  const targetA = Math.max(-0.16, Math.min(0.16, (weightSum() - saltOnPan) * 0.045));
+  bal.a += (targetA - bal.a) * Math.min(1, dt * 8);
+  bal.shakeL = Math.max(0, bal.shakeL - dt);
+  bal.shakeR = Math.max(0, bal.shakeR - dt);
+  beaker.shake = Math.max(0, beaker.shake - dt);
+  cyl.shake = Math.max(0, cyl.shake - dt);
+  overshootWarnT = Math.max(0, overshootWarnT - dt);
+
+  // 水壶倒水 / 滴管微调
+  if (drag && drag.type === "pitcher" && phase === "water" && !cyl.done) {
+    if (overCylMouth(pitcher.x, pitcher.y)) {
+      cyl.water = Math.min(cyl.max, cyl.water + 24 * dt);
+      if (Math.random() < dt * 30) grains.push({ x:cyl.x + cyl.w / 2, y:cyl.y + 6, vx:0, vy:120, life:0.35, kind:"water" });
+      checkWater();
+    }
+  }
+  if (drag && drag.type === "dropper" && phase === "water" && !cyl.done) {
+    if (overCylMouth(dropper.x, dropper.y)) {
+      if (cyl.water < waterNeed - 0.2) { cyl.water = Math.min(waterNeed, cyl.water + 4 * dt); }
+      else if (cyl.water > waterNeed + 0.2) { cyl.water = Math.max(0, cyl.water - 4 * dt); }
+      checkWater();
+    }
+  }
+
+  // 倾倒动画
+  if (pourAnim) {
+    pourAnim.t += dt;
+    const p = Math.min(1, pourAnim.t / pourAnim.dur);
+    if (pourAnim.type === "salt") {
+      if (Math.random() < dt * 40) grains.push({ x:beaker.cx + (Math.random()-0.5)*36, y:beaker.y - 40, vx:(Math.random()-0.5)*30, vy:60, life:0.6, kind:"salt" });
+      if (p >= 1) {
+        beaker.salt = saltOnPan; saltOnPan = 0;
+        dish.state = "pan"; pourAnim = null;
+        phase = "water"; pop(720);
+        showHint(`第 2 步：拖水壶向量筒倒水，到 ${waterNeed} mL 刻度线（接近时用滴管微调）`);
+      }
+    } else {
+      cyl.water = pourAnim.start * (1 - p);
+      beaker.water = pourAnim.start * p;
+      if (Math.random() < dt * 40) grains.push({ x:beaker.cx + 20, y:beaker.y - 46, vx:0, vy:150, life:0.4, kind:"water" });
+      if (p >= 1) {
+        pourAnim = null; phase = "stir"; pop(760);
+        showHint("第 3 步：拖玻璃棒在烧杯里画圈搅拌，把盐全部溶解！");
+      }
+    }
+  }
+
+  // 粒子
+  for (const g2 of grains) { g2.vy += 300 * dt; g2.x += g2.vx * dt; g2.y += g2.vy * dt; g2.life -= dt; }
+  grains = grains.filter(g2 => g2.life > 0);
+  for (const c of confetti) { c.vy += 240 * dt; c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt; c.life -= dt; }
+  confetti = confetti.filter(c => c.life > 0 && c.y < H + 30);
+  swirlA += dt * (phase === "stir" ? 1.5 : 0.3);
+}
+
+function checkWater() {
+  if (cyl.done) return;
+  if (Math.abs(cyl.water - waterNeed) <= 1.5) {
+    cyl.water = waterNeed; cyl.done = true; ding();
+    showHint(`正好到刻度线 ${waterNeed} mL ✓ 把量筒拖到烧杯倒进去`);
+  } else if (cyl.water > waterNeed + 1.5 && overshootWarnT <= 0) {
+    overshootWarnT = 1.2; cyl.shake = 0.7; pop(180);
+    showHint(`水多了 ${Math.round(cyl.water - waterNeed)} mL！目标 ${waterNeed} mL，用滴管吸走一些`);
+  }
+}
+
+function celebrate() {
+  phase = "celebrate"; celebT = 0;
+  fanfare();
+  for (let i = 0; i < 70; i++) confetti.push({
+    x: beaker.cx + (Math.random() - 0.5) * 300, y: beaker.y - 60,
+    vx:(Math.random() - 0.5) * 260, vy:-160 - Math.random() * 220,
+    rot:Math.random() * 7, vr:(Math.random() - 0.5) * 12,
+    life:2.4, color:["#ff5252","#ffd54a","#4caf50","#42a5f5","#ab47bc"][i % 5]
+  });
+  setTimeout(nextTask, 3000);
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+}
+function shakeOff(t) { return t > 0 ? Math.sin(t * 40) * 5 * t : 0; }
+
+function drawTable() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#e8f4e8"); g.addColorStop(1, "#cfe8d8");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 台面
+  ctx.fillStyle = "#a8d5b8";
+  ctx.fillRect(0, bal.baseY + 40, W, H - bal.baseY - 40);
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.fillRect(0, bal.baseY + 40, W, 6);
+}
+
+function drawBalance() {
+  const pL = panLPos(), pR = panRPos();
+  const offL = shakeOff(bal.shakeL), offR = shakeOff(bal.shakeR);
+  // 底座与立柱
+  ctx.fillStyle = "#5d6d7e";
+  ctx.beginPath();
+  ctx.moveTo(bal.cx - 70, bal.baseY); ctx.lineTo(bal.cx + 70, bal.baseY);
+  ctx.lineTo(bal.cx + 40, bal.baseY - 26); ctx.lineTo(bal.cx - 40, bal.baseY - 26);
+  ctx.closePath(); ctx.fill();
+  ctx.fillRect(bal.cx - 6, bal.beamY, 12, bal.baseY - 26 - bal.beamY);
+  // 横梁
+  ctx.strokeStyle = "#34495e"; ctx.lineWidth = 8; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(bal.cx - Math.cos(bal.a) * bal.half, bal.beamY - Math.sin(bal.a) * bal.half);
+  ctx.lineTo(bal.cx + Math.cos(bal.a) * bal.half, bal.beamY + Math.sin(bal.a) * bal.half);
+  ctx.stroke();
+  ctx.fillStyle = "#e74c3c";
+  ctx.beginPath(); ctx.arc(bal.cx, bal.beamY, 7, 0, 7); ctx.fill();
+  // 吊绳 + 托盘
+  for (const [p, off, red] of [[pL, offL, bal.shakeL > 0], [pR, offR, bal.shakeR > 0]]) {
+    const topY = p.y - 42;
+    ctx.strokeStyle = "#7f8c8d"; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(p.x, topY); ctx.lineTo(p.x - 34 + off, p.y - 6);
+    ctx.moveTo(p.x, topY); ctx.lineTo(p.x + 34 + off, p.y - 6);
+    ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(p.x + off, p.y, 46, 12, 0, 0, 7);
+    ctx.fillStyle = red ? "rgba(231,76,60,0.55)" : "#dfe6e9";
+    ctx.fill();
+    ctx.strokeStyle = red ? "#e74c3c" : "#95a5a6"; ctx.lineWidth = red ? 4 : 2.5; ctx.stroke();
+  }
+  // 左盘称量纸 + 盐堆
+  if (dish.state === "pan") drawDishAt(pL.x + offL, pL.y - 8, saltOnPan);
+  // 右盘砝码堆
+  const onPan = weights.filter(w2 => w2.onPan);
+  onPan.forEach((wt, i) => {
+    const ox = ((i % 3) - 1) * 26, oy = -Math.floor(i / 3) * 22 - 10;
+    drawWeightAt(wt, pR.x + offR + ox, pR.y + oy);
+  });
+  // 读数屏
+  ctx.fillStyle = "rgba(20,40,35,0.85)";
+  roundRect(bal.cx - 105, bal.baseY + 8, 210, 46, 10, true);
+  ctx.fillStyle = "#7dffb0"; ctx.font = "bold 17px monospace";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(`盐 ${saltOnPan} g  ⚖  砝码 ${weightSum()} g`, bal.cx, bal.baseY + 31);
+  // 目标小签
+  if (phase === "weigh" || phase === "dishReady") {
+    ctx.fillStyle = "rgba(255,213,74,0.9)";
+    roundRect(bal.cx - 62, bal.beamY - 84, 124, 30, 15, true);
+    ctx.fillStyle = "#5a3d00"; ctx.font = "bold 15px sans-serif";
+    ctx.fillText(`目标 ${saltNeed} g`, bal.cx, bal.beamY - 69);
+  }
+}
+
+function drawDishAt(x, y, salt) {
+  ctx.fillStyle = "#fff8e7";
+  ctx.beginPath(); ctx.ellipse(x, y, 34, 9, 0, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#d8c9a3"; ctx.lineWidth = 2; ctx.stroke();
+  if (salt > 0) {
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath(); ctx.ellipse(x, y - 4, 8 + salt * 3.2, 4 + salt * 1.6, 0, 0, 7); ctx.fill();
+    ctx.strokeStyle = "#cfcfcf"; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.fillStyle = "#b8b8b8";
+    for (let i = 0; i < Math.min(14, salt * 3); i++) {
+      ctx.fillRect(x + (Math.sin(i * 2.7) * (6 + salt * 2.4)), y - 6 - Math.abs(Math.cos(i * 1.9)) * (3 + salt), 2, 2);
+    }
+  }
+}
+
+function drawWeightAt(wt, x, y) {
+  const s = wt.v >= 50 ? 30 : wt.v >= 10 ? 25 : 20;
+  ctx.fillStyle = "#c9a227";
+  roundRect(x - s / 2, y - s / 2, s, s, 5, true);
+  ctx.strokeStyle = "#8a6d1a"; ctx.lineWidth = 2;
+  roundRect(x - s / 2, y - s / 2, s, s, 5, false); ctx.stroke();
+  ctx.fillStyle = "#5a4400"; ctx.font = `bold ${wt.v >= 10 ? 11 : 12}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(wt.v + "g", x, y + 1);
+}
+
+function drawWeightsTray() {
+  ctx.fillStyle = "rgba(90,60,20,0.15)";
+  roundRect(bal.cx - Math.min(64, W * 0.05) * 2.2, H * 0.78 - 34, Math.min(64, W * 0.05) * 4.4, H * 0.88 - H * 0.78 + 70, 14, true);
+  ctx.fillStyle = "#6d4c1f"; ctx.font = "bold 14px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("砝码盒", bal.cx, H * 0.78 - 44);
+  for (const wt of weights) if (!wt.onPan && (!drag || drag.obj !== wt)) drawWeightAt(wt, wt.x, wt.y);
+}
+
+function drawBottleAndSpoon() {
+  // 盐瓶
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  roundRect(bottle.x, bottle.y + 24, bottle.w, bottle.h - 24, 10, true);
+  ctx.strokeStyle = "#9aa5a0"; ctx.lineWidth = 2.5;
+  roundRect(bottle.x, bottle.y + 24, bottle.w, bottle.h - 24, 10, false); ctx.stroke();
+  ctx.fillStyle = "#e8e8e8";
+  ctx.fillRect(bottle.x + 6, bottle.y + 60, bottle.w - 12, bottle.h - 44); // 瓶里的盐
+  ctx.fillStyle = "#7f8c8d";
+  roundRect(bottle.x + 10, bottle.y, bottle.w - 20, 26, 6, true);          // 瓶盖
+  ctx.fillStyle = "#2d6a4f"; ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("食盐", bottle.x + bottle.w / 2, bottle.y + 48);
+  // 盐勺
+  drawSpoonAt(spoon.x, spoon.y);
+  if (phase === "weigh") {
+    ctx.fillStyle = "rgba(45,106,79,0.75)"; ctx.font = "13px sans-serif";
+    ctx.fillText("拖盐勺→左盘加 1g", bottle.x + bottle.w / 2 + 16, bottle.y - 14);
+  }
+}
+function drawSpoonAt(x, y) {
+  ctx.strokeStyle = "#95a5a6"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(x + 16, y - 22); ctx.lineTo(x - 4, y + 6); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(x - 10, y + 12, 13, 8, -0.6, 0, 7);
+  ctx.fillStyle = "#dfe6e9"; ctx.fill();
+  ctx.strokeStyle = "#95a5a6"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.ellipse(x - 10, y + 9, 8, 4, -0.6, 0, 7); ctx.fill();
+}
+
+function drawBeaker() {
+  const off = shakeOff(beaker.shake);
+  const bx = beaker.cx - beaker.w / 2 + off, by = beaker.y, bw = beaker.w, bh = beaker.h;
+  const levelMax = 250;
+  // 杯内液体
+  const totalV = beaker.water;
+  if (totalV > 0 || beaker.salt > 0) {
+    const lh = Math.max(14, (Math.max(totalV, 1) / levelMax) * (bh - 30));
+    ctx.fillStyle = "rgba(140,200,250,0.55)";
+    ctx.fillRect(bx + 6, by + bh - 8 - lh, bw - 12, lh);
+    // 液面
+    ctx.strokeStyle = "rgba(80,140,220,0.8)"; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(bx + 6, by + bh - 8 - lh);
+    ctx.quadraticCurveTo(beaker.cx + off, by + bh - 8 - lh + 4, bx + bw - 6, by + bh - 8 - lh);
+    ctx.stroke();
+    // 未溶解的盐粒（搅拌时逐渐减少 → 把“溶解”画出来）
+    const undiss = beaker.salt * (1 - stirProg);
+    if (undiss > 0.05) {
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      ctx.beginPath(); ctx.ellipse(beaker.cx + off, by + bh - 12, 6 + undiss * 5, 3 + undiss * 1.8, 0, 0, 7); ctx.fill();
+      ctx.fillStyle = "#c9c9c9";
+      for (let i = 0; i < undiss * 4; i++) ctx.fillRect(beaker.cx + off + Math.sin(i * 3.1) * undiss * 4, by + bh - 16 + Math.cos(i * 2.3) * 3, 2.5, 2.5);
+    }
+    // 搅拌旋涡线
+    if (phase === "stir" && stirProg < 1) {
+      ctx.strokeStyle = "rgba(255,255,255,0.6)"; ctx.lineWidth = 2;
+      for (let k = 0; k < 3; k++) {
+        const a0 = swirlA + k * 2.1;
+        ctx.beginPath();
+        ctx.arc(beaker.cx + off, by + bh - 8 - lh / 2, lh * 0.28, a0, a0 + 1.6);
+        ctx.stroke();
+      }
+    }
+  }
+  // 杯壁
+  ctx.strokeStyle = beaker.shake > 0 ? "#e74c3c" : "#7f9aa8";
+  ctx.lineWidth = beaker.shake > 0 ? 5 : 4;
+  ctx.beginPath();
+  ctx.moveTo(bx, by); ctx.lineTo(bx, by + bh - 14);
+  ctx.quadraticCurveTo(bx, by + bh, bx + 14, by + bh);
+  ctx.lineTo(bx + bw - 14, by + bh);
+  ctx.quadraticCurveTo(bx + bw, by + bh, bx + bw, by + bh - 14);
+  ctx.lineTo(bx + bw, by);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.18)";
+  ctx.fillRect(bx + 4, by + 4, bw - 8, bh - 8);
+  // 标签
+  ctx.fillStyle = "#41627a"; ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("烧杯", beaker.cx + off, by + bh + 20);
+  // 搅拌进度
+  if (phase === "stir") {
+    ctx.fillStyle = "rgba(0,0,0,0.25)";
+    roundRect(beaker.cx - 80, by - 34, 160, 14, 7, true);
+    ctx.fillStyle = "#4caf50";
+    if (stirProg > 0.01) roundRect(beaker.cx - 78, by - 32, 156 * stirProg, 10, 5, true);
+  }
+}
+
+function drawCylinder() {
+  const off = shakeOff(cyl.shake);
+  const cx0 = cyl.x + off, cy0 = cyl.y, cw = cyl.w, ch = cyl.h;
+  // 水
+  const lh = (cyl.water / cyl.max) * (ch - 26);
+  if (lh > 1) {
+    ctx.fillStyle = "rgba(140,200,250,0.6)";
+    ctx.fillRect(cx0 + 6, cy0 + ch - 8 - lh, cw - 12, lh);
+    // 凹液面（最低处读数）
+    ctx.strokeStyle = "rgba(70,130,210,0.9)"; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(cx0 + 6, cy0 + ch - 8 - lh);
+    ctx.quadraticCurveTo(cx0 + cw / 2, cy0 + ch - 8 - lh + 7, cx0 + cw - 6, cy0 + ch - 8 - lh);
+    ctx.stroke();
+  }
+  // 刻度
+  ctx.strokeStyle = "#5d7a8a"; ctx.lineWidth = 1.5;
+  ctx.font = "11px sans-serif"; ctx.fillStyle = "#41627a"; ctx.textAlign = "left";
+  for (let v = 0; v <= cyl.max; v += 25) {
+    const yy = cy0 + ch - 8 - (v / cyl.max) * (ch - 26);
+    const major = v % 50 === 0;
+    ctx.beginPath(); ctx.moveTo(cx0 + 6, yy); ctx.lineTo(cx0 + (major ? 26 : 16), yy); ctx.stroke();
+    if (major) ctx.fillText(v + "", cx0 + 30, yy + 3);
+  }
+  // 目标刻度线
+  if (phase === "water" || phase === "stir" || phase === "celebrate") {
+    const yy = cy0 + ch - 8 - (waterNeed / cyl.max) * (ch - 26);
+    ctx.strokeStyle = "#e74c3c"; ctx.lineWidth = 3;
+    ctx.setLineDash([8, 5]);
+    ctx.beginPath(); ctx.moveTo(cx0 + 2, yy); ctx.lineTo(cx0 + cw - 2, yy); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#e74c3c"; ctx.font = "bold 13px sans-serif"; ctx.textAlign = "left";
+    ctx.fillText(`目标 ${waterNeed} mL`, cx0 + cw + 6, yy + 4);
+  }
+  // 筒壁
+  ctx.strokeStyle = cyl.shake > 0 ? "#e74c3c" : "#7f9aa8";
+  ctx.lineWidth = cyl.shake > 0 ? 5 : 3.5;
+  ctx.beginPath();
+  ctx.moveTo(cx0, cy0); ctx.lineTo(cx0, cy0 + ch - 8);
+  ctx.lineTo(cx0 + cw, cy0 + ch - 8); ctx.lineTo(cx0 + cw, cy0);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.15)";
+  ctx.fillRect(cx0 + 3, cy0 + 3, cw - 6, ch - 12);
+  // 底座
+  ctx.fillStyle = "#8fa5b0";
+  roundRect(cx0 - 12, cy0 + ch - 6, cw + 24, 12, 4, true);
+  ctx.fillStyle = "#41627a"; ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("量筒", cx0 + cw / 2, cy0 + ch + 22);
+  // 俯视读数提示（眼睛图标 + 与凹液面平齐的虚线）
+  if (phase === "water" && !cyl.done && cyl.water > waterNeed * 0.35) {
+    const yy = cy0 + ch - 8 - (cyl.water / cyl.max) * (ch - 26);
+    ctx.fillStyle = "rgba(20,60,50,0.85)";
+    roundRect(cx0 + cw / 2 - 118, cy0 - 78, 236, 40, 12, true);
+    ctx.fillStyle = "#fff"; ctx.font = "13px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("👁 视线要与凹液面最低处相平", cx0 + cw / 2, cy0 - 64);
+    ctx.fillText("俯视会把数读大哦！", cx0 + cw / 2, cy0 - 47);
+    ctx.strokeStyle = "rgba(20,60,50,0.6)"; ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(cx0 - 30, yy + 3); ctx.lineTo(cx0 + 6, yy + 3); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function drawPitcher() {
+  const pouring = drag && drag.type === "pitcher" && overCylMouth(pitcher.x, pitcher.y) && phase === "water" && !cyl.done;
+  ctx.save();
+  ctx.translate(pitcher.x, pitcher.y);
+  if (pouring) ctx.rotate(-0.9);
+  ctx.fillStyle = "rgba(150,205,250,0.85)";
+  roundRect(-30, -28, 60, 62, 9, true);
+  ctx.strokeStyle = "#5d7a8a"; ctx.lineWidth = 3;
+  roundRect(-30, -28, 60, 62, 9, false); ctx.stroke();
+  ctx.fillStyle = "rgba(90,150,220,0.7)";
+  ctx.fillRect(-26, 0, 52, 30);
+  ctx.strokeStyle = "#5d7a8a"; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(30, -16); ctx.lineTo(44, -24); ctx.stroke();  // 壶嘴
+  ctx.beginPath(); ctx.arc(-36, 2, 12, Math.PI * 0.5, Math.PI * 1.5); ctx.stroke(); // 把手
+  ctx.restore();
+  if (pouring) {
+    ctx.strokeStyle = "rgba(120,190,250,0.9)"; ctx.lineWidth = 5; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(pitcher.x + 44, pitcher.y - 10); ctx.lineTo(cyl.x + cyl.w / 2, cyl.y + 4); ctx.stroke();
+  }
+  ctx.fillStyle = "#41627a"; ctx.font = "bold 14px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("水壶", pitcher.x, pitcher.y + 52);
+}
+
+function drawDropper() {
+  ctx.save();
+  ctx.translate(dropper.x, dropper.y);
+  ctx.fillStyle = "#e74c3c";
+  ctx.beginPath(); ctx.arc(0, -16, 11, 0, 7); ctx.fill();           // 胶头
+  ctx.fillStyle = "rgba(200,230,250,0.85)";
+  ctx.fillRect(-4, -8, 8, 34);                                       // 玻璃管
+  ctx.strokeStyle = "#7f9aa8"; ctx.lineWidth = 2;
+  ctx.strokeRect(-4, -8, 8, 34);
+  ctx.restore();
+  ctx.fillStyle = "#41627a"; ctx.font = "bold 13px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("滴管", dropper.x, dropper.y + 42);
+  if (phase === "water" && !cyl.done) {
+    ctx.fillStyle = "rgba(45,106,79,0.75)"; ctx.font = "12px sans-serif";
+    ctx.fillText("微调水位", dropper.x, dropper.y + 58);
+  }
+}
+
+function drawRod() {
+  ctx.save();
+  ctx.translate(rod.x, rod.y);
+  ctx.rotate(0.5);
+  ctx.strokeStyle = "rgba(190,220,235,0.95)"; ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(0, -58); ctx.lineTo(0, 58); ctx.stroke();
+  ctx.strokeStyle = "rgba(120,160,180,0.8)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, -58); ctx.lineTo(0, 58); ctx.stroke();
+  ctx.restore();
+  if (phase === "stir") {
+    ctx.fillStyle = "rgba(45,106,79,0.8)"; ctx.font = "bold 13px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("拖我进烧杯搅拌", rod.hx, rod.hy + 80);
+  }
+}
+
+function drawFormula() {
+  const fx = beaker.cx, fy = beaker.y - 118;
+  const saltStr = beaker.salt > 0 ? `${beaker.salt} g` : "?";
+  const waterStr = beaker.water > 0 ? `${Math.round(beaker.water)} g` : "?";
+  let line2 = `= ${saltStr} ÷（${saltStr} ＋ ${waterStr}）× 100%`;
+  if (beaker.salt > 0 && beaker.water > 0) {
+    line2 += ` = ${(beaker.salt / (beaker.salt + beaker.water) * 100).toFixed(1)}%`;
+  }
+  ctx.fillStyle = "rgba(255,255,255,0.88)";
+  roundRect(fx - 235, fy - 34, 470, 78, 14, true);
+  ctx.strokeStyle = "#8fbc9a"; ctx.lineWidth = 2;
+  roundRect(fx - 235, fy - 34, 470, 78, 14, false); ctx.stroke();
+  ctx.fillStyle = "#2d6a4f"; ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("浓度 ＝ 溶质 ÷（溶质 ＋ 溶剂）× 100%", fx, fy - 10);
+  ctx.fillStyle = "#1b4a35"; ctx.font = "15px monospace";
+  ctx.fillText(line2, fx, fy + 16);
+}
+
+function drawParticles() {
+  for (const g2 of grains) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, g2.life * 2));
+    if (g2.kind === "salt") {
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(g2.x - 2, g2.y - 2, 4, 4);
+    } else {
+      ctx.fillStyle = "rgba(120,190,250,0.9)";
+      ctx.beginPath(); ctx.arc(g2.x, g2.y, 3, 0, 7); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.max(0, Math.min(1, c.life));
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-5, -3, 10, 6);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawDragGhost() {
+  if (!drag) return;
+  if (drag.type === "dish") drawDishAt(drag.obj.x, drag.obj.y, saltOnPan);
+  else if (drag.type === "weight") drawWeightAt(drag.obj, drag.obj.x, drag.obj.y);
+  else if (drag.type === "saltBack") {
+    drawSpoonAt(drag.x, drag.y);
+    ctx.fillStyle = "rgba(45,106,79,0.8)"; ctx.font = "12px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("放回盐瓶 -1g", drag.x, drag.y + 36);
+  }
+}
+
+function drawCelebrate() {
+  if (phase !== "celebrate") return;
+  const pct = (beaker.salt / (beaker.salt + beaker.water) * 100).toFixed(1);
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  roundRect(W / 2 - 250, H * 0.18, 500, 86, 20, true);
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 4;
+  roundRect(W / 2 - 250, H * 0.18, 500, 86, 20, false); ctx.stroke();
+  ctx.fillStyle = "#e67e22"; ctx.font = "bold 34px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(`🎉 浓度 = ${pct}% ✓`, W / 2, H * 0.18 + 34);
+  ctx.fillStyle = "#2d6a4f"; ctx.font = "17px sans-serif";
+  ctx.fillText(`${beaker.salt} g ÷（${beaker.salt} g ＋ ${Math.round(beaker.water)} g）× 100% ＝ ${pct}%`, W / 2, H * 0.18 + 66);
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawTable();
+  drawBalance();
+  drawWeightsTray();
+  drawBottleAndSpoon();
+  drawFormula();
+  drawBeaker();
+  drawCylinder();
+  drawPitcher();
+  drawDropper();
+  drawRod();
+  // 倾倒动画里的器具姿态
+  if (pourAnim && pourAnim.type === "salt") drawDishAt(beaker.cx, beaker.y - 56, saltOnPan * (1 - pourAnim.t / pourAnim.dur));
+  if (pourAnim && pourAnim.type === "water") {
+    ctx.save();
+    ctx.translate(beaker.cx + 50, beaker.y - 110);
+    ctx.rotate(-1.15);
+    ctx.fillStyle = "rgba(200,230,250,0.5)";
+    ctx.fillRect(-cyl.w / 2, -20, cyl.w, 120);
+    ctx.strokeStyle = "#7f9aa8"; ctx.lineWidth = 3;
+    ctx.strokeRect(-cyl.w / 2, -20, cyl.w, 120);
+    ctx.restore();
+  }
+  drawParticles();
+  drawDragGhost();
+  drawCelebrate();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const ding = () => { tone(880, 0.25, 0.12); setTimeout(() => tone(1320, 0.3, 0.1), 120); };
+const whooshS = () => tone(320, 0.35, 0.08, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3600);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+document.getElementById("resetBtn").addEventListener("click", () => { startTask(taskIdx); pop(660); });
+document.getElementById("replayBtn").addEventListener("click", () => {
+  winPanel.style.display = "none";
+  startTask(0); pop(880);
+});
+
+startTask(0);
+resize();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

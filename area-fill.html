@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>面积铺满</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#fff6e0; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(90,60,20,0.85); color:#ffe9a8; padding:10px 22px;
+    border-radius:24px; font-size:19px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(90,60,20,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #modeBar { position:absolute; top:12px; left:12px; display:flex; gap:10px; z-index:10; }
+  #modeBar button, #changeBtn {
+    font-size:18px; font-weight:bold; padding:10px 18px;
+    border-radius:24px; border:3px solid #e0a400; background:#fff; color:#8a5a00;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.15);
+  }
+  #modeBar button.on { background:#ffb700; color:#5a3d00; }
+  #modeBar button:active, #changeBtn:active { transform:scale(1.06); }
+  #changeBtn { position:absolute; top:12px; right:12px; z-index:10; }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.45);
+  }
+  #winPanel .msg {
+    font-size:38px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center; line-height:1.5;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar"></div>
+<div id="modeBar">
+  <button id="btnA">🧱 自由铺</button>
+  <button id="btnB">⚖️ 比一比</button>
+</div>
+<button id="changeBtn">🔁 换形状</button>
+<div id="hint"></div>
+<div id="winPanel">
+  <div class="msg"></div>
+  <button id="againBtn">再玩一次</button>
+  <button id="goABtn">去自由铺 🧱</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+const changeBtn = document.getElementById("changeBtn");
+const TAU = Math.PI * 2;
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  layout();
+}
+window.addEventListener("resize", resize);
+
+function roundRectPath(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/* ================= 形状数据 ================= */
+// 每个形状用字符网格定义，X = 一格 1×1 方砖的位置
+const RECT = { name:"长方形", eye:null, rows:[
+  "XXXXXX",
+  "XXXXXX",
+  "XXXXXX",
+  "XXXXXX",
+]};
+const FISH = { name:"小鱼", eye:[1,1], rows:[
+  ".XXX..X",
+  "XXXXXXX",
+  "XXXXXXX",
+  ".XXX..X",
+]};
+const SHAPES_A = [RECT, FISH];
+// 比一比：两个形状不一样，但都是 12 格
+const B_LEFT = { name:"长方形", eye:null, rows:[
+  "XXXX",
+  "XXXX",
+  "XXXX",
+]};
+const B_RIGHT = { name:"L 形", eye:null, rows:[
+  "X......",
+  "X......",
+  "X......",
+  "X......",
+  "X......",
+  "XXXXXXX",
+]};
+
+function buildShape(def) {
+  const cells = [], set = new Set();
+  let cols = 0;
+  def.rows.forEach((row, r) => {
+    cols = Math.max(cols, row.length);
+    for (let c = 0; c < row.length; c++)
+      if (row[c] === "X") { cells.push({r, c}); set.add(r + "," + c); }
+  });
+  return { def, name:def.name, eye:def.eye, cells, set, cols, rows:def.rows.length };
+}
+function makeSide(def) {
+  return { shape:buildShape(def), placed:new Map(), done:false, ox:0, oy:0, cs:48 };
+}
+
+/* ================= 游戏状态 ================= */
+const PALETTE = ["#ff6b6b","#ffa94d","#ffd43b","#69db7c","#4dabf7","#b197fc","#f783ac","#63e6be"];
+let colorIdx = 0;
+function nextColor() { return PALETTE[(colorIdx++) % PALETTE.length]; }
+
+let mode = "A";          // "A" 自由铺 | "B" 比一比
+let shapeIdxA = 0;
+let A = null;            // 自由铺场景（一个 side）
+let B = null;            // 比一比场景 {left, right, guess, revealed}
+let tray = {x:0, y:0, w:0, h:0, horiz:false};
+let drag = null;         // {color, x, y, src:{side,r,c}|null, moved, downX, downY, pid}
+let sel = null;          // {side, r, c} 选中待删除的方砖
+
+function sides() { return mode === "A" ? [A] : [B.left, B.right]; }
+
+function resetA() { A = makeSide(SHAPES_A[shapeIdxA]); drag = null; sel = null; }
+function resetB() {
+  B = { left:makeSide(B_LEFT), right:makeSide(B_RIGHT), guess:null, revealed:false };
+  drag = null; sel = null;
+}
+
+function setMode(m) {
+  mode = m;
+  if (m === "A") resetA(); else resetB();
+  winPanel.style.display = "none";
+  changeBtn.style.display = m === "A" ? "block" : "none";
+  document.getElementById("btnA").classList.toggle("on", m === "A");
+  document.getElementById("btnB").classList.toggle("on", m === "B");
+  layout(); updateScore();
+  showHint(m === "A" ? "从左边拖小方砖，把大图形铺满！" : "先猜一猜：哪个面积大？点上面的卡片选一选！");
+}
+
+/* ================= 布局 ================= */
+function layout() {
+  if (!A || !B) return;
+  if (mode === "A") {
+    const s = A.shape;
+    const availW = W - 130 - 80, availH = H - 110 - 70;
+    const cs = Math.max(28, Math.min(64, availW / s.cols, availH / s.rows));
+    A.cs = cs;
+    A.ox = 130 + (W - 130 - s.cols * cs) / 2;
+    A.oy = 110 + (availH - s.rows * cs) / 2;
+    tray = { x:12, y:110, w:106, h:H - 110 - 70, horiz:false };
+  } else {
+    const topRoom = 200, botRoom = 150;
+    const availW = W / 2 - 60, availH = H - topRoom - botRoom;
+    let cs = Math.min(52,
+      availW / B.left.shape.cols, availH / B.left.shape.rows,
+      availW / B.right.shape.cols, availH / B.right.shape.rows);
+    cs = Math.max(24, cs);
+    for (const [side, cx] of [[B.left, W * 0.25], [B.right, W * 0.75]]) {
+      side.cs = cs;
+      side.ox = cx - side.shape.cols * cs / 2;
+      side.oy = topRoom + (availH - side.shape.rows * cs) / 2;
+    }
+    const tw = Math.min(430, W - 60);
+    tray = { x:W / 2 - tw / 2, y:H - 130, w:tw, h:72, horiz:true };
+  }
+}
+
+/* ================= 交互 ================= */
+function inTray(x, y) { return x >= tray.x && x <= tray.x + tray.w && y >= tray.y && y <= tray.y + tray.h; }
+
+function cellAt(x, y) {
+  for (const side of sides()) {
+    const c = Math.floor((x - side.ox) / side.cs);
+    const r = Math.floor((y - side.oy) / side.cs);
+    if (side.shape.set.has(r + "," + c)) return { side, r, c };
+  }
+  return null;
+}
+function tileAt(x, y) {
+  const t = cellAt(x, y);
+  if (t && t.side.placed.has(t.r + "," + t.c)) return t;
+  return null;
+}
+function handlePos(s) {
+  return { x:s.side.ox + (s.c + 1) * s.side.cs - 2, y:s.side.oy + s.r * s.side.cs + 2 };
+}
+function cardAt(x, y) {
+  if (mode !== "B" || B.revealed) return null;
+  for (const [key, side] of [["left", B.left], ["right", B.right]]) {
+    const cx = side.ox + side.shape.cols * side.cs / 2;
+    const cy = side.oy - 48;
+    if (Math.abs(x - cx) <= 75 && Math.abs(y - cy) <= 36) return key;
+  }
+  return null;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex" || drag) return;
+  const x = e.clientX, y = e.clientY;
+  // 1. 红色 ✕ 删除手柄
+  if (sel) {
+    const hp = handlePos(sel);
+    if (Math.hypot(x - hp.x, y - hp.y) < 24) {
+      sel.side.placed.delete(sel.r + "," + sel.c);
+      sel.side.done = false;
+      sel = null; pop(240); updateScore();
+      return;
+    }
+  }
+  // 2. 比一比：点卡片猜一猜
+  const g = cardAt(x, y);
+  if (g) {
+    B.guess = g; pop(720);
+    showHint("好！铺一铺、数一数，看看你猜得对不对！");
+    return;
+  }
+  // 3. 点中已铺的方砖 → 拿起来
+  const t = tileAt(x, y);
+  if (t) {
+    const key = t.r + "," + t.c;
+    const color = t.side.placed.get(key);
+    t.side.placed.delete(key);
+    t.side.done = false;
+    drag = { color, x, y, src:{ side:t.side, r:t.r, c:t.c }, moved:false, downX:x, downY:y, pid:e.pointerId };
+    sel = null;
+    canvas.setPointerCapture(e.pointerId);
+    updateScore();
+    return;
+  }
+  // 4. 点工具箱 → 拿出一块新方砖
+  if (inTray(x, y)) {
+    drag = { color:nextColor(), x, y, src:null, moved:false, downX:x, downY:y, pid:e.pointerId };
+    canvas.setPointerCapture(e.pointerId);
+    pop(500);
+    return;
+  }
+  // 5. 点空白 → 取消选中
+  sel = null;
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!drag || e.pointerId !== drag.pid) return;
+  drag.x = e.clientX; drag.y = e.clientY;
+  if (Math.hypot(drag.x - drag.downX, drag.y - drag.downY) > 8) drag.moved = true;
+});
+
+function endDrag(e) {
+  if (!drag || (e.pointerId !== undefined && e.pointerId !== drag.pid)) return;
+  const d = drag; drag = null;
+  // 原地轻点已铺方砖 → 选中，出现 ✕ 手柄
+  if (!d.moved && d.src) {
+    d.src.side.placed.set(d.src.r + "," + d.src.c, d.color);
+    sel = { side:d.src.side, r:d.src.r, c:d.src.c };
+    pop(620); updateScore();
+    return;
+  }
+  // 拖回工具箱 → 收回
+  if (inTray(d.x, d.y)) { pop(240); updateScore(); return; }
+  // 尝试吸附到网格
+  const t = cellAt(d.x, d.y);
+  if (t && !t.side.placed.has(t.r + "," + t.c)) {
+    t.side.placed.set(t.r + "," + t.c, d.color);
+    pop(520 + Math.random() * 140);
+    checkDone(t.side);
+  } else if (d.src) {
+    // 没铺好：放回原来的格子
+    d.src.side.placed.set(d.src.r + "," + d.src.c, d.color);
+  }
+  updateScore();
+}
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+
+/* ================= 完成判定 ================= */
+function checkDone(side) {
+  if (side.placed.size !== side.shape.cells.length || side.done) return;
+  side.done = true;
+  fanfare();
+  if (mode === "A") {
+    showHint(`🎉 铺满啦！这个${side.shape.name}的面积是 ${side.placed.size} 块方砖！`);
+  } else {
+    showHint(`${side === B.left ? "左边" : "右边"}铺满啦！用了 ${side.placed.size} 块！`);
+    if (B.left.done && B.right.done) {
+      B.revealed = true;
+      setTimeout(() => {
+        winPanel.querySelector(".msg").innerHTML =
+          `🎉 原来都是 ${B.left.shape.cells.length} 块！<br>面积一样大！`;
+        winPanel.style.display = "flex";
+        fanfare();
+      }, 900);
+    }
+  }
+}
+
+function updateScore() {
+  if (mode === "A") scorebar.textContent = `🧱 用了 ${A.placed.size} 块`;
+  else scorebar.textContent = `左边 ${B.left.placed.size} 块 · 右边 ${B.right.placed.size} 块`;
+}
+
+/* ================= 绘制 ================= */
+function drawTile(x, y, s, color, alpha) {
+  ctx.save();
+  if (alpha !== undefined) ctx.globalAlpha = alpha;
+  roundRectPath(x + 2, y + 2, s - 4, s - 4, Math.min(9, s * 0.2));
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  roundRectPath(x + 6, y + 6, s - 12, (s - 12) * 0.32, 5);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawShapeOutline(side) {
+  const { shape, ox, oy, cs } = side;
+  // 格子底色
+  ctx.fillStyle = "#eef5fa";
+  for (const {r, c} of shape.cells) ctx.fillRect(ox + c * cs, oy + r * cs, cs, cs);
+  // 内部浅色网格线
+  ctx.strokeStyle = "#c9dae6"; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (const {r, c} of shape.cells) {
+    ctx.strokeRect(ox + c * cs, oy + r * cs, cs, cs);
+  }
+  // 外轮廓（只在边缘画线）；铺满时发光
+  ctx.save();
+  if (side.done) {
+    ctx.shadowColor = "#ffd43b";
+    ctx.shadowBlur = 16 + 9 * Math.sin(performance.now() / 220);
+  }
+  ctx.strokeStyle = side.done ? "#ffb700" : "#5b7a99";
+  ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath();
+  const has = (r, c) => shape.set.has(r + "," + c);
+  for (const {r, c} of shape.cells) {
+    const x0 = ox + c * cs, y0 = oy + r * cs, x1 = x0 + cs, y1 = y0 + cs;
+    if (!has(r - 1, c)) { ctx.moveTo(x0, y0); ctx.lineTo(x1, y0); }
+    if (!has(r + 1, c)) { ctx.moveTo(x0, y1); ctx.lineTo(x1, y1); }
+    if (!has(r, c - 1)) { ctx.moveTo(x0, y0); ctx.lineTo(x0, y1); }
+    if (!has(r, c + 1)) { ctx.moveTo(x1, y0); ctx.lineTo(x1, y1); }
+  }
+  ctx.stroke();
+  ctx.restore();
+  // 小鱼的眼睛
+  if (shape.eye) {
+    const ex = ox + (shape.eye[1] + 0.5) * cs, ey = oy + (shape.eye[0] + 0.5) * cs;
+    ctx.beginPath(); ctx.arc(ex, ey, cs * 0.18, 0, TAU);
+    ctx.fillStyle = "#fff"; ctx.fill();
+    ctx.strokeStyle = "#5b7a99"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(ex, ey, cs * 0.08, 0, TAU);
+    ctx.fillStyle = "#333"; ctx.fill();
+  }
+}
+
+function drawPlaced(side) {
+  for (const [key, color] of side.placed) {
+    const [r, c] = key.split(",").map(Number);
+    drawTile(side.ox + c * side.cs, side.oy + r * side.cs, side.cs, color);
+  }
+}
+
+function drawTray() {
+  ctx.save();
+  roundRectPath(tray.x, tray.y, tray.w, tray.h, 18);
+  ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.fill();
+  ctx.strokeStyle = "#e0a400"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#8a5a00";
+  ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  if (tray.horiz) {
+    ctx.fillText("小方砖 · 拖我 →", tray.x + tray.w / 2, tray.y + 16);
+    const s = 40, n = 6, gap = (tray.w - 30 - n * s) / (n - 1);
+    for (let i = 0; i < n; i++)
+      drawTile(tray.x + 15 + i * (s + gap), tray.y + 26, s, PALETTE[i % PALETTE.length]);
+  } else {
+    ctx.fillText("小方砖", tray.x + tray.w / 2, tray.y + 22);
+    ctx.fillText("拖我 →", tray.x + tray.w / 2, tray.y + 42);
+    const s = 56, n = 4, gap = 18;
+    const totalH = n * s + (n - 1) * gap;
+    let y = tray.y + 60 + (tray.h - 70 - totalH) / 2;
+    for (let i = 0; i < n; i++) {
+      drawTile(tray.x + (tray.w - s) / 2, y, s, PALETTE[i % PALETTE.length]);
+      y += s + gap;
+    }
+  }
+  ctx.restore();
+}
+
+function drawCards() {
+  for (const [key, side] of [["left", B.left], ["right", B.right]]) {
+    const cx = side.ox + side.shape.cols * side.cs / 2;
+    const cy = side.oy - 48;
+    ctx.save();
+    roundRectPath(cx - 75, cy - 36, 150, 72, 16);
+    ctx.fillStyle = "#fff"; ctx.fill();
+    ctx.lineWidth = B.guess === key ? 6 : 3;
+    ctx.strokeStyle = B.guess === key ? "#ffb700" : "#9db8cc";
+    ctx.stroke();
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    if (B.revealed) {
+      ctx.fillStyle = "#e8590c";
+      ctx.font = "bold 26px sans-serif";
+      ctx.fillText(`${side.shape.cells.length} 块！`, cx, cy);
+    } else {
+      ctx.fillStyle = "#5b7a99";
+      ctx.font = "bold 34px sans-serif";
+      ctx.fillText("？", cx, cy - 4);
+    }
+    if (B.guess === key && !B.revealed) {
+      ctx.fillStyle = "#e8590c";
+      ctx.font = "bold 15px sans-serif";
+      ctx.fillText("👆 我选这个", cx, cy + 46);
+    }
+    ctx.restore();
+  }
+}
+
+function drawSelection() {
+  if (!sel) return;
+  const { side, r, c } = sel;
+  const x = side.ox + c * side.cs, y = side.oy + r * side.cs;
+  ctx.save();
+  ctx.setLineDash([6, 5]);
+  ctx.strokeStyle = "#ffb700"; ctx.lineWidth = 3;
+  ctx.strokeRect(x - 3, y - 3, side.cs + 6, side.cs + 6);
+  ctx.setLineDash([]);
+  // 红色 ✕ 删除手柄
+  const hp = handlePos(sel);
+  ctx.beginPath(); ctx.arc(hp.x, hp.y, 14, 0, TAU);
+  ctx.fillStyle = "#e93b3b"; ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(hp.x - 5, hp.y - 5); ctx.lineTo(hp.x + 5, hp.y + 5);
+  ctx.moveTo(hp.x + 5, hp.y - 5); ctx.lineTo(hp.x - 5, hp.y + 5);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawDrag() {
+  if (!drag) return;
+  // 目标格高亮
+  const t = cellAt(drag.x, drag.y);
+  if (t && !t.side.placed.has(t.r + "," + t.c)) {
+    ctx.fillStyle = "rgba(255,212,59,0.55)";
+    ctx.fillRect(t.side.ox + t.c * t.side.cs, t.side.oy + t.r * t.side.cs, t.side.cs, t.side.cs);
+  }
+  const s = mode === "A" ? A.cs : B.left.cs;
+  drawTile(drag.x - s / 2, drag.y - s / 2, s, drag.color, 0.9);
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#fff6e0"); g.addColorStop(1, "#ffeccb");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  drawTray();
+  for (const side of sides()) { drawShapeOutline(side); drawPlaced(side); }
+  if (mode === "B") drawCards();
+  drawSelection();
+  drawDrag();
+}
+
+/* ================= 主循环 ================= */
+function loop() {
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.13);
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3000);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+document.getElementById("btnA").addEventListener("click", () => { setMode("A"); pop(660); });
+document.getElementById("btnB").addEventListener("click", () => { setMode("B"); pop(660); });
+changeBtn.addEventListener("click", () => {
+  shapeIdxA = (shapeIdxA + 1) % SHAPES_A.length;
+  resetA(); layout(); updateScore(); pop(660);
+  showHint(`新形状：${A.shape.name}！把它铺满吧！`);
+});
+document.getElementById("againBtn").addEventListener("click", () => {
+  resetB(); layout(); updateScore();
+  winPanel.style.display = "none"; pop(660);
+  showHint("再猜一次：哪个面积大？");
+});
+document.getElementById("goABtn").addEventListener("click", () => { setMode("A"); pop(660); });
+
+resetA(); resetB();
+setMode("A");
+resize();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

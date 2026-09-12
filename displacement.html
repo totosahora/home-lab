@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>谁抢了谁的电子？</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#1c2733; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(10,20,30,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(10,20,30,0.88); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap; max-width:96vw;
+  }
+  #resetBtn {
+    position:absolute; top:12px; left:12px; z-index:10;
+    font-size:16px; font-weight:bold; padding:10px 18px;
+    border-radius:24px; border:none; background:#3a6ea8; color:#fff;
+    cursor:pointer; box-shadow:0 3px 8px rgba(0,0,0,0.3);
+  }
+  #resetBtn:active { transform:scale(1.06); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center;
+    background:rgba(0,0,0,0.55);
+  }
+  #winPanel .card {
+    background:linear-gradient(160deg,#fdf6e3,#ffe9b8);
+    border-radius:22px; padding:30px 40px; max-width:min(620px, 92vw);
+    box-shadow:0 10px 40px rgba(0,0,0,0.5); text-align:center;
+  }
+  #winPanel .msg { font-size:34px; font-weight:bold; color:#8a5a00; margin-bottom:12px; }
+  #winPanel .rule { font-size:20px; font-weight:bold; color:#c0392b; margin-bottom:10px; }
+  #winPanel .body { font-size:16px; color:#4a3a1a; line-height:1.7; margin-bottom:18px; }
+  #winPanel .chain { font-size:20px; font-weight:bold; color:#2c5f8a; margin-bottom:20px; }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#5a3d00;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">🕵️ 谁抢了谁的电子？ · 链条点亮 ⚡ 0 / 5</div>
+<button id="resetBtn">🔄 重新调查</button>
+<div id="hint">把左边的金属条拖进右边溶液瓶：排在前面的金属，能抢走排在后面金属的“位置”！</div>
+<div id="winPanel">
+  <div class="card">
+    <div class="msg">🎉 真相大白！</div>
+    <div class="rule">置换规律：前换后！</div>
+    <div class="body">
+      在金属活动性顺序里，排在前面的金属更“活泼”，<br>
+      能把排在后面的金属从它的盐溶液里“抢”出来（置换），<br>
+      自己变成离子进入溶液；排在后面的金属抢不动，只能静悄悄。
+    </div>
+    <div class="chain">Mg ＞ Zn ＞ Fe ＞ Cu ＞ Ag</div>
+    <button id="replayBtn">再查一次</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1, S = 1;   // S = 整体缩放
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  S = Math.min(W / 1280, H / 800);
+  layout();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据 ================= */
+// 金属活动性：Mg > Zn > Fe > Cu > Ag
+const METALS = [
+  { id:"mg", name:"镁条", symbol:"Mg", act:4, color:"#dde2e8", dark:"#a9b0ba" },
+  { id:"zn", name:"锌条", symbol:"Zn", act:3, color:"#c6cfd9", dark:"#8e98a5" },
+  { id:"fe", name:"铁条", symbol:"Fe", act:2, color:"#bcc1c9", dark:"#7c828c" },
+  { id:"cu", name:"铜条", symbol:"Cu", act:1, color:"#cf8050", dark:"#94522c" },
+  { id:"ag", name:"银条", symbol:"Ag", act:0, color:"#eceef2", dark:"#b7bcc5" },
+];
+// 四种盐溶液：metal = 溶液中可被置换的金属
+const SOLNS = [
+  { id:"cuso4", name:"硫酸铜",   formula:"CuSO₄", metal:"cu", color:[70,130,225]  },  // 蓝色
+  { id:"feso4", name:"硫酸亚铁", formula:"FeSO₄", metal:"fe", color:[168,216,142] },  // 浅绿色
+  { id:"agno3", name:"硝酸银",   formula:"AgNO₃", metal:"ag", color:[232,240,246] },  // 无色
+  { id:"znso4", name:"硫酸锌",   formula:"ZnSO₄", metal:"zn", color:[236,243,248] },  // 无色
+];
+const METAL_BY_ID = {};
+METALS.forEach((m, i) => { m.idx = i; METAL_BY_ID[m.id] = m; });
+// 置换后生成的溶液颜色（活泼金属的盐）
+const PRODUCT_COLOR = { mg:[236,243,248], zn:[236,243,248], fe:[168,216,142], cu:[70,130,225] };
+// 析出金属（镀层）的颜色
+const DEPOSIT_COLOR = { cu:[178,90,46], ag:[235,238,243], fe:[62,64,70], zn:[150,158,170] };
+
+let metals = [];     // {def, x, y, home, state, bx, ok, prog, dur, coat, anim, drag}
+let beakers = [];    // {def, x, y, bw, bh, cur, colFrom, colTo, metalIdx, bubbles, sparks, fb, log}
+let lit = {};        // 活动性链条上被点亮的金属 id -> true
+let chain = { nodes:[], y:0, r:0 };
+let confetti = [];
+let celebrated = false;
+let leftW = 300;
+
+function layout() {
+  leftW = Math.max(230, 300 * S);
+  // 金属条的家（左侧竖排）
+  const bw = Math.min(210 * S, leftW - 40), bh = 56 * S + 10;
+  const y0 = H * 0.30, gap = bh + 16 * S;
+  metals.forEach((m, i) => {
+    m.home = { x: leftW / 2, y: y0 + i * gap };
+    m.w = bw; m.h = bh;
+    if (m.state === "home" || m.state === "return") { m.x = m.home.x; m.y = m.home.y; }
+    if (m.state === "insert" || m.state === "lift") {  // 缩放时打断反应，退回重来
+      if (m.bx !== null && beakers[m.bx]) beakers[m.bx].metalIdx = null;
+      m.state = "home"; m.x = m.home.x; m.y = m.home.y; m.prog = 0; m.coat = null;
+    }
+  });
+  // 右侧溶液瓶一排
+  const areaX = leftW + 30, areaW = W - areaX - 30;
+  const kbw = Math.min(200 * S * 1.15, (areaW - 30) / 4 - 16);
+  const kbh = kbw * 1.15;
+  const kgap = (areaW - kbw * 4) / 5;
+  const ky = H * 0.72;   // 瓶底
+  beakers.forEach((b, i) => {
+    b.x = areaX + kgap + i * (kbw + kgap) + kbw / 2;
+    b.y = ky; b.bw = kbw; b.bh = kbh;
+  });
+  // 顶部活动性链条
+  chain.y = Math.max(130, H * 0.17);
+  chain.r = 27 * S + 4;
+  const span = Math.min(W * 0.56, 640 * S + 200);
+  const x0 = W / 2 - span / 2, step = span / 4;
+  chain.nodes = METALS.map((m, i) => ({ id:m.id, symbol:m.symbol, x:x0 + i * step, y:chain.y }));
+}
+
+function resetGame() {
+  metals = METALS.map(d => ({
+    def:d, x:0, y:0, home:{x:0,y:0}, w:0, h:0,
+    state:"home", bx:null, ok:false, prog:0, dur:1, coat:null, anim:null, drag:null
+  }));
+  beakers = SOLNS.map(d => ({
+    def:d, x:0, y:0, bw:0, bh:0,
+    cur:d.color.slice(), colFrom:d.color.slice(), colTo:d.color.slice(),
+    metalIdx:null, bubbles:[], sparks:[], fb:null, log:[]
+  }));
+  lit = {}; confetti = []; celebrated = false;
+  winPanel.style.display = "none";
+  layout();
+  updateScore();
+}
+function updateScore() {
+  scorebar.textContent = `🕵️ 谁抢了谁的电子？ · 链条点亮 ⚡ ${Object.keys(lit).length} / 5`;
+}
+
+/* ================= 反应规则 ================= */
+function equation(mdef, sdef) {
+  const prod = sdef.id === "agno3" ? `${mdef.symbol}(NO₃)₂` : `${mdef.symbol}SO₄`;
+  const dep = METAL_BY_ID[sdef.metal].symbol;
+  if (sdef.id === "agno3") return `${mdef.symbol} + 2AgNO₃ → ${prod} + 2Ag`;
+  return `${mdef.symbol} + ${sdef.formula} → ${prod} + ${dep}`;
+}
+
+// 把金属条投入烧瓶
+function tryDrop(m, bi) {
+  const b = beakers[bi];
+  if (b.metalIdx !== null) {
+    showHint("这个瓶子里已经有一根金属条啦，等它出来先！");
+    sendHome(m);
+    return;
+  }
+  const target = METAL_BY_ID[b.def.metal];
+  b.metalIdx = m.def.idx;
+  m.state = "insert"; m.bx = bi;
+  m.ok = m.def.act > target.act;          // 活动性前面的才能置换后面的
+  m.prog = 0;
+  m.dur = m.ok ? 2.8 : 1.5;
+  m.coat = m.ok ? b.def.metal : null;     // 成功后镀上的金属
+  b.colFrom = b.cur.slice();
+  b.colTo = m.ok ? PRODUCT_COLOR[m.def.id].slice() : b.cur.slice();
+  // 插入动画
+  m.anim = { x0:m.x, y0:m.y, x1:b.x, y1:b.y - b.bh * 0.42, t:0, dur:0.3, phase:"dip" };
+  pop(m.ok ? 660 : 300);
+}
+
+function sendHome(m) {
+  m.state = "return";
+  m.anim = { x0:m.x, y0:m.y, x1:m.home.x, y1:m.home.y, t:0, dur:0.45, phase:"home" };
+}
+
+function finishReaction(m) {
+  const b = beakers[m.bx];
+  const target = METAL_BY_ID[b.def.metal];
+  if (m.ok) {
+    lit[m.def.id] = true; lit[target.id] = true;   // 点亮链条上这一对
+    b.fb = { type:"ok", t:0 };
+    b.log.push({ ok:true });
+    showHint(`✓ ${equation(m.def, b.def)} — ${m.def.symbol} 抢走了 ${target.symbol} 的位置！`);
+    chime();
+    updateScore();
+    checkWin();
+  } else {
+    b.fb = { type:"no", t:0 };
+    b.log.push({ ok:false });
+    showHint(`✗ 静悄悄…… ${m.def.symbol} 排在 ${target.symbol} 后面，抢不动电子`);
+    deny();
+  }
+  m.state = "lift";
+  m.anim = { x0:m.x, y0:m.y, x1:m.x, y1:b.y - b.bh - m.h, t:0, dur:0.35, phase:"lift" };
+}
+
+function checkWin() {
+  if (celebrated || Object.keys(lit).length < 5) return;
+  celebrated = true;
+  setTimeout(() => {
+    for (let i = 0; i < 140; i++) {
+      confetti.push({
+        x: Math.random() * W, y: -20 - Math.random() * H * 0.4,
+        vx: (Math.random() - 0.5) * 60, vy: 120 + Math.random() * 160,
+        w: 8 + Math.random() * 7, h: 5 + Math.random() * 5,
+        c: `hsl(${Math.random() * 360},85%,60%)`,
+        rot: Math.random() * 7, vr: (Math.random() - 0.5) * 8
+      });
+    }
+    fanfare();
+    winPanel.style.display = "flex";
+  }, 900);
+}
+
+/* ================= 物理 / 动画 ================= */
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function update(dt) {
+  for (const m of metals) {
+    if (m.anim) {
+      m.anim.t += dt;
+      const t = Math.min(1, m.anim.t / m.anim.dur);
+      const e = 1 - (1 - t) * (1 - t);   // easeOut
+      m.x = lerp(m.anim.x0, m.anim.x1, e);
+      m.y = lerp(m.anim.y0, m.anim.y1, e);
+      if (t >= 1) {
+        const phase = m.anim.phase;
+        m.anim = null;
+        if (phase === "lift") { m.prog = 0; m.coat = null; if (beakers[m.bx]) beakers[m.bx].metalIdx = null; m.bx = null; sendHome(m); }
+        else if (phase === "home") { m.state = "home"; }
+      }
+    }
+    if (m.state === "insert" && !m.anim) {
+      m.prog += dt / m.dur;
+      const b = beakers[m.bx];
+      if (m.ok) {
+        // 溶液颜色渐变 + 剧烈冒泡 + 电子流
+        for (let c = 0; c < 3; c++) b.cur[c] = lerp(b.colFrom[c], b.colTo[c], Math.min(1, m.prog));
+        if (Math.random() < dt * 26) {
+          b.bubbles.push({
+            x: m.x + (Math.random() - 0.5) * m.w * 0.8,
+            y: m.y + m.h * 0.4,
+            r: (2 + Math.random() * 4) * S + 1.5,
+            vy: 60 + Math.random() * 80, wob: Math.random() * 7
+          });
+        }
+        if (Math.random() < dt * 16) {   // e⁻ 电子从金属条表面跑进溶液
+          b.sparks.push({
+            x: m.x + (Math.random() - 0.5) * m.w * 0.8,
+            y: m.y + (Math.random() - 0.5) * m.h * 0.5,
+            vx: (Math.random() - 0.5) * 90, vy: 20 + Math.random() * 60,
+            life: 0.7, t: 0
+          });
+        }
+        if (Math.random() < dt * 5) fizz();
+      }
+      if (m.prog >= 1) finishReaction(m);
+    }
+  }
+  for (const b of beakers) {
+    const surf = b.y - b.bh * 0.88;
+    b.bubbles = b.bubbles.filter(u => {
+      u.y -= u.vy * dt; u.x += Math.sin(u.wob + u.y * 0.05) * 14 * dt;
+      return u.y > surf;
+    });
+    b.sparks = b.sparks.filter(p => {
+      p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt;
+      return p.t < p.life && p.y < b.y - 6;
+    });
+    if (b.fb) { b.fb.t += dt; if (b.fb.t > 2.0) b.fb = null; }
+  }
+  confetti = confetti.filter(c => {
+    c.vy += 140 * dt; c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+    return c.y < H + 30;
+  });
+}
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+function drawChain() {
+  ctx.save();
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  ctx.font = `${14 * S + 4}px sans-serif`;
+  ctx.fillText("金属活动性链条（破案关键：谁排在前面谁就能抢！）", W / 2, chain.y - chain.r - 18 * S);
+  for (let i = 0; i < chain.nodes.length; i++) {
+    const n = chain.nodes[i];
+    if (i > 0) {
+      ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(chain.nodes[i-1].x + chain.r + 6, n.y); ctx.lineTo(n.x - chain.r - 6, n.y); ctx.stroke();
+      ctx.fillStyle = "rgba(255,255,255,0.6)";
+      ctx.font = `bold ${18 * S + 6}px sans-serif`;
+      ctx.fillText("＞", (chain.nodes[i-1].x + n.x) / 2, n.y);
+    }
+    const on = !!lit[n.id];
+    if (on) {
+      const g = ctx.createRadialGradient(n.x, n.y, chain.r * 0.3, n.x, n.y, chain.r * 1.8);
+      g.addColorStop(0, "rgba(255,213,74,0.55)"); g.addColorStop(1, "rgba(255,213,74,0)");
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(n.x, n.y, chain.r * 1.8, 0, 7); ctx.fill();
+    }
+    ctx.beginPath(); ctx.arc(n.x, n.y, chain.r, 0, 7);
+    ctx.fillStyle = on ? "#ffd54a" : "rgba(255,255,255,0.10)";
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = on ? "#ffab00" : "rgba(255,255,255,0.45)";
+    ctx.stroke();
+    ctx.fillStyle = on ? "#5a3d00" : "rgba(255,255,255,0.85)";
+    ctx.font = `bold ${17 * S + 6}px sans-serif`;
+    ctx.fillText(n.symbol, n.x, n.y + 1);
+    if (on) {
+      ctx.font = `${15 * S + 5}px sans-serif`;
+      ctx.fillText("⚡", n.x + chain.r * 0.85, n.y - chain.r * 0.85);
+    }
+  }
+  ctx.restore();
+}
+
+function drawPanel() {
+  ctx.save();
+  ctx.fillStyle = "rgba(255,255,255,0.06)";
+  roundRect(12, H * 0.20, leftW - 24, H * 0.56, 18 * S + 8, true);
+  ctx.fillStyle = "rgba(255,255,255,0.8)";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = `bold ${15 * S + 5}px sans-serif`;
+  ctx.fillText("🔍 证物袋：金属条", leftW / 2, H * 0.245);
+  ctx.font = `${13 * S + 3}px sans-serif`;
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.fillText("（上面最活泼，下面最不活泼）", leftW / 2, H * 0.245 + 24 * S + 8);
+  ctx.restore();
+}
+
+function drawMetal(m) {
+  const { w, h } = m;
+  ctx.save();
+  ctx.translate(m.x, m.y);
+  if (m.state === "insert" && !m.anim) ctx.rotate(0.04);
+  // 金属条本体
+  const g = ctx.createLinearGradient(0, -h/2, 0, h/2);
+  g.addColorStop(0, m.def.color); g.addColorStop(1, m.def.dark);
+  ctx.fillStyle = g;
+  roundRect(-w/2, -h/2, w, h, 10 * S + 4, true);
+  ctx.lineWidth = 2; ctx.strokeStyle = "rgba(0,0,0,0.3)";
+  roundRect(-w/2, -h/2, w, h, 10 * S + 4, false, true);
+  // 镀层：成功反应时从底部逐渐覆盖，颜色 = 析出的金属
+  if (m.coat && m.prog > 0) {
+    const dc = DEPOSIT_COLOR[m.coat];
+    const cov = Math.min(1, m.prog * 1.15);
+    ctx.save();
+    roundRect(-w/2, -h/2, w, h, 10 * S + 4, false);
+    ctx.clip();
+    ctx.fillStyle = `rgb(${dc[0]},${dc[1]},${dc[2]})`;
+    ctx.fillRect(-w/2, h/2 - h * cov, w, h * cov);
+    // 镀层边缘的粗糙颗粒
+    ctx.fillStyle = "rgba(0,0,0,0.25)";
+    for (let i = 0; i < 14; i++) {
+      const px = -w/2 + ((i * 37.7) % w);
+      ctx.beginPath(); ctx.arc(px, h/2 - h * cov + ((i * 13.3) % 7), 2.2, 0, 7); ctx.fill();
+    }
+    ctx.restore();
+  }
+  // 高光
+  ctx.fillStyle = "rgba(255,255,255,0.30)";
+  roundRect(-w/2 + 6, -h/2 + 5, w - 12, h * 0.28, 8 * S, true);
+  // 文字
+  ctx.fillStyle = "rgba(20,30,40,0.85)";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = `bold ${16 * S + 6}px sans-serif`;
+  ctx.fillText(`${m.def.name} ${m.def.symbol}`, 0, 6);
+  ctx.restore();
+}
+
+function drawBeaker(b) {
+  const { bw, bh } = b;
+  const top = b.y - bh, left = b.x - bw / 2;
+  const surf = b.y - bh * 0.88;
+  ctx.save();
+  // 液体
+  ctx.fillStyle = `rgba(${b.cur[0]},${b.cur[1]},${b.cur[2]},0.85)`;
+  roundRect(left + 6, surf, bw - 12, b.y - surf - 5, 8, true);
+  // 液面线
+  ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(left + 6, surf); ctx.lineTo(left + bw - 6, surf); ctx.stroke();
+  // 气泡
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  for (const u of b.bubbles) {
+    ctx.beginPath(); ctx.arc(u.x, u.y, u.r, 0, 7); ctx.fill();
+  }
+  // 电子流（金色小点）
+  for (const p of b.sparks) {
+    const a = 1 - p.t / p.life;
+    ctx.fillStyle = `rgba(255,220,80,${0.9 * a})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3.2 * S + 1.5, 0, 7); ctx.fill();
+  }
+  // 玻璃瓶壁
+  ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 4;
+  roundRect(left, top, bw, bh, 12 * S + 4, false, true);
+  ctx.fillStyle = "rgba(255,255,255,0.08)";
+  roundRect(left, top, bw, bh, 12 * S + 4, true);
+  // 瓶内金属条
+  if (b.metalIdx !== null) drawMetal(metals[b.metalIdx]);
+  // ✓ / ✗ 即时反馈
+  if (b.fb) {
+    const t = b.fb.t;
+    const popT = Math.min(1, t / 0.25);
+    const scale = 0.5 + 1.6 * (1 - (1 - popT) * (1 - popT)) * 0.625;  // 弹出来
+    const alpha = t < 1.2 ? 1 : Math.max(0, 1 - (t - 1.2) / 0.8);
+    ctx.globalAlpha = alpha;
+    ctx.font = `bold ${Math.round((44 * S + 16) * scale)}px sans-serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = b.fb.type === "ok" ? "#69f05a" : "#9aa4ae";
+    ctx.shadowColor = "rgba(0,0,0,0.6)"; ctx.shadowBlur = 8;
+    ctx.fillText(b.fb.type === "ok" ? "✓" : "✗", b.x, top - 30 * S - 10);
+    ctx.shadowBlur = 0;
+    if (b.fb.type === "no") {
+      ctx.font = `${13 * S + 3}px sans-serif`;
+      ctx.fillStyle = "rgba(255,255,255,0.75)";
+      ctx.fillText("静悄悄……", b.x, top - 62 * S - 16);
+    }
+    ctx.globalAlpha = 1;
+  }
+  // 标签
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#fff";
+  ctx.font = `bold ${16 * S + 6}px sans-serif`;
+  ctx.fillText(`${b.def.name} ${b.def.formula}`, b.x, b.y + 24 * S + 8);
+  // 证据记录：小圆点 ✓绿 / ✗灰
+  ctx.font = `${12 * S + 3}px sans-serif`;
+  b.log.forEach((rec, i) => {
+    const lx = b.x - (b.log.length - 1) * 11 + i * 22;
+    ctx.fillStyle = rec.ok ? "#69f05a" : "#8a939c";
+    ctx.beginPath(); ctx.arc(lx, b.y + 46 * S + 14, 8, 0, 7); ctx.fill();
+    ctx.fillStyle = "#102030";
+    ctx.fillText(rec.ok ? "✓" : "✗", lx, b.y + 46 * S + 15);
+  });
+  ctx.restore();
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 背景：侦探夜色
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#24344a"); bg.addColorStop(1, "#16202c");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+  // 桌面
+  ctx.fillStyle = "rgba(120,90,50,0.35)";
+  ctx.fillRect(0, H * 0.78, W, H * 0.22);
+  drawPanel();
+  drawChain();
+  for (const b of beakers) drawBeaker(b);
+  // 在家的金属条
+  for (const m of metals) {
+    if (m.state === "home" || m.state === "return") drawMetal(m);
+  }
+  // 拖拽中的金属条最上层
+  for (const m of metals) {
+    if (m.state === "drag") {
+      ctx.save();
+      ctx.shadowColor = "rgba(0,0,0,0.5)"; ctx.shadowBlur = 16; ctx.shadowOffsetY = 8;
+      drawMetal(m);
+      ctx.restore();
+    }
+  }
+  // 拖拽悬停高亮目标瓶
+  if (dragMetal) {
+    const bi = beakerAt(dragMetal.x, dragMetal.y);
+    if (bi !== null) {
+      const b = beakers[bi];
+      ctx.save();
+      ctx.strokeStyle = "rgba(255,213,74,0.9)"; ctx.lineWidth = 4;
+      ctx.setLineDash([10, 8]);
+      roundRect(b.x - b.bw/2 - 8, b.y - b.bh - 8, b.bw + 16, b.bh + 16, 16, false, true);
+      ctx.restore();
+    }
+  }
+  // 彩带
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.c;
+    ctx.fillRect(-c.w/2, -c.h/2, c.w, c.h);
+    ctx.restore();
+  }
+}
+
+/* ================= 交互 ================= */
+let dragMetal = null;
+
+function metalAt(x, y) {
+  for (let i = metals.length - 1; i >= 0; i--) {
+    const m = metals[i];
+    if (m.state !== "home") continue;
+    if (Math.abs(x - m.x) <= m.w / 2 && Math.abs(y - m.y) <= m.h / 2) return m;
+  }
+  return null;
+}
+function beakerAt(x, y) {
+  for (let i = 0; i < beakers.length; i++) {
+    const b = beakers[i];
+    if (x >= b.x - b.bw/2 - 14 && x <= b.x + b.bw/2 + 14 &&
+        y >= b.y - b.bh - 30 && y <= b.y + 10) return i;
+  }
+  return null;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const m = metalAt(e.clientX, e.clientY);
+  if (!m) return;
+  dragMetal = m;
+  m.state = "drag";
+  m.drag = { dx: m.x - e.clientX, dy: m.y - e.clientY };
+  canvas.setPointerCapture(e.pointerId);
+  hintEl.style.opacity = "0";
+  pop(500);
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragMetal) return;
+  dragMetal.x = e.clientX + dragMetal.drag.dx;
+  dragMetal.y = e.clientY + dragMetal.drag.dy;
+});
+function endDrag(e) {
+  if (!dragMetal) return;
+  const m = dragMetal;
+  dragMetal = null;
+  m.drag = null;
+  const bi = beakerAt(m.x, m.y);
+  if (bi !== null) tryDrop(m, bi);
+  else { sendHome(m); pop(320); }
+}
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.12);
+const fizz = () => tone(700 + Math.random() * 900, 0.05, 0.03, "square");
+const deny = () => tone(180, 0.3, 0.12, "triangle");
+function chime() { [660, 880].forEach((f, i) => setTimeout(() => pop(f), i * 110)); }
+function fanfare() { [523, 659, 784, 1047, 1319].forEach((f, i) => setTimeout(() => pop(f), i * 140)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3200);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+document.getElementById("resetBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+resize();
+resetGame();
+requestAnimationFrame(loop);
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

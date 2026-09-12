@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>勾股拼图</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#fdf3dd; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #topbar {
+    position:absolute; top:10px; left:50%; transform:translateX(-50%);
+    display:flex; gap:8px; z-index:10; white-space:nowrap;
+  }
+  #topbar button {
+    font-size:17px; font-weight:bold; padding:9px 16px;
+    border-radius:22px; border:2px solid rgba(180,130,60,0.5);
+    background:rgba(255,255,255,0.9); color:#7a5220; cursor:pointer;
+    box-shadow:0 2px 6px rgba(120,80,20,0.15);
+  }
+  #topbar button.active { background:#ffd54a; border-color:#e0a800; }
+  #topbar button:active { transform:scale(1.07); }
+  #scorebar {
+    position:absolute; top:58px; left:50%; transform:translateX(-50%);
+    background:rgba(60,40,15,0.85); color:#ffd54a; padding:7px 20px;
+    border-radius:20px; font-size:16px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(60,40,15,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; cursor:pointer;
+    transition:opacity 0.6s; white-space:nowrap; max-width:92vw;
+  }
+  body.mb #hint { bottom:126px; }
+  #panelB {
+    position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+    display:none; gap:18px; align-items:center; z-index:10;
+    background:rgba(255,255,255,0.92); border:2px solid rgba(180,130,60,0.5);
+    border-radius:18px; padding:10px 20px; box-shadow:0 2px 8px rgba(120,80,20,0.18);
+  }
+  body.mb #panelB { display:flex; }
+  #panelB .srow { display:flex; align-items:center; gap:10px; font-size:19px; color:#7a5220; }
+  #panelB .srow b { min-width:64px; }
+  #panelB input[type=range] { width:min(220px,32vw); height:34px; accent-color:#e0a800; cursor:pointer; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="topbar">
+  <button id="btnA" class="active">🧩 拼图证明</button>
+  <button id="btnB">🎚 数值探索</button>
+  <button id="resetBtn">⟲ 重摆</button>
+</div>
+<div id="scorebar">已拼入 0 / 4 块</div>
+<div id="hint">把 b² 正方形里的 4 块拼图，拖进 c² 正方形的虚线框里！</div>
+<div id="panelB">
+  <div class="srow"><b>a = <span id="va">2</span></b><input type="range" id="sa" min="1" max="12" step="1" value="2"></div>
+  <div class="srow"><b>b = <span id="vb">2</span></b><input type="range" id="sb" min="1" max="12" step="1" value="2"></div>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const hintEl = document.getElementById("hint");
+const scorebar = document.getElementById("scorebar");
+let W = 0, H = 0, DPR = 1;
+// 世界→屏幕：sx=ox+U*wx, sy=oy-U*wy（世界 y 轴向上）
+let U = 50, ox = 0, oy = 0;
+
+function toScreen(wx, wy) { return [ox + U * wx, oy - U * wy]; }
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  fitView();
+}
+window.addEventListener("resize", resize);
+
+/* ================= 场景数据（模式A：3-4-5 拼图证明） ================= */
+// 直角三角形：O(0,0)，A(3,0)，B(0,4)，斜边 c=5
+// a² 正方形在 a 边下方，b² 正方形在 b 边左侧，c² 正方形贴在斜边外侧
+const C0 = [3, 0], E1 = [0.8, 0.6], E2 = [-0.6, 0.8];   // c² 局部→世界
+function c2w(u, v) { return [C0[0] + u * E1[0] + v * E2[0], C0[1] + u * E1[1] + v * E2[1]]; }
+// Perigal 剖分：c² 内 4 个槽位（c² 局部坐标，已离线验证：4×4 + 中央 3×3 孔 = 25 恰好铺满）
+const SLOT_UV = [
+  [[0,0],[2.5,0],[0.4,2.8],[0,2.5]],
+  [[5,0],[2.5,0],[2.2,0.4],[5,2.5]],
+  [[5,5],[2.5,5],[4.6,2.2],[5,2.5]],
+  [[0,5],[2.5,5],[2.8,4.6],[0,2.5]],
+];
+const HOLE_UV = [[0.4,2.8],[2.8,4.6],[4.6,2.2],[2.2,0.4]];   // 中央孔 = a² 正方形
+// b² 正方形（x∈[-4,0], y∈[0,4]，中心(-2,2)）被过中心、平行/垂直斜边的线剪成 4 块
+const HOME_VERTS = [
+  [[-2,2],[-3.5,4],[0,4],[0,3.5]],
+  [[-2,2],[-4,0.5],[-4,4],[-3.5,4]],
+  [[-2,2],[-0.5,0],[-4,0],[-4,0.5]],
+  [[-2,2],[0,3.5],[0,0],[-0.5,0]],
+];
+const PIECE_COLORS = ["#f59e0b", "#3b82f6", "#22c55e", "#ec4899"];
+
+function centroid(vs) {
+  let x = 0, y = 0;
+  for (const v of vs) { x += v[0]; y += v[1]; }
+  return [x / vs.length, y / vs.length];
+}
+
+/* ================= 游戏状态 ================= */
+let mode = "A";              // A=拼图证明 B=数值探索
+let pieces = [];             // {id,color,local,cx,cy,ang,fx,slot,tween}
+let slots = [];              // {verts,cent,filledBy}
+let holeVerts = [];          // 中央 a² 孔世界坐标
+let drag = null;             // {p, dx, dy}
+let nearSlot = null;         // 拖动中靠近的槽位（高亮）
+let celebratedA = false;
+let confetti = [];
+// 模式B
+let bA = 2, bB = 2;
+const found = new Set();     // 已发现的勾股数 key="3-4-5"
+
+function resetA() {
+  pieces = HOME_VERTS.map((vs, i) => {
+    const c = centroid(vs);
+    return {
+      id: i, color: PIECE_COLORS[i],
+      local: vs.map(v => [v[0] - c[0], v[1] - c[1]]),
+      cx: c[0], cy: c[1], ang: 0, fx: 0,
+      slot: null, tween: null
+    };
+  });
+  slots = SLOT_UV.map(uv => {
+    const vs = uv.map(p => c2w(p[0], p[1]));
+    return { verts: vs, cent: centroid(vs), filledBy: null };
+  });
+  holeVerts = HOLE_UV.map(p => c2w(p[0], p[1]));
+  drag = null; nearSlot = null; celebratedA = false;
+  updateScore();
+}
+function updateScore() {
+  if (mode === "A") {
+    const n = slots.filter(s => s.filledBy).length;
+    scorebar.textContent = celebratedA ? "🎉 a² + b² = c² 成立！" : `已拼入 ${n} / 4 块`;
+  } else {
+    scorebar.textContent = `🎯 找到勾股数 ${found.size} / 4 组`;
+  }
+}
+
+/* ================= 拼图逻辑（顶点/形心磁吸 + 自动旋转翻转） ================= */
+// 块的当前世界顶点：local → x 镜像(fx:0→1 连续) → 旋转 ang → 平移
+function worldVerts(p) {
+  const c = Math.cos(p.ang), s = Math.sin(p.ang), mx = 1 - 2 * p.fx;
+  return p.local.map(v => {
+    const x = v[0] * mx, y = v[1];
+    return [p.cx + x * c - y * s, p.cy + x * s + y * c];
+  });
+}
+// 求把块（形心对齐槽位形心后）贴到槽位上所需的 ang 与是否翻面；
+// 遍历 翻面×循环偏移×环绕方向，取顶点误差最小者（正确匹配 err≈0）
+function matchPose(p, slot) {
+  const sv = slot.verts.map(v => [v[0] - slot.cent[0], v[1] - slot.cent[1]]);
+  let best = null;
+  for (const flip of [false, true]) {
+    const fl = p.local.map(v => flip ? [-v[0], v[1]] : v);
+    for (let off = 0; off < 4; off++) for (const dir of [1, -1]) {
+      let dot = 0, crs = 0;
+      const sv2 = fl.map((_, i) => sv[(((off + dir * i) % 4) + 4) % 4]);
+      for (let i = 0; i < 4; i++) {
+        dot += fl[i][0] * sv2[i][0] + fl[i][1] * sv2[i][1];
+        crs += fl[i][0] * sv2[i][1] - fl[i][1] * sv2[i][0];
+      }
+      const ang = Math.atan2(crs, dot);
+      const c = Math.cos(ang), s = Math.sin(ang);
+      let err = 0;
+      for (let i = 0; i < 4; i++) {
+        const x = fl[i][0] * c - fl[i][1] * s, y = fl[i][0] * s + fl[i][1] * c;
+        err += (x - sv2[i][0]) ** 2 + (y - sv2[i][1]) ** 2;
+      }
+      if (!best || err < best.err) best = { err, ang, flip };
+    }
+  }
+  return best;
+}
+const SNAP_D = 1.8;   // 磁吸半径（世界单位，宽容大）
+function findSlot(p) {
+  let best = null, bd = SNAP_D;
+  for (const s of slots) {
+    if (s.filledBy) continue;
+    const d = Math.hypot(p.cx - s.cent[0], p.cy - s.cent[1]);
+    if (d < bd) { bd = d; best = s; }
+  }
+  return best;
+}
+function snapTo(p, slot) {
+  const m = matchPose(p, slot);
+  let ang = m.ang;
+  while (ang - p.ang > Math.PI) ang -= 2 * Math.PI;
+  while (ang - p.ang < -Math.PI) ang += 2 * Math.PI;
+  slot.filledBy = p; p.slot = slot;
+  p.tween = {
+    t0: performance.now(), dur: 260,
+    from: { cx: p.cx, cy: p.cy, ang: p.ang, fx: p.fx },
+    to: { cx: slot.cent[0], cy: slot.cent[1], ang, fx: m.flip ? 1 : 0 },
+    err: m.err
+  };
+  blip();
+  updateScore();
+}
+function afterSnap(p) {
+  pop(720);
+  if (!celebratedA && slots.every(s => s.filledBy)) {
+    celebratedA = true;
+    updateScore();
+    fanfare();
+    const [gx, gy] = toScreen(3.5, 3.5);
+    spawnConfetti(gx, gy);
+    showHint("🎉 铺满啦！b² 的 4 块 + a² 正好填满 c²：9 + 16 = 25，勾股定理成立！");
+  }
+}
+
+/* ================= 模式切换 ================= */
+const btnA = document.getElementById("btnA");
+const btnB = document.getElementById("btnB");
+function setMode(m) {
+  mode = m;
+  btnA.classList.toggle("active", m === "A");
+  btnB.classList.toggle("active", m === "B");
+  document.body.classList.toggle("mb", m === "B");
+  fitView();
+  updateScore();
+  if (m === "A") showHint("把 b² 正方形里的 4 块拼图，拖进 c² 正方形的虚线框里！");
+  else showHint("拖动滑杆改变 a 和 b，找出让 c 也是整数的勾股数！");
+}
+btnA.addEventListener("click", () => { setMode("A"); pop(660); });
+btnB.addEventListener("click", () => { setMode("B"); pop(660); });
+document.getElementById("resetBtn").addEventListener("click", () => {
+  if (mode === "A") { resetA(); showHint("拼图都放回 b² 正方形啦"); }
+  else { setAB(2, 2); }
+  pop(330);
+});
+
+function fitView() {
+  const top = 150, bot = mode === "B" ? 150 : 40;
+  if (mode === "A") {
+    // 世界包围盒 x∈[-4,7], y∈[-3,7]，中心 (1.5, 2)
+    U = Math.min((W - 60) / 12.4, (H - top - bot) / 11.4);
+    ox = W / 2 - 1.5 * U;
+    oy = (top + H - bot) / 2 + 2 * U;
+  } else {
+    // 世界包围盒 x∈[-b,a+b], y∈[-a,a+b]，中心 (a/2, b/2)
+    const wW = bA + 2 * bB, wH = 2 * bA + bB;
+    U = Math.min((W - 60) / wW, (H - top - bot) / wH);
+    ox = W / 2 - (bA / 2) * U;
+    oy = (top + H - bot) / 2 + (bB / 2) * U;
+  }
+}
+
+/* ================= 模式B：数值探索 ================= */
+const sa = document.getElementById("sa"), sb = document.getElementById("sb");
+const va = document.getElementById("va"), vb = document.getElementById("vb");
+function setAB(a, b) {
+  bA = a; bB = b;
+  sa.value = a; sb.value = b;
+  va.textContent = a; vb.textContent = b;
+  fitView();
+}
+function onSlider() {
+  const a = +sa.value, b = +sb.value;
+  if (a === bA && b === bB) return;
+  setAB(a, b);
+  pop(360 + a * 20 + b * 15);
+  const c2 = a * a + b * b, c = Math.round(Math.sqrt(c2));
+  if (c * c === c2) {
+    const key = [Math.min(a, b), Math.max(a, b), c].join("-");
+    if (!found.has(key)) {
+      found.add(key);
+      fanfare();
+      const [gx, gy] = toScreen(bA / 2, bB / 2 + 1);
+      spawnConfetti(gx, gy);
+      showHint(`🎉 发现勾股数 ${a}² + ${b}² = ${c}² （${a * a} + ${b * b} = ${c * c}）！`);
+      updateScore();
+      if (found.size === 4) setTimeout(() => showHint("🏆 4 组勾股数全找到啦！你是勾股小达人！"), 2200);
+    }
+  }
+}
+sa.addEventListener("input", onSlider);
+sb.addEventListener("input", onSlider);
+
+/* ================= 绘制 ================= */
+function polyS(vs, fill, stroke, lw, dash) {
+  ctx.beginPath();
+  vs.forEach((v, i) => {
+    const [x, y] = toScreen(v[0], v[1]);
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.closePath();
+  if (dash) ctx.setLineDash(dash);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw || 2; ctx.stroke(); }
+  if (dash) ctx.setLineDash([]);
+}
+function txt(s, wx, wy, size, color, bold) {
+  const [x, y] = toScreen(wx, wy);
+  ctx.font = (bold === false ? "" : "bold ") + size + "px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.lineJoin = "round";
+  ctx.lineWidth = Math.max(3, size / 6); ctx.strokeStyle = "rgba(255,250,235,0.92)";
+  ctx.strokeText(s, x, y);
+  ctx.fillStyle = color;
+  ctx.fillText(s, x, y);
+}
+function drawGridSquare(x0, y0, n, fill, stroke) {
+  // 轴对齐 n×n 单位格正方形，左下角 (x0,y0)
+  polyS([[x0,y0],[x0+n,y0],[x0+n,y0+n],[x0,y0+n]], fill, stroke, 2);
+  ctx.strokeStyle = "rgba(120,80,20,0.25)"; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 1; i < n; i++) {
+    let [x1, y1] = toScreen(x0 + i, y0), [x2, y2] = toScreen(x0 + i, y0 + n);
+    ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+    [x1, y1] = toScreen(x0, y0 + i); [x2, y2] = toScreen(x0 + n, y0 + i);
+    ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  }
+  ctx.stroke();
+}
+function drawTriangleFig(a, b, big) {
+  // 直角三角形 + 直角标记
+  polyS([[0,0],[a,0],[0,b]], "#fff8e1", "#5d4037", 3);
+  const r = Math.min(a, b) * 0.14;
+  polyS([[r,0],[r,r],[0,r]], null, "#5d4037", 2);
+  if (big) {
+    txt("a=3", a / 2, 0.48, U * 0.42, "#5d4037");
+    txt("b=4", 0.55, b / 2, U * 0.42, "#5d4037");
+  }
+}
+function drawModeA() {
+  const ts = U * 0.44;
+  // a² 正方形（3×3 格子）
+  drawGridSquare(0, -3, 3, "rgba(255,213,74,0.35)", "#c8930a");
+  txt("a²=9", 1.5, -1.5, ts, "#8a6a10");
+  // b² 正方形 + 剪开线（虚线）
+  polyS([[-4,0],[0,0],[0,4],[-4,4]], "rgba(147,197,253,0.18)", "#3b6fb5", 2);
+  ctx.strokeStyle = "rgba(59,111,181,0.6)"; ctx.lineWidth = 2; ctx.setLineDash([6, 5]);
+  ctx.beginPath();
+  for (const seg of [[[-3.5,4],[-0.5,0]], [[-4,0.5],[0,3.5]]]) {
+    const [x1, y1] = toScreen(seg[0][0], seg[0][1]);
+    const [x2, y2] = toScreen(seg[1][0], seg[1][1]);
+    ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  }
+  ctx.stroke(); ctx.setLineDash([]);
+  txt("b²=16", -2, 4.5, ts, "#2b5ca0");
+  // 三角形
+  drawTriangleFig(3, 4, true);
+  txt("c=5", 1.06, 1.67, ts, "#5d4037");   // 斜边标注放在三角形内侧，避免被 c² 挡住
+  // c² 正方形：槽位虚线框 + 中央 a² 孔
+  polyS([c2w(0,0), c2w(5,0), c2w(5,5), c2w(0,5)], "rgba(255,255,255,0.55)", "#888", 2.5, [9, 7]);
+  for (const s of slots) {
+    if (s.filledBy) continue;
+    const glow = nearSlot === s;
+    polyS(s.verts, glow ? "rgba(47,191,74,0.3)" : null,
+      glow ? "#2fbf4a" : "rgba(80,80,80,0.95)", glow ? 3.5 : 2.5, [8, 6]);
+    if (glow) for (const v of s.verts) {
+      const [x, y] = toScreen(v[0], v[1]);
+      ctx.beginPath(); ctx.arc(x, y, 5, 0, 7);
+      ctx.fillStyle = "#2fbf4a"; ctx.fill();
+    }
+  }
+  // 中央孔 = a² 整体（预先放好）
+  polyS(holeVerts, "rgba(255,213,74,0.75)", "#c8930a", 2, [5, 4]);
+  const hc = centroid(holeVerts);
+  txt("a²=9", hc[0], hc[1], ts * 0.8, "#8a6a10");
+  txt(celebratedA ? "c²=25" : "c²=?", 2.3, 6.15, ts, "#c0392b");
+  // 拼块
+  for (const p of pieces) drawPiece(p);
+  // 公式
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "bold 26px sans-serif"; ctx.fillStyle = "#5d4037";
+  ctx.fillText("a² + b² = c²", W / 2, 104);
+  ctx.font = "bold 22px sans-serif";
+  ctx.fillStyle = celebratedA ? "#1e8e3e" : "#9a7b3f";
+  ctx.fillText(celebratedA ? "9 + 16 = 25  ✓" : "9 + 16 = ？", W / 2, 136);
+}
+function drawPiece(p) {
+  const vs = worldVerts(p);
+  ctx.save();
+  if (drag && drag.p === p) { ctx.shadowColor = "rgba(0,0,0,0.35)"; ctx.shadowBlur = 14; ctx.shadowOffsetY = 5; }
+  polyS(vs, p.color, "rgba(0,0,0,0.45)", 2);
+  ctx.restore();
+  if (p.slot && !p.tween) {
+    const [x, y] = toScreen(p.cx, p.cy);
+    ctx.beginPath(); ctx.arc(x, y, 12, 0, 7);
+    ctx.fillStyle = "rgba(47,191,74,0.92)"; ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.font = "bold 14px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("✓", x, y + 1);
+  }
+}
+function drawModeB() {
+  const a = bA, b = bB, c2 = a * a + b * b, c = Math.sqrt(c2);
+  const ci = Math.round(c), isInt = ci * ci === c2;
+  const ts = Math.max(13, U * 0.62);
+  // 三个正方形
+  drawGridSquare(0, -a, a, "rgba(255,213,74,0.3)", "#c8930a");
+  drawGridSquare(-b, 0, b, "rgba(147,197,253,0.3)", "#3b6fb5");
+  // c² 倾斜正方形 + 单位格线
+  const d = [-a / c, b / c], n = [b / c, a / c];   // 斜边方向 / 外法向
+  const P = (u, v) => [a + u * d[0] + v * n[0], 0 + u * d[1] + v * n[1]];
+  const csq = [P(0,0), P(c,0), P(c,c), P(0,c)];
+  polyS(csq, isInt ? "rgba(120,220,120,0.35)" : "rgba(255,255,255,0.6)", isInt ? "#1e8e3e" : "#888", 2.5);
+  ctx.strokeStyle = "rgba(120,120,120,0.28)"; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let k = 1; k < c; k++) {
+    for (const seg of [[P(k, 0), P(k, c)], [P(0, k), P(c, k)]]) {
+      const [x1, y1] = toScreen(seg[0][0], seg[0][1]);
+      const [x2, y2] = toScreen(seg[1][0], seg[1][1]);
+      ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+    }
+  }
+  ctx.stroke();
+  // 三角形与标注
+  drawTriangleFig(a, b, false);
+  txt(`a=${a}`, a / 2, 0.6, ts, "#8a6a10");
+  txt(`b=${b}`, 0.7, b / 2, ts, "#2b5ca0");
+  const cm = P(c / 2, 0.75);   // c 标注放在斜边外侧 c² 格子区，避开 a/b 标签
+  txt(isInt ? `c=${ci}` : `c≈${c.toFixed(2)}`, cm[0], cm[1], ts, isInt ? "#1e8e3e" : "#666");
+  txt(`a²=${a * a}`, a / 2, -a / 2, ts, "#8a6a10");
+  txt(`b²=${b * b}`, -b / 2, b / 2, ts, "#2b5ca0");
+  const cc = P(c / 2, c / 2);
+  txt(`c²=${c2}`, cc[0], cc[1], ts, isInt ? "#1e8e3e" : "#666");
+  // 公式
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "bold 26px sans-serif"; ctx.fillStyle = "#5d4037";
+  ctx.fillText("a² + b² = c²", W / 2, 104);
+  ctx.font = "bold 22px sans-serif";
+  ctx.fillStyle = isInt ? "#1e8e3e" : "#9a7b3f";
+  ctx.fillText(
+    isInt ? `${a * a} + ${b * b} = ${c2}，c = ${ci} ✓ 勾股数！`
+          : `${a * a} + ${b * b} = ${c2}，c = √${c2} ≈ ${c.toFixed(2)}`,
+    W / 2, 136);
+  // 已找到的勾股数
+  if (found.size) {
+    ctx.font = "bold 16px sans-serif"; ctx.fillStyle = "#7a5220";
+    ctx.textAlign = "right";
+    ctx.fillText("已找到：", W - 20, 108);
+    [...found].forEach((k, i) => {
+      ctx.fillStyle = "#1e8e3e";
+      ctx.fillText("⭐" + k, W - 20, 134 + i * 24);
+    });
+    ctx.textAlign = "center";
+  }
+}
+function spawnConfetti(x, y) {
+  const colors = ["#ef4444","#f97316","#facc15","#22c55e","#3b82f6","#a855f7","#ec4899"];
+  for (let i = 0; i < 90; i++) {
+    confetti.push({
+      x: x + (Math.random() - 0.5) * 120, y: y + (Math.random() - 0.5) * 60,
+      vx: (Math.random() - 0.5) * 420, vy: -Math.random() * 380 - 60,
+      c: colors[i % colors.length], s: 5 + Math.random() * 6,
+      r: Math.random() * 7, vr: (Math.random() - 0.5) * 9
+    });
+  }
+}
+function drawConfetti(dt) {
+  if (!confetti.length) return;
+  for (const c of confetti) {
+    c.vy += 780 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt; c.r += c.vr * dt;
+  }
+  confetti = confetti.filter(c => c.y < H + 30);
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.r);
+    ctx.fillStyle = c.c;
+    ctx.fillRect(-c.s / 2, -c.s / 2, c.s, c.s * 0.6);
+    ctx.restore();
+  }
+}
+function draw(dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#fff8e8"); g.addColorStop(1, "#ffe9c0");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  if (mode === "A") drawModeA(); else drawModeB();
+  drawConfetti(dt);
+}
+
+/* ================= 交互（模式A拖拽拼块） ================= */
+function pointInPoly(sx, sy, vs) {
+  let inside = false;
+  for (let i = 0, j = vs.length - 1; i < vs.length; j = i++) {
+    const [ax, ay] = toScreen(vs[i][0], vs[i][1]);
+    const [bx, by] = toScreen(vs[j][0], vs[j][1]);
+    if ((ay > sy) !== (by > sy) && sx < (bx - ax) * (sy - ay) / (by - ay) + ax) inside = !inside;
+  }
+  return inside;
+}
+canvas.addEventListener("pointerdown", e => {
+  if (mode !== "A") return;
+  const sx = e.clientX, sy = e.clientY;
+  const wx = (sx - ox) / U, wy = (oy - sy) / U;
+  for (let i = pieces.length - 1; i >= 0; i--) {
+    const p = pieces[i];
+    if (p.tween) continue;
+    if (!pointInPoly(sx, sy, worldVerts(p))) continue;
+    // 抓起：已放入的块取出槽位
+    if (p.slot) { p.slot.filledBy = null; p.slot = null; updateScore(); }
+    pieces.splice(i, 1); pieces.push(p);   // 置顶
+    drag = { p, dx: wx - p.cx, dy: wy - p.cy };
+    canvas.setPointerCapture(e.pointerId);
+    pop(440);
+    return;
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const wx = (e.clientX - ox) / U, wy = (oy - e.clientY) / U;
+  drag.p.cx = wx - drag.dx; drag.p.cy = wy - drag.dy;
+  nearSlot = findSlot(drag.p);
+});
+function endDrag() {
+  if (!drag) return;
+  const p = drag.p;
+  if (nearSlot) snapTo(p, nearSlot);
+  nearSlot = null;
+  drag = null;
+}
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.15, 0.14);
+const blip = () => tone(1500, 0.05, 0.08, "square");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 3000);
+}
+hintEl.addEventListener("click", () => { hintEl.style.opacity = "0"; });
+
+/* ================= 主循环 ================= */
+resize();
+resetA();
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  // 拼块磁吸补间动画
+  for (const p of pieces) {
+    if (!p.tween) continue;
+    const t = Math.min(1, (now - p.tween.t0) / p.tween.dur);
+    const e = t * t * (3 - 2 * t);   // smoothstep
+    p.cx = p.tween.from.cx + (p.tween.to.cx - p.tween.from.cx) * e;
+    p.cy = p.tween.from.cy + (p.tween.to.cy - p.tween.from.cy) * e;
+    p.ang = p.tween.from.ang + (p.tween.to.ang - p.tween.from.ang) * e;
+    p.fx = p.tween.from.fx + (p.tween.to.fx - p.tween.from.fx) * e;
+    if (t >= 1) { const tw = p.tween; p.tween = null; p.snapErr = tw.err; afterSnap(p); }
+  }
+  draw(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 测试接口 ================= */
+window.__py = {
+  setMode, setAB, toScreen,
+  mode: () => mode,
+  pieces: () => pieces,
+  slots: () => slots,
+  found: () => [...found],
+  wonA: () => celebratedA,
+  matchErr(p, s) { return matchPose(p, s).err; },
+  // 无头测试用：rAF 不推进时手动完成补间（与主循环 t>=1 分支一致）
+  finishTweens() {
+    for (const p of pieces) {
+      if (!p.tween) continue;
+      const tw = p.tween;
+      p.cx = tw.to.cx; p.cy = tw.to.cy; p.ang = tw.to.ang; p.fx = tw.to.fx;
+      p.tween = null; p.snapErr = tw.err;
+      afterSnap(p);
+    }
+  },
+  // 模拟完美游玩：把每块直接吸附到一个空槽位（走真实 matchPose/snap 路径）
+  solveA() {
+    setMode("A"); resetA();
+    let maxErr = 0;
+    pieces.forEach((p, i) => {
+      const s = slots[i];
+      const m = matchPose(p, s);
+      maxErr = Math.max(maxErr, m.err);
+      s.filledBy = p; p.slot = s;
+      p.cx = s.cent[0]; p.cy = s.cent[1]; p.ang = m.ang; p.fx = m.flip ? 1 : 0;
+      afterSnap(p);
+    });
+    return JSON.stringify({ res: celebratedA ? "OK" : "FAIL", maxErr });
+  }
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>

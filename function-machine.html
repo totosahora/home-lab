@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>函数机器</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#2b3a55; }
+  #stage { position:absolute; inset:0; touch-action:none; display:block; }
+  #scorebar {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(20,28,48,0.85); color:#ffd54a; padding:10px 22px;
+    border-radius:24px; font-size:18px; font-weight:bold; z-index:10;
+    pointer-events:none; white-space:nowrap;
+  }
+  #hint {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(20,28,48,0.85); color:#fff; padding:9px 20px;
+    border-radius:24px; font-size:15px; z-index:10; pointer-events:none;
+    transition:opacity 0.6s; white-space:nowrap;
+  }
+  #options {
+    position:absolute; right:16px; top:50%; transform:translateY(-50%);
+    display:flex; flex-direction:column; gap:14px; z-index:10; align-items:stretch;
+  }
+  #options .title {
+    color:#fff; font-size:16px; font-weight:bold; text-align:center;
+    background:rgba(20,28,48,0.7); border-radius:14px; padding:6px 10px;
+  }
+  .optBtn {
+    font-size:22px; font-weight:bold; padding:16px 20px; min-width:190px;
+    border-radius:18px; border:4px solid rgba(255,255,255,0.85);
+    background:#ffd54a; color:#4a3200; cursor:pointer;
+    box-shadow:0 4px 10px rgba(0,0,0,0.35); font-family:inherit;
+    transition:transform 0.08s;
+  }
+  .optBtn:active { transform:scale(1.06); }
+  .optBtn.out { opacity:0.35; filter:grayscale(1); pointer-events:none; }
+  #nextBtn {
+    display:none; font-size:22px; font-weight:bold; padding:16px 20px;
+    border-radius:18px; border:4px solid rgba(255,255,255,0.9);
+    background:#2fbf4a; color:#fff; cursor:pointer;
+    box-shadow:0 4px 12px rgba(0,0,0,0.4); font-family:inherit;
+  }
+  #nextBtn:active { transform:scale(1.06); }
+  #winPanel {
+    position:absolute; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center; flex-direction:column; gap:22px;
+    background:rgba(0,0,0,0.5);
+  }
+  #winPanel .msg {
+    font-size:38px; font-weight:bold; color:#ffd54a;
+    text-shadow:0 3px 8px rgba(0,0,0,0.6); text-align:center;
+  }
+  #winPanel button {
+    font-size:22px; font-weight:bold; padding:14px 34px;
+    border-radius:30px; border:none; background:#ffd54a; color:#4a3200;
+    cursor:pointer; box-shadow:0 4px 10px rgba(0,0,0,0.4);
+  }
+  #winPanel button:active { transform:scale(1.06); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scorebar">第 1 / 8 台机器</div>
+<div id="hint">把下面的数字球拖进机器投球口，观察产出的数，猜猜机器的秘密规则！</div>
+<div id="options">
+  <div class="title">🤔 机器的规则是？</div>
+</div>
+<div id="winPanel">
+  <div class="msg">🎉 全部通关！</div>
+  <button id="replayBtn">再玩一次</button>
+</div>
+
+<script>
+"use strict";
+/* ================= 基础 ================= */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const scorebar = document.getElementById("scorebar");
+const hintEl = document.getElementById("hint");
+const optionsEl = document.getElementById("options");
+const winPanel = document.getElementById("winPanel");
+let W = 0, H = 0, DPR = 1;
+
+const L = {};   // 布局：机器位置、投球口、出球口、记录表、球托盘
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  computeLayout();
+}
+function computeLayout() {
+  L.mx = W * 0.42;          // 机器中心 x
+  L.my = H * 0.46;          // 机器中心 y
+  L.bw = 250; L.bh = 190;   // 机身尺寸
+  // 投球口（漏斗嘴）判定区
+  L.funnel = { x: L.mx - 135, y: L.my - 175, w: 110, h: 95 };
+  // 出球口终点（产出球停留位）
+  L.outX = L.mx + 195; L.outY = L.my + 118;
+  // 记录表
+  L.tabX = 18; L.tabY = 84; L.tabW = 216; L.rowH = 30; L.maxRows = Math.max(5, Math.floor((H - 250) / L.rowH));
+  // 球托盘
+  L.trayY = H - 66; L.ballR = 25;
+  L.trayGap = Math.min(58, (W - 80) / 10);
+  L.trayX0 = W / 2 - L.trayGap * 4.5;
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ================= 机器数据（8 台，难度递增：加→乘→混合→平方） ================= */
+const MACHINES = [
+  { fn:x=>x+3,    formula:"y = x + 3",     opts:["x + 3","x + 5","x × 2","x + 10"],        answer:0, color:"#ff9f43" },
+  { fn:x=>x+8,    formula:"y = x + 8",     opts:["x + 8","x + 3","x × 8","x + 2"],         answer:0, color:"#ff6b81" },
+  { fn:x=>x*2,    formula:"y = x × 2",     opts:["x + 2","x × 2","x × 3","x + 12"],        answer:1, color:"#1dd1a1" },
+  { fn:x=>x*4,    formula:"y = x × 4",     opts:["x × 2","x + 4","x × 4","x × 3"],         answer:2, color:"#54a0ff" },
+  { fn:x=>x*2+3,  formula:"y = x × 2 + 3", opts:["x × 2","x × 3 + 2","x × 2 + 3","x + 5"], answer:2, color:"#8e6bf0" },
+  { fn:x=>x*3-2,  formula:"y = x × 3 - 2", opts:["x × 3 - 2","x × 3","x × 2 - 1","x - 2"], answer:0, color:"#ee5253" },
+  { fn:x=>x*x,    formula:"y = x × x",     opts:["x × 2","x × x","x + x + 5","x × 4"],     answer:1, color:"#10ac84" },
+  { fn:x=>x*x/2,  formula:"y = x × x ÷ 2", opts:["x × x","x × 5","x × x ÷ 2","x ÷ 2 + 10"],answer:2, color:"#f368e0" },
+];
+function fmt(v) { return Number.isInteger(v) ? String(v) : v.toFixed(1); }
+
+/* ================= 游戏状态 ================= */
+let machineIdx = 0;       // 当前机器
+let rows = [];            // 观察记录 [{x, y}]
+let proc = null;          // 加工中 {val, t}
+let outBall = null;       // 产出的球 {val, t}（t 为弹出动画进度）
+let drag = null;          // 拖拽中的球 {val, x, y, overFunnel}
+let lidAngle = 0;         // 盖子打开角度（猜对后）
+let solved = false;       // 当前机器已猜对
+let gearAngle = 0;        // 齿轮角度
+let shakeT = 0;           // 机器震动剩余时间
+let wrongShake = 0;       // 猜错摇头剩余时间
+let confetti = [];        // 彩带粒子
+let fedCount = 0;         // 本台机器投球总数
+
+function machine() { return MACHINES[machineIdx]; }
+
+function resetGame() {
+  machineIdx = 0;
+  winPanel.style.display = "none";
+  loadMachine();
+}
+function loadMachine() {
+  rows = []; proc = null; outBall = null; drag = null;
+  lidAngle = 0; solved = false; fedCount = 0;
+  confetti = [];
+  buildOptions();
+  updateScore();
+}
+function updateScore() {
+  scorebar.textContent = `第 ${machineIdx + 1} / ${MACHINES.length} 台机器 · 已投进 ${fedCount} 个球`;
+}
+resetGame();
+
+/* ================= 选项按钮（猜规则） ================= */
+function buildOptions() {
+  optionsEl.querySelectorAll(".optBtn,#nextBtn").forEach(b => b.remove());
+  machine().opts.forEach((label, i) => {
+    const btn = document.createElement("button");
+    btn.className = "optBtn";
+    btn.textContent = label;
+    btn.addEventListener("click", () => guess(i));
+    optionsEl.appendChild(btn);
+  });
+  const next = document.createElement("button");
+  next.id = "nextBtn";
+  next.textContent = machineIdx + 1 < MACHINES.length ? "下一台机器 ▶" : "🏆 完成挑战";
+  next.addEventListener("click", nextMachine);
+  optionsEl.appendChild(next);
+}
+function guess(i) {
+  if (solved || proc) return;
+  if (rows.length < 2) { showHint("先多投几个球观察规律，再来猜！"); pop(300); return; }
+  const btn = optionsEl.querySelectorAll(".optBtn")[i];
+  if (i === machine().answer) {
+    // 猜对了！
+    solved = true;
+    btn.style.background = "#2fbf4a"; btn.style.color = "#fff";
+    spawnConfetti();
+    fanfare();
+    showHint(`🎉 猜对啦！机器的秘密是 ${machine().formula}`);
+    document.getElementById("nextBtn").style.display = "block";
+  } else {
+    // 猜错无惩罚：划掉错误选项，鼓励继续试
+    btn.classList.add("out");
+    wrongShake = 0.5;
+    buzz();
+    showHint("不对哦，再投几个数试试 🔍");
+  }
+}
+function nextMachine() {
+  pop(880);
+  if (machineIdx + 1 >= MACHINES.length) {
+    winPanel.querySelector(".msg").innerHTML = "🎉 全部通关！<br>你是真正的函数小侦探！";
+    winPanel.style.display = "flex";
+    spawnConfetti(120);
+    fanfare();
+    return;
+  }
+  machineIdx++;
+  loadMachine();
+  showHint("新机器上岗！它的规则又不一样了……");
+}
+
+/* ================= 投球与加工 ================= */
+function startProc(val) {
+  if (proc || solved) return;
+  proc = { val, t: 0 };
+  shakeT = 0;
+  clank();
+}
+function updateProc(dt) {
+  if (!proc) return;
+  proc.t += dt;
+  if (proc.t > 0.25 && proc.t < 0.95) {
+    shakeT = 0.05;   // 咣当咣当持续震动
+    if (Math.floor((proc.t - dt) * 8) !== Math.floor(proc.t * 8)) clank(0.5);
+  }
+  if (proc.t >= 0.95 && !proc.done) {
+    proc.done = true;
+    const y = machine().fn(proc.val);
+    rows.push({ x: proc.val, y });
+    if (rows.length > 99) rows.shift();
+    outBall = { val: y, t: 0 };
+    fedCount++;
+    updateScore();
+    ding();
+  }
+  if (proc.t >= 1.15) proc = null;
+}
+function update(dt) {
+  updateProc(dt);
+  gearAngle += dt * (proc ? 7 : 0.8);
+  if (shakeT > 0) shakeT -= dt;
+  if (wrongShake > 0) wrongShake -= dt;
+  if (outBall && outBall.t < 1) outBall.t = Math.min(1, outBall.t + dt * 2.6);
+  if (solved && lidAngle < 1) lidAngle = Math.min(1, lidAngle + dt * 1.8);
+  // 彩带
+  for (const c of confetti) {
+    c.x += c.vx * dt; c.y += c.vy * dt; c.vy += 620 * dt;
+    c.rot += c.vr * dt; c.life -= dt;
+  }
+  confetti = confetti.filter(c => c.life > 0 && c.y < H + 30);
+}
+function spawnConfetti(n) {
+  const colors = ["#ff5252","#ffd54a","#2fbf4a","#54a0ff","#f368e0","#ff9f43"];
+  for (let i = 0; i < (n || 70); i++) {
+    confetti.push({
+      x: L.mx + (Math.random() - 0.5) * 200, y: L.my - 140,
+      vx: (Math.random() - 0.5) * 420, vy: -180 - Math.random() * 320,
+      w: 7 + Math.random() * 6, h: 5 + Math.random() * 5,
+      rot: Math.random() * 7, vr: (Math.random() - 0.5) * 12,
+      color: colors[i % colors.length], life: 2.2 + Math.random()
+    });
+  }
+}
+
+/* ================= 交互：拖拽数字球 ================= */
+function trayBallPos(i) { return [L.trayX0 + i * L.trayGap, L.trayY]; }
+function overFunnel(x, y) {
+  const f = L.funnel;
+  return x > f.x - 12 && x < f.x + f.w + 12 && y > f.y - 12 && y < f.y + f.h + 18;
+}
+canvas.addEventListener("pointerdown", e => {
+  if (winPanel.style.display === "flex") return;
+  const x = e.clientX, y = e.clientY;
+  // 点中托盘里的球？
+  for (let i = 0; i < 10; i++) {
+    const [bx, by] = trayBallPos(i);
+    if (Math.hypot(x - bx, y - by) < L.ballR + 10) {
+      drag = { val: i + 1, x, y, overFunnel: false };
+      canvas.setPointerCapture(e.pointerId);
+      pop(500 + i * 40);
+      hintEl.style.opacity = "0";
+      return;
+    }
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag) return;
+  drag.x = e.clientX; drag.y = e.clientY;
+  drag.overFunnel = overFunnel(drag.x, drag.y);
+});
+window.addEventListener("pointerup", e => {
+  if (!drag) return;
+  const d = drag; drag = null;
+  if (overFunnel(e.clientX, e.clientY)) {
+    if (solved) { showHint("这台机器已经破解啦，点「下一台机器」！"); }
+    else if (proc) { showHint("机器正在咣当咣当运转中……"); }
+    else startProc(d.val);
+  }
+});
+
+/* ================= 绘制 ================= */
+function roundRect(x, y, w, h, r, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#7ec8e8"); g.addColorStop(0.7, "#bfe3d8"); g.addColorStop(1, "#e8d8a8");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 地板
+  ctx.fillStyle = "#c9a86a";
+  ctx.fillRect(0, H - 120, W, 120);
+  ctx.fillStyle = "rgba(0,0,0,0.08)";
+  ctx.fillRect(0, H - 120, W, 8);
+}
+
+function drawTable() {
+  const { tabX, tabY, tabW, rowH, maxRows } = L;
+  const shown = rows.slice(-maxRows);
+  const th = 66 + shown.length * rowH + 10;
+  ctx.save();
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  ctx.strokeStyle = "rgba(60,50,30,0.4)"; ctx.lineWidth = 3;
+  roundRect(tabX, tabY, tabW, th, 16, true, true);
+  // 标题
+  ctx.fillStyle = "#4a3200";
+  ctx.font = "bold 19px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("📋 观察记录表", tabX + tabW / 2, tabY + 22);
+  // 表头
+  ctx.font = "bold 16px sans-serif";
+  ctx.fillStyle = "#8a6d2f";
+  ctx.fillText("投入 x", tabX + tabW * 0.28, tabY + 48);
+  ctx.fillText("产出 y", tabX + tabW * 0.76, tabY + 48);
+  ctx.strokeStyle = "rgba(60,50,30,0.25)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(tabX + 14, tabY + 60); ctx.lineTo(tabX + tabW - 14, tabY + 60); ctx.stroke();
+  // 数据行
+  ctx.font = "bold 17px sans-serif";
+  shown.forEach((r, i) => {
+    const yy = tabY + 60 + rowH * (i + 0.5) + 4;
+    const fresh = i === shown.length - 1;
+    ctx.fillStyle = fresh ? "#d43a2f" : "#33475b";
+    ctx.fillText(fmt(r.x), tabX + tabW * 0.24, yy);
+    ctx.fillStyle = fresh ? "#d43a2f" : "#8a6d2f";
+    ctx.fillText("→", tabX + tabW * 0.5, yy);
+    ctx.fillStyle = fresh ? "#d43a2f" : "#1a7a3a";
+    ctx.fillText(fmt(r.y), tabX + tabW * 0.78, yy);
+  });
+  if (!shown.length) {
+    ctx.fillStyle = "#999";
+    ctx.font = "15px sans-serif";
+    ctx.fillText("还没有记录", tabX + tabW / 2, tabY + 90);
+  }
+  ctx.restore();
+}
+
+function drawGear(cx, cy, r, ang, color) {
+  ctx.save();
+  ctx.translate(cx, cy); ctx.rotate(ang);
+  ctx.fillStyle = color;
+  for (let i = 0; i < 8; i++) {
+    ctx.rotate(Math.PI / 4);
+    ctx.fillRect(-r * 0.22, -r * 1.28, r * 0.44, r * 0.42);
+  }
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.38, 0, 7); ctx.fill();
+  ctx.restore();
+}
+
+function drawMachine() {
+  const m = machine();
+  const bx = L.mx - L.bw / 2, by = L.my - L.bh / 2;
+  let sx = 0;
+  if (shakeT > 0) sx = Math.sin(performance.now() * 0.09) * 5;
+  if (wrongShake > 0) sx = Math.sin(performance.now() * 0.06) * 7 * wrongShake;
+  ctx.save();
+  ctx.translate(sx, 0);
+
+  // 腿
+  ctx.fillStyle = "#5d6d7e";
+  ctx.fillRect(bx + 30, by + L.bh, 26, 34);
+  ctx.fillRect(bx + L.bw - 56, by + L.bh, 26, 34);
+
+  // 投球漏斗（梯形）
+  const f = L.funnel;
+  ctx.beginPath();
+  ctx.moveTo(f.x - sx, f.y); ctx.lineTo(f.x + f.w - sx, f.y);
+  ctx.lineTo(f.x + f.w - 26 - sx, by + 26); ctx.lineTo(f.x + 26 - sx, by + 26);
+  ctx.closePath();
+  ctx.fillStyle = drag && drag.overFunnel ? "#ffe28a" : "#f0c05a";
+  ctx.fill();
+  ctx.lineWidth = 4; ctx.strokeStyle = "#8a6d2f"; ctx.stroke();
+  // 投球口标签
+  ctx.fillStyle = "#5a4300";
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("投球口", f.x + f.w / 2 - sx, f.y - 14);
+
+  // 出球管道
+  ctx.fillStyle = "#95a5a6";
+  ctx.strokeStyle = "#5d6d7e"; ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(bx + L.bw, L.my + 20); ctx.lineTo(L.outX - 16, L.outY - 24);
+  ctx.lineTo(L.outX - 4, L.outY - 4); ctx.lineTo(bx + L.bw, L.my + 58);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+
+  // 机身
+  const g = ctx.createLinearGradient(bx, by, bx, by + L.bh);
+  g.addColorStop(0, m.color);
+  g.addColorStop(1, shade(m.color, -30));
+  ctx.fillStyle = g;
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 4;
+  roundRect(bx, by, L.bw, L.bh, 26, true, true);
+
+  // 齿轮装饰
+  drawGear(bx + 46, by + L.bh - 44, 24, gearAngle, "rgba(255,255,255,0.5)");
+  drawGear(bx + 92, by + L.bh - 34, 17, -gearAngle * 1.4, "rgba(255,255,255,0.4)");
+
+  // 盖子（猜对后翻开）
+  ctx.save();
+  ctx.translate(bx + L.bw - 10, by - 6);
+  ctx.rotate(-lidAngle * 1.9);
+  ctx.fillStyle = shade(m.color, -45);
+  ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 4;
+  roundRect(-(L.bw - 20), -20, L.bw - 20, 22, 10, true, true);
+  // 盖子把手
+  ctx.fillStyle = "#ffd54a";
+  ctx.beginPath(); ctx.arc(-(L.bw - 20) / 2, -22, 9, 0, 7); ctx.fill();
+  ctx.restore();
+
+  // 脸：眼睛 + 嘴
+  const ex = bx + L.bw / 2, ey = by + 56;
+  ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.arc(ex - 34, ey, 16, 0, 7); ctx.arc(ex + 34, ey, 16, 0, 7); ctx.fill();
+  ctx.fillStyle = "#222";
+  const look = drag ? Math.sign(drag.x - ex) * 4 : 0;
+  ctx.beginPath(); ctx.arc(ex - 34 + look, ey, 7, 0, 7); ctx.arc(ex + 34 + look, ey, 7, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#222"; ctx.lineWidth = 4;
+  ctx.beginPath();
+  if (solved) ctx.arc(ex, ey + 30, 20, 0.15 * Math.PI, 0.85 * Math.PI);   // 开心大笑
+  else ctx.arc(ex, ey + 34, 13, 0.15 * Math.PI, 0.85 * Math.PI);
+  ctx.stroke();
+
+  // 破解后显示内部公式
+  if (solved) {
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
+    ctx.strokeStyle = "#d43a2f"; ctx.lineWidth = 4;
+    roundRect(bx + 22, by + 96, L.bw - 44, 52, 14, true, true);
+    ctx.fillStyle = "#d43a2f";
+    ctx.font = "bold 27px sans-serif";
+    ctx.fillText(m.formula, bx + L.bw / 2, by + 123);
+  } else {
+    // 神秘面板
+    ctx.fillStyle = "rgba(0,0,0,0.25)";
+    roundRect(bx + 22, by + 96, L.bw - 44, 52, 14, true);
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.font = "bold 26px sans-serif";
+    ctx.fillText("y = ?", bx + L.bw / 2, by + 123);
+  }
+  ctx.restore();
+
+  // 出球口标签
+  ctx.fillStyle = "#5a4300";
+  ctx.font = "bold 15px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("出球口", L.outX + 6, L.outY - 48);
+}
+
+function shade(hex, amt) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.max(0, Math.min(255, (n >> 16) + amt));
+  const g = Math.max(0, Math.min(255, ((n >> 8) & 255) + amt));
+  const b = Math.max(0, Math.min(255, (n & 255) + amt));
+  return `rgb(${r},${g},${b})`;
+}
+
+function drawBall(x, y, r, label, hue, scale) {
+  const rr = r * (scale || 1);
+  ctx.save();
+  // 阴影
+  ctx.fillStyle = "rgba(0,0,0,0.18)";
+  ctx.beginPath(); ctx.ellipse(x, y + rr * 0.85, rr * 0.85, rr * 0.3, 0, 0, 7); ctx.fill();
+  const g = ctx.createRadialGradient(x - rr * 0.35, y - rr * 0.4, rr * 0.1, x, y, rr);
+  g.addColorStop(0, hue === "green" ? "#8effc1" : "#a8c8ff");
+  g.addColorStop(1, hue === "green" ? "#1a9e50" : "#1a4fc0");
+  ctx.beginPath(); ctx.arc(x, y, rr, 0, 7);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.3)"; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.font = `bold ${Math.round(rr * 0.95)}px sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(label, x, y + 1);
+  ctx.restore();
+}
+
+function drawTray() {
+  for (let i = 0; i < 10; i++) {
+    if (drag && drag.val === i + 1) continue;
+    const [bx, by] = trayBallPos(i);
+    drawBall(bx, by, L.ballR, String(i + 1), "blue");
+  }
+}
+
+function drawProcBall() {
+  if (!proc) return;
+  const f = L.funnel;
+  if (proc.t < 0.25) {
+    // 被漏斗吸进去
+    const k = proc.t / 0.25;
+    const x = f.x + f.w / 2, y = f.y + 6 + k * 46;
+    drawBall(x, y, L.ballR, String(proc.val), "blue", 1 - k * 0.55);
+  }
+}
+
+function drawOutBall() {
+  if (!outBall) return;
+  const t = outBall.t;
+  const ease = 1 - Math.pow(1 - t, 2);
+  const x0 = L.mx + L.bw / 2 + 26, y0 = L.my + 42;
+  const x = x0 + (L.outX - x0) * ease;
+  const y = y0 + (L.outY - y0) * ease - Math.sin(t * Math.PI) * 44;
+  drawBall(x, y, L.ballR, fmt(outBall.val), "green", 0.4 + 0.6 * ease);
+}
+
+function drawDrag() {
+  if (!drag) return;
+  // 漏斗高亮提示
+  if (drag.overFunnel) {
+    ctx.save();
+    ctx.strokeStyle = proc || solved ? "rgba(120,120,120,0.7)" : "#ffd54a";
+    ctx.lineWidth = 5; ctx.setLineDash([10, 8]);
+    const f = L.funnel;
+    roundRect(f.x - 10, f.y - 8, f.w + 20, f.h + 20, 18, false, true);
+    ctx.restore();
+  }
+  drawBall(drag.x, drag.y, L.ballR, String(drag.val), "blue", 1.18);
+}
+
+function drawConfetti() {
+  for (const c of confetti) {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.globalAlpha = Math.min(1, c.life);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.w / 2, -c.h / 2, c.w, c.h);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawTable();
+  drawMachine();
+  drawTray();
+  drawProcBall();
+  drawOutBall();
+  drawDrag();
+  drawConfetti();
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ================= 音效 ================= */
+let actx = null;
+function tone(freq, dur, vol, type) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+const pop = f => tone(f, 0.12, 0.14);
+const ding = () => { tone(880, 0.18, 0.15); setTimeout(() => tone(1320, 0.22, 0.12), 90); };
+const clank = (v) => tone(160 + Math.random() * 60, 0.09, 0.06 + 0.08 * (v || 1), "square");
+const buzz = () => tone(170, 0.25, 0.09, "triangle");
+function fanfare() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => pop(f), i * 130)); }
+
+/* ================= 其它 ================= */
+let hintTimer = null;
+function showHint(text) {
+  hintEl.textContent = text;
+  hintEl.style.opacity = "1";
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.style.opacity = "0"; }, 2400);
+}
+document.getElementById("replayBtn").addEventListener("click", () => { resetGame(); pop(880); });
+
+/* ================= 测试钩子 ================= */
+window.__fm = {
+  feed: v => startProc(v),
+  step: dt => update(dt),
+  guess,
+  next: nextMachine,
+  state: () => ({ machineIdx, rows: rows.map(r => [r.x, r.y]), solved, fedCount, proc: !!proc }),
+};
+</script>
+<!-- 大厅插件：回大厅 + 试玩记录 -->
+<div id="labHomeBtn" title="回到大厅">🏠</div>
+<style>#labHomeBtn{position:absolute;left:12px;bottom:12px;z-index:99;width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid #ffd54a;font-size:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);user-select:none}</style>
+<script>(function(){try{var f=location.pathname.split('/').pop();var p=JSON.parse(localStorage.getItem('lab-played')||'{}');p[f]=Date.now();localStorage.setItem('lab-played',JSON.stringify(p));}catch(e){}var b=document.getElementById('labHomeBtn');if(b)b.onclick=function(){location.href='index.html'};})();</script>
+</body>
+</html>
